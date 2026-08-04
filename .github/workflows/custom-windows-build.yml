@@ -1,6 +1,9 @@
 name: custom-windows-build
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       official_ref:
