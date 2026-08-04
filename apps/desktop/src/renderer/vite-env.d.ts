@@ -1058,6 +1058,11 @@ interface ElectronAPI {
    * splash / login 阶段会 reject (handler 未注册), 调用方需 catch 兜底成 false。
    */
   anySessionInTurn: () => Promise<boolean>;
+  visibleTextTranslation: {
+    translate: (
+      source: string,
+    ) => Promise<import('../shared/visibleTextTranslation').VisibleTextTranslationResult>;
+  };
   pageZoomIn: () => Promise<{ ok: true; zoomLevel: number }>;
   pageZoomOut: () => Promise<{ ok: true; zoomLevel: number }>;
   pageZoomReset: () => Promise<{ ok: true; zoomLevel: number }>;

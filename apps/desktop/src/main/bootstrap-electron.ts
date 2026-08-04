@@ -302,6 +302,7 @@ import { isIpcError } from '../shared/ipc-errors';
 import { readFileBytesForPreview } from './fileReadBytes.js';
 import { initHeartbeatService } from './heartbeatService';
 import { initAnalyticsSettingsService, noteAuthColdStartState } from './analyticsSettingsService';
+import { registerVisibleTextTranslationIpc } from './visibleTextTranslationService.js';
 import { WindowManualDragController } from './windowManualDrag';
 // 设备互联(跨设备远程控制): relay 连接 host + 开关/设备列表 IPC
 import {
@@ -6309,6 +6310,9 @@ app.on('ready', async () => {
   // handler 还没注册的话那次 invoke 会 reject,而它是 fail closed 的 —— 已同意
   // 的用户会一直不上报,直到手动去设置里拨一下开关。
   initAnalyticsSettingsService();
+  // 可见工作摘要翻译是 owner 级全局显示增强。handler 只在请求发生时读取
+  // 设置/Provider，原始 agent 事件与启动关键路径均不等待网络。
+  registerVisibleTextTranslationIpc({ getMaker: getMakerCore });
   startupWindowCreationAllowed = true;
   createWindow();
   // 预热仅服务 dev macOS，延迟执行避免和启动关键路径争用 CPU；失败由入口内部吞掉。
