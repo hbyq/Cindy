@@ -209,6 +209,14 @@ jobs:
         if: ${{ steps.duplicate.outputs.skip != 'true' }}
         run: pnpm install --frozen-lockfile
 
+      - name: Ensure Electron runtime
+        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node node_modules/electron/install.js
+          node -e "const fs = require('node:fs'); const executable = require('electron'); if (!fs.existsSync(executable)) throw new Error('Electron executable is missing after install'); console.log(executable)"
+
       - name: Install bundled ripgrep
         if: ${{ steps.duplicate.outputs.skip != 'true' }}
         env:
