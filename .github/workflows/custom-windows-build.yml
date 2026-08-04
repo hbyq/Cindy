@@ -241,8 +241,6 @@ jobs:
 
       - name: Build unsigned versionless Windows installer
         if: ${{ steps.duplicate.outputs.skip != 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: pnpm release:package -- --platform win32 --arch x64 --region global --no-sign
 
       - name: Write custom build provenance
