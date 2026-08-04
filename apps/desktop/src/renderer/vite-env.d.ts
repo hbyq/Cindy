@@ -1057,9 +1057,14 @@ interface ElectronAPI {
   windowCloseSelf: () => void;
   /**
    * 查询当前是否有 session 在 turn 中。WindowControls 用它决定是否弹确认框。
-   * splash / login 阶段会 reject (handler 未注册), 调用方需 catch 兜底成 false。
-   */
+  * splash / login 阶段会 reject (handler 未注册), 调用方需 catch 兜底成 false。
+  */
   anySessionInTurn: () => Promise<boolean>;
+  visibleTextTranslation: {
+    translate: (
+      source: string,
+    ) => Promise<import('../shared/visibleTextTranslation').VisibleTextTranslationResult>;
+  };
   pageZoomIn: () => Promise<{ ok: true; zoomFactor: number }>;
   pageZoomOut: () => Promise<{ ok: true; zoomFactor: number }>;
   pageZoomReset: () => Promise<{ ok: true; zoomFactor: number }>;
