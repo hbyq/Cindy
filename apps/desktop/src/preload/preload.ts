@@ -68,6 +68,10 @@ import type { VoiceInputRefinerProviderKind, VoiceInputRefinerTransport } from '
 import { isIpcErrorCode, type IpcErrorCode } from '../shared/ipc-errors';
 import type { VoiceInputSyncErrorResult } from '../shared/voiceInputData';
 import type { UtilityTextFailure } from '../shared/utilityTextResult';
+import {
+  VISIBLE_TEXT_TRANSLATION_INVOKE,
+  type VisibleTextTranslationResult,
+} from '../shared/visibleTextTranslation';
 import type {
   BrowserBackendHealth,
   BrowserBackendRecoveryResult,
@@ -754,6 +758,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   anySessionInTurn: (): Promise<boolean> =>
     ipcRenderer.invoke('maker:any-session-in-turn'),
+  visibleTextTranslation: {
+    translate: (source: string): Promise<VisibleTextTranslationResult> =>
+      ipcRenderer.invoke(VISIBLE_TEXT_TRANSLATION_INVOKE, source),
+  },
   pageZoomIn: (): Promise<{ ok: true; zoomLevel: number }> => ipcRenderer.invoke('page-zoom:in'),
   pageZoomOut: (): Promise<{ ok: true; zoomLevel: number }> => ipcRenderer.invoke('page-zoom:out'),
   pageZoomReset: (): Promise<{ ok: true; zoomLevel: number }> =>
