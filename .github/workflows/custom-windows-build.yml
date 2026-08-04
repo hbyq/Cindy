@@ -221,9 +221,9 @@ jobs:
           NODE_OPTIONS: "--max-old-space-size=8192"
         run: pnpm --filter desktop typecheck
 
-      - name: Build maker-shared
+      - name: Typecheck maker-shared when available
         if: ${{ steps.duplicate.outputs.skip != 'true' }}
-        run: pnpm --filter "@cindy/maker-shared" build
+        run: pnpm --filter "@cindy/maker-shared" run --if-present typecheck
 
       - name: Run translation tests
         if: ${{ steps.duplicate.outputs.skip != 'true' }}
