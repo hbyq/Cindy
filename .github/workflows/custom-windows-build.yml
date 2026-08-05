@@ -7,20 +7,22 @@ on:
   workflow_dispatch:
     inputs:
       official_ref:
-        description: "stable，或指定官方稳定标签（例如 v0.1.28）"
+        description: "stable，或指定官方稳定标签（例如 v0.1.30）；手动运行会生成新修订版"
         required: true
         default: stable
         type: string
   schedule:
-    - cron: "17 2 * * *"
+    # 每 3 小时检查一次；输入不变时会在安装依赖前退出。
+    - cron: "17 */3 * * *"
 
-# Fork-only build: the token cannot push code, create releases, or open PRs.
+# Fork-only pipeline. Source code is built with a read-only token. A separate
+# runner that never checks out or executes Cindy source performs publication.
 permissions:
   actions: read
   contents: read
 
 concurrency:
-  group: custom-windows-build-${{ github.event.inputs.official_ref || 'stable' }}
+  group: custom-windows-stable-channel
   cancel-in-progress: false
 
 env:
@@ -32,6 +34,21 @@ jobs:
     if: ${{ github.repository == 'hbyq/Cindy' }}
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skipped: ${{ steps.channel.outputs.skip }}
+      handoff_key: ${{ steps.metadata.outputs.cache_key }}
+      build_run_attempt: ${{ steps.metadata.outputs.run_attempt }}
+      custom_version: ${{ steps.channel.outputs.custom_version }}
+      custom_revision: ${{ steps.channel.outputs.custom_revision }}
+      channel_head_sha: ${{ steps.channel.outputs.channel_head_sha }}
+      official_ref: ${{ steps.release.outputs.official_ref }}
+      official_version: ${{ steps.release.outputs.official_version }}
+      official_sha: ${{ steps.compose.outputs.official_sha }}
+      translation_sha: ${{ steps.compose.outputs.translation_sha }}
+      update_sha: ${{ steps.compose.outputs.update_sha }}
 
     steps:
       - name: Resolve official stable tag
@@ -47,19 +64,27 @@ jobs:
             $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             $manifest = Invoke-RestMethod -Uri "https://hotfix.cindy.app/cindy/manifest-win32-x64.json?t=$cacheBust"
             $version = [string]$manifest.app.version
-            if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
               throw "Official stable manifest returned an invalid version: '$version'"
             }
             $officialRef = "v$version"
-          } elseif ($requested -match '^v\d+\.\d+\.\d+$') {
+            $requireRelogin = $manifest.app.requireRelogin -eq $true
+          } elseif ($requested -match '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
             $officialRef = $requested
             $version = $requested.Substring(1)
+            $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $manifest = Invoke-RestMethod -Uri "https://hotfix.cindy.app/cindy/manifest-win32-x64.json?t=$cacheBust"
+            $requireRelogin = (
+              [string]$manifest.app.version -eq $version -and
+              $manifest.app.requireRelogin -eq $true
+            )
           } else {
             throw "official_ref must be 'stable' or an official vX.Y.Z tag"
           }
 
           "official_ref=$officialRef" >> $env:GITHUB_OUTPUT
           "official_version=$version" >> $env:GITHUB_OUTPUT
+          "require_relogin=$($requireRelogin.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Official source: makecindy/cindy@$officialRef"
 
       - name: Checkout official Cindy source
@@ -86,39 +111,61 @@ jobs:
           git submodule update --init --force --recursive -- cindy-protocol
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch cindy-protocol' }
 
-      - name: Apply the allow-listed translation commit
+      - name: Apply allow-listed fork customizations
         id: compose
         shell: pwsh
-        env:
-          OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $featureRef = 'refs/remotes/customization/feature/visible-text-translation'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          git remote add customization $featureUrl
-          git fetch --no-tags customization '+refs/heads/feature/visible-text-translation:refs/remotes/customization/feature/visible-text-translation'
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch the translation branch' }
+          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.30'
+          $updateRef = 'refs/remotes/customization/feature/custom-update-feed-v0.1.30'
 
-          $featureSha = (git rev-parse $featureRef).Trim()
-          $parents = @((git show -s --format='%P' $featureSha).Trim() -split '\s+' | Where-Object { $_ })
-          if ($parents.Count -ne 1) { throw 'The translation branch head must be a single-parent commit' }
-          $baseSha = $parents[0]
+          git remote add customization $featureUrl
+          git fetch --no-tags customization `
+            '+refs/heads/feature/visible-text-translation-v0.1.30:refs/remotes/customization/feature/visible-text-translation-v0.1.30' `
+            '+refs/heads/feature/custom-update-feed-v0.1.30:refs/remotes/customization/feature/custom-update-feed-v0.1.30'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
+
+          git config user.name 'hbyq'
+          git config user.email '51372765+hbyq@users.noreply.github.com'
           $officialSha = (git rev-parse HEAD).Trim()
 
-          git merge-base --is-ancestor $baseSha $officialSha
-          if ($LASTEXITCODE -ne 0) {
-            throw "Translation base $baseSha is not an ancestor of official source $officialSha"
+          function Assert-And-CherryPick {
+            param(
+              [Parameter(Mandatory = $true)][string]$Label,
+              [Parameter(Mandatory = $true)][string]$Ref,
+              [Parameter(Mandatory = $true)][string[]]$AllowedPaths
+            )
+            $featureSha = (git rev-parse $Ref).Trim()
+            if ($featureSha -notmatch '^[a-f0-9]{40}$') { throw "$Label has an invalid SHA" }
+            $parents = @((git show -s --format='%P' $featureSha).Trim() -split '\s+' | Where-Object { $_ })
+            if ($parents.Count -ne 1) { throw "$Label head must be a single-parent commit" }
+            $baseSha = $parents[0]
+            git merge-base --is-ancestor $baseSha $officialSha
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Label base $baseSha is not an ancestor of official source $officialSha"
+            }
+            $commitCount = [int](git rev-list --count "$baseSha..$featureSha")
+            if ($commitCount -ne 1) { throw "$Label must contain exactly one commit, found $commitCount" }
+            $message = git show -s --format='%B' $featureSha
+            if (-not ($message -match '(?m)^Signed-off-by:\s+.+\s+<[^>]+>$')) {
+              throw "$Label commit is missing a DCO Signed-off-by trailer"
+            }
+            $changedPaths = @(git diff-tree --no-commit-id --name-only -r $featureSha)
+            $unexpectedPaths = @($changedPaths | Where-Object { $_ -notin $AllowedPaths })
+            if ($unexpectedPaths.Count -gt 0) {
+              throw "$Label changed non-allow-listed paths: $($unexpectedPaths -join ', ')"
+            }
+            $missingPaths = @($AllowedPaths | Where-Object { $_ -notin $changedPaths })
+            if ($missingPaths.Count -gt 0) {
+              throw "$Label is missing expected paths: $($missingPaths -join ', ')"
+            }
+            git cherry-pick $featureSha | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "$Label conflicts with the selected official release" }
+            return [string]$featureSha
           }
 
-          $commitCount = [int](git rev-list --count "$baseSha..$featureSha")
-          if ($commitCount -ne 1) { throw "Expected exactly one translation commit, found $commitCount" }
-
-          $message = git show -s --format='%B' $featureSha
-          if (-not ($message -match '(?m)^Signed-off-by:\s+.+\s+<[^>]+>$')) {
-            throw 'Translation commit is missing a DCO Signed-off-by trailer'
-          }
-
-          $allowedPaths = @(
+          $translationPaths = @(
             'apps/desktop/src/main/__tests__/visibleTextTranslationService.test.ts',
             'apps/desktop/src/main/bootstrap-electron.ts',
             'apps/desktop/src/main/visible-text-translation-settings-store.ts',
@@ -134,38 +181,33 @@ jobs:
             'apps/desktop/src/shared/visibleTextTranslation.ts',
             'packages/maker-shared/src/workActivityProjection.ts'
           )
-          $changedPaths = @(git diff-tree --no-commit-id --name-only -r $featureSha)
-          $unexpectedPaths = @($changedPaths | Where-Object { $_ -notin $allowedPaths })
-          if ($unexpectedPaths.Count -gt 0) {
-            throw "Translation commit changed non-allow-listed paths: $($unexpectedPaths -join ', ')"
-          }
-          $missingPaths = @($allowedPaths | Where-Object { $_ -notin $changedPaths })
-          if ($missingPaths.Count -gt 0) {
-            throw "Translation commit is missing expected paths: $($missingPaths -join ', ')"
-          }
+          $updatePaths = @(
+            'apps/desktop/src/main/__tests__/customUpdateFeed.test.ts',
+            'apps/desktop/src/main/__tests__/updateService.test.ts',
+            'apps/desktop/src/main/customUpdateFeed.ts',
+            'apps/desktop/src/main/updateService.ts'
+          )
 
-          git config user.name 'hbyq'
-          git config user.email '51372765+hbyq@users.noreply.github.com'
-          git cherry-pick $featureSha
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Translation commit conflicts with the selected official release'
-          }
-
+          $translationSha = Assert-And-CherryPick -Label 'Translation customization' -Ref $translationRef -AllowedPaths $translationPaths
+          $updateSha = Assert-And-CherryPick -Label 'Fork update feed customization' -Ref $updateRef -AllowedPaths $updatePaths
           $composedSha = (git rev-parse HEAD).Trim()
-          $featureShort = $featureSha.Substring(0, 12)
-          $artifactName = "cindy-visible-translation-$env:OFFICIAL_VERSION-$featureShort"
-          "official_sha=$officialSha" >> $env:GITHUB_OUTPUT
-          "feature_sha=$featureSha" >> $env:GITHUB_OUTPUT
-          "composed_sha=$composedSha" >> $env:GITHUB_OUTPUT
-          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
 
-      - name: Skip an unchanged scheduled build
-        id: duplicate
-        if: ${{ github.event_name == 'schedule' }}
+          "official_sha=$officialSha" >> $env:GITHUB_OUTPUT
+          "translation_sha=$translationSha" >> $env:GITHUB_OUTPUT
+          "update_sha=$updateSha" >> $env:GITHUB_OUTPUT
+          "composed_sha=$composedSha" >> $env:GITHUB_OUTPUT
+
+      - name: Resolve monotonic custom version
+        id: channel
         shell: pwsh
         env:
-          ARTIFACT_NAME: ${{ steps.compose.outputs.artifact_name }}
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          OFFICIAL_REF: ${{ steps.release.outputs.official_ref }}
+          OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
+          OFFICIAL_SHA: ${{ steps.compose.outputs.official_sha }}
+          TRANSLATION_SHA: ${{ steps.compose.outputs.translation_sha }}
+          UPDATE_SHA: ${{ steps.compose.outputs.update_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $headers = @{
@@ -173,22 +215,116 @@ jobs:
             Authorization = "Bearer $env:GH_TOKEN"
             'X-GitHub-Api-Version' = '2022-11-28'
           }
-          $encodedName = [Uri]::EscapeDataString($env:ARTIFACT_NAME)
-          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts?name=$encodedName&per_page=10"
-          $response = Invoke-RestMethod -Headers $headers -Uri $uri
-          $active = @($response.artifacts | Where-Object { -not $_.expired })
-          $skip = $active.Count -gt 0
-          "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          if ($skip) { Write-Host "Artifact '$env:ARTIFACT_NAME' already exists; scheduled build skipped." }
+
+          function Get-StatusCode([System.Management.Automation.ErrorRecord]$Record) {
+            if ($null -eq $Record.Exception.Response) { return 0 }
+            return [int]$Record.Exception.Response.StatusCode
+          }
+
+          function Assert-Version([string]$Label, [string]$Value) {
+            if ($Value -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+              throw "$Label has an invalid version: '$Value'"
+            }
+          }
+
+          $state = $null
+          $channelHeadSha = ''
+          $refUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/git/ref/heads/custom-update-channel"
+          try {
+            $channelRef = Invoke-RestMethod -Headers $headers -Uri $refUri
+            $channelHeadSha = [string]$channelRef.object.sha
+            if ($channelHeadSha -notmatch '^[a-f0-9]{40}$') {
+              throw 'custom-update-channel returned an invalid head SHA'
+            }
+          } catch {
+            if ((Get-StatusCode $_) -ne 404) { throw }
+          }
+
+          if ($channelHeadSha) {
+            $contentUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/contents/channel-state.json?ref=custom-update-channel"
+            try {
+              $content = Invoke-RestMethod -Headers $headers -Uri $contentUri
+            } catch {
+              if ((Get-StatusCode $_) -eq 404) {
+                throw 'custom-update-channel exists but channel-state.json is missing'
+              }
+              throw
+            }
+            if ([string]$content.encoding -ne 'base64' -or -not [string]$content.content) {
+              throw 'channel-state.json was not returned as base64 content'
+            }
+            try {
+              $bytes = [Convert]::FromBase64String(([string]$content.content -replace '\s', ''))
+              $state = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            } catch {
+              throw "channel-state.json is invalid: $($_.Exception.Message)"
+            }
+
+            if ([string]$state.schemaVersion -ne '1') { throw 'Unsupported channel-state schema' }
+            Assert-Version 'state.officialVersion' ([string]$state.officialVersion)
+            Assert-Version 'state.customVersion' ([string]$state.customVersion)
+            if ([string]$state.officialRef -ne "v$($state.officialVersion)") { throw 'Invalid state.officialRef' }
+            foreach ($name in @('officialSha', 'translationFeatureSha', 'updateFeedFeatureSha')) {
+              if ([string]$state.$name -notmatch '^[a-f0-9]{40}$') { throw "Invalid state.$name" }
+            }
+            $priorRevision = 0
+            if (-not [int]::TryParse([string]$state.customRevision, [ref]$priorRevision) -or $priorRevision -lt 1 -or $priorRevision -gt 99) {
+              throw 'Invalid state.customRevision'
+            }
+            if ([string]$state.releaseTag -ne 'cindy-custom-stable') { throw 'Invalid state.releaseTag' }
+          }
+
+          Assert-Version 'official version' $env:OFFICIAL_VERSION
+          if ($state -and [version]$env:OFFICIAL_VERSION -lt [version]([string]$state.officialVersion)) {
+            throw "Refusing channel downgrade from official $($state.officialVersion) to $env:OFFICIAL_VERSION"
+          }
+
+          $sameInputs = $state `
+            -and [string]$state.officialRef -eq $env:OFFICIAL_REF `
+            -and [string]$state.officialSha -eq $env:OFFICIAL_SHA `
+            -and [string]$state.translationFeatureSha -eq $env:TRANSLATION_SHA `
+            -and [string]$state.updateFeedFeatureSha -eq $env:UPDATE_SHA
+
+          if ($sameInputs -and $env:EVENT_NAME -ne 'workflow_dispatch') {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            "custom_version=$($state.customVersion)" >> $env:GITHUB_OUTPUT
+            "custom_revision=$($state.customRevision)" >> $env:GITHUB_OUTPUT
+            "channel_head_sha=$channelHeadSha" >> $env:GITHUB_OUTPUT
+            Write-Host "Channel already publishes custom version $($state.customVersion); build skipped."
+            exit 0
+          }
+
+          if ($state -and [string]$state.officialVersion -eq $env:OFFICIAL_VERSION) {
+            $revision = [int]$state.customRevision + 1
+          } else {
+            $revision = 1
+          }
+          if ($revision -lt 1 -or $revision -gt 99) {
+            throw "Custom revision $revision is outside the supported 1..99 range"
+          }
+
+          $parts = $env:OFFICIAL_VERSION.Split('.')
+          $customPatch = ([int]$parts[2] * 100) + $revision
+          if ($customPatch -gt 65535) { throw "Mapped Windows patch component $customPatch exceeds 65535" }
+          $customVersion = "$($parts[0]).$($parts[1]).$customPatch"
+          if ($state -and [version]$customVersion -le [version]([string]$state.customVersion)) {
+            throw "Custom version must increase monotonically: old=$($state.customVersion) new=$customVersion"
+          }
+
+          "skip=false" >> $env:GITHUB_OUTPUT
+          "custom_version=$customVersion" >> $env:GITHUB_OUTPUT
+          "custom_revision=$revision" >> $env:GITHUB_OUTPUT
+          "channel_head_sha=$channelHeadSha" >> $env:GITHUB_OUTPUT
+          Write-Host "Custom app version: $customVersion (official $env:OFFICIAL_VERSION, revision $revision)"
 
       - name: Setup pnpm
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
         with:
           run_install: false
 
       - name: Setup Node.js
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -196,7 +332,7 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -206,11 +342,11 @@ jobs:
           cargo --version
 
       - name: Install dependencies
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         run: pnpm install --frozen-lockfile
 
       - name: Ensure Electron runtime
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -218,23 +354,22 @@ jobs:
           node -e "const fs = require('node:fs'); const executable = require('electron'); if (!fs.existsSync(executable)) throw new Error('Electron executable is missing after install'); console.log(executable)"
 
       - name: Install bundled ripgrep
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         env:
+          # This job's token is read-only and cannot modify the fork.
           GITHUB_TOKEN: ${{ github.token }}
         run: pnpm install:ripgrep
 
       - name: Typecheck Desktop
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
-        env:
-          NODE_OPTIONS: "--max-old-space-size=8192"
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         run: pnpm --filter desktop typecheck
 
       - name: Typecheck maker-shared when available
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         run: pnpm --filter "@cindy/maker-shared" run --if-present typecheck
 
-      - name: Run translation tests
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+      - name: Run fork customization tests
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         run: >-
           pnpm --filter desktop exec vitest run
           src/shared/__tests__/visibleTextTranslation.test.ts
@@ -242,51 +377,565 @@ jobs:
           src/renderer/__tests__/thinkingTextRendering.test.tsx
           src/renderer/__tests__/workGroupBlockLivePreview.test.tsx
           src/renderer/__tests__/workActivityProjection.test.ts
+          src/main/__tests__/customUpdateFeed.test.ts
+          src/main/__tests__/updateService.test.ts
 
       - name: Run complete unit test gate
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         run: pnpm test:unit
 
-      - name: Build unsigned versionless Windows installer
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
-        run: pnpm release:package -- --platform win32 --arch x64 --region global --no-sign
+      - name: Build unsigned versioned Windows installer and hotfix
+        if: ${{ steps.channel.outputs.skip != 'true' }}
+        env:
+          CUSTOM_VERSION: ${{ steps.channel.outputs.custom_version }}
+        run: >-
+          pnpm release:package -- --platform win32 --arch x64 --region global
+          --version $env:CUSTOM_VERSION --no-sign
 
-      - name: Write custom build provenance
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
+      - name: Validate and stage the publication bundle
+        id: metadata
+        if: ${{ steps.channel.outputs.skip != 'true' }}
         shell: pwsh
         env:
+          CUSTOM_VERSION: ${{ steps.channel.outputs.custom_version }}
+          CUSTOM_REVISION: ${{ steps.channel.outputs.custom_revision }}
+          CHANNEL_HEAD_SHA: ${{ steps.channel.outputs.channel_head_sha }}
           OFFICIAL_REF: ${{ steps.release.outputs.official_ref }}
           OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
           OFFICIAL_SHA: ${{ steps.compose.outputs.official_sha }}
-          FEATURE_SHA: ${{ steps.compose.outputs.feature_sha }}
+          TRANSLATION_SHA: ${{ steps.compose.outputs.translation_sha }}
+          UPDATE_SHA: ${{ steps.compose.outputs.update_sha }}
           COMPOSED_SHA: ${{ steps.compose.outputs.composed_sha }}
+          REQUIRE_RELOGIN: ${{ steps.release.outputs.require_relogin }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $artifactDir = 'apps/desktop/release/artifacts/global/unversioned/win32-x64'
-          $provenance = [ordered]@{
+          $artifactDir = "apps/desktop/release/artifacts/global/$env:CUSTOM_VERSION/win32-x64"
+          $buildInfoPath = Join-Path $artifactDir 'build-info.json'
+          $buildInfo = Get-Content -Raw $buildInfoPath | ConvertFrom-Json
+          if ($buildInfo.versionless -or [string]$buildInfo.version -ne $env:CUSTOM_VERSION) {
+            throw 'build-info.json does not describe the requested versioned build'
+          }
+          if ([string]$buildInfo.platformKey -ne 'win32-x64') { throw "Unexpected platform key: $($buildInfo.platformKey)" }
+
+          $hotfixes = @($buildInfo.files | Where-Object role -eq 'hotfix')
+          $installers = @($buildInfo.files | Where-Object role -eq 'installer')
+          if ($hotfixes.Count -ne 1 -or $installers.Count -ne 1) {
+            throw 'Expected exactly one installer and one hotfix in build-info.json'
+          }
+          $hotfix = $hotfixes[0]
+          $installer = $installers[0]
+          foreach ($item in @(
+            @{ Meta = $hotfix; Extension = '.zip' },
+            @{ Meta = $installer; Extension = '.exe' }
+          )) {
+            $name = [string]$item.Meta.name
+            if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or -not $name.EndsWith($item.Extension, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Unsafe build artifact name: '$name'"
+            }
+            $sourcePath = Join-Path $artifactDir $name
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw "Missing build artifact: $sourcePath" }
+            $actualSize = (Get-Item -LiteralPath $sourcePath).Length
+            $actualSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash.ToLowerInvariant()
+            if ($actualSize -ne [int64]$item.Meta.size -or $actualSha -ne ([string]$item.Meta.sha256).ToLowerInvariant()) {
+              throw "Artifact metadata mismatch: $sourcePath"
+            }
+          }
+
+          $stageDir = Join-Path $env:GITHUB_WORKSPACE '.cindy-publish-bundle'
+          if (Test-Path -LiteralPath $stageDir) {
+            Remove-Item -LiteralPath $stageDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+          $installerSourceName = [string]$installer.name
+          $hotfixSourceName = [string]$hotfix.name
+          # Run-scoped asset names let a later scheduled run recover automatically
+          # if Release upload succeeded but the final channel push failed.
+          $installerName = "cindy-$env:CUSTOM_VERSION-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-Setup.exe"
+          $hotfixName = "cindy-$env:CUSTOM_VERSION-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-hotfix.zip"
+          Copy-Item -LiteralPath (Join-Path $artifactDir $installerSourceName) -Destination (Join-Path $stageDir $installerName)
+          Copy-Item -LiteralPath (Join-Path $artifactDir $hotfixSourceName) -Destination (Join-Path $stageDir $hotfixName)
+
+          $appManifest = [ordered]@{
+            version = $env:CUSTOM_VERSION
+            releaseNotes = "基于 Cindy 官方 $env:OFFICIAL_REF 的自动整合版，包含可见文本中文翻译。"
+            hotfix = [ordered]@{ file = $hotfixName; sha256 = ([string]$hotfix.sha256).ToLowerInvariant(); size = [int64]$hotfix.size }
+            installer = [ordered]@{ file = $installerName; sha256 = ([string]$installer.sha256).ToLowerInvariant(); size = [int64]$installer.size }
+          }
+          if ($env:REQUIRE_RELOGIN -eq 'true') { $appManifest.requireRelogin = $true }
+          $manifestPath = Join-Path $stageDir 'manifest-win32-x64.json'
+          [ordered]@{ app = $appManifest } | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $manifestPath
+
+          $assetStem = "cindy-$env:CUSTOM_VERSION-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $versionedBuildInfoPath = Join-Path $stageDir "$assetStem-build-info.json"
+          Copy-Item -LiteralPath $buildInfoPath -Destination $versionedBuildInfoPath
+          $provenancePath = Join-Path $stageDir "$assetStem-provenance.json"
+          [ordered]@{
             officialRepository = 'makecindy/cindy'
             officialRef = $env:OFFICIAL_REF
             officialVersion = $env:OFFICIAL_VERSION
             officialSha = $env:OFFICIAL_SHA
             customizationRepository = 'hbyq/Cindy'
-            featureBranch = 'feature/visible-text-translation'
-            featureSha = $env:FEATURE_SHA
+            translationFeatureSha = $env:TRANSLATION_SHA
+            updateFeedFeatureSha = $env:UPDATE_SHA
             composedSha = $env:COMPOSED_SHA
+            customVersion = $env:CUSTOM_VERSION
+            customRevision = [int]$env:CUSTOM_REVISION
             workflowRepository = $env:GITHUB_REPOSITORY
             workflowRunId = $env:GITHUB_RUN_ID
             workflowRunAttempt = $env:GITHUB_RUN_ATTEMPT
-          }
-          $provenance | ConvertTo-Json | Set-Content -Encoding utf8 "$artifactDir/custom-build-provenance.json"
+          } | ConvertTo-Json | Set-Content -Encoding utf8 $provenancePath
 
-      - name: Upload installer artifact
-        if: ${{ steps.duplicate.outputs.skip != 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          $checksumsPath = Join-Path $stageDir "$assetStem-SHA256SUMS.txt"
+          @(
+            "$(([string]$installer.sha256).ToLowerInvariant())  $installerName",
+            "$(([string]$hotfix.sha256).ToLowerInvariant())  $hotfixName",
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $versionedBuildInfoPath).Hash.ToLowerInvariant())  $(Split-Path -Leaf $versionedBuildInfoPath)",
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $provenancePath).Hash.ToLowerInvariant())  $(Split-Path -Leaf $provenancePath)"
+          ) | Set-Content -Encoding ascii $checksumsPath
+
+          $fileRoles = [ordered]@{
+            installer = Join-Path $stageDir $installerName
+            hotfix = Join-Path $stageDir $hotfixName
+            buildInfo = $versionedBuildInfoPath
+            provenance = $provenancePath
+            checksums = $checksumsPath
+            manifest = $manifestPath
+          }
+          $files = @()
+          foreach ($entry in $fileRoles.GetEnumerator()) {
+            $file = Get-Item -LiteralPath $entry.Value
+            $files += [ordered]@{
+              role = [string]$entry.Key
+              name = $file.Name
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+              size = [int64]$file.Length
+            }
+          }
+          $planPath = Join-Path $stageDir 'publish-plan.json'
+          [ordered]@{
+            schemaVersion = 1
+            repository = $env:GITHUB_REPOSITORY
+            releaseTag = 'cindy-custom-stable'
+            channelHeadSha = $env:CHANNEL_HEAD_SHA
+            officialRef = $env:OFFICIAL_REF
+            officialVersion = $env:OFFICIAL_VERSION
+            officialSha = $env:OFFICIAL_SHA
+            translationFeatureSha = $env:TRANSLATION_SHA
+            updateFeedFeatureSha = $env:UPDATE_SHA
+            customVersion = $env:CUSTOM_VERSION
+            customRevision = [int]$env:CUSTOM_REVISION
+            workflowRunId = $env:GITHUB_RUN_ID
+            workflowRunAttempt = $env:GITHUB_RUN_ATTEMPT
+            files = $files
+          } | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $planPath
+
+          "stage_dir=$stageDir" >> $env:GITHUB_OUTPUT
+          "cache_key=cindy-publish-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+          "run_attempt=$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+
+      - name: Save isolated build handoff in the 10 GB Actions cache
+        if: ${{ steps.channel.outputs.skip != 'true' }}
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
-          name: ${{ steps.compose.outputs.artifact_name }}
-          path: |
-            apps/desktop/release/artifacts/global/unversioned/win32-x64/cindy-unversioned-Setup.exe
-            apps/desktop/release/artifacts/global/unversioned/win32-x64/build-info.json
-            apps/desktop/release/artifacts/global/unversioned/win32-x64/custom-build-provenance.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
+          path: .cindy-publish-bundle
+          key: ${{ steps.metadata.outputs.cache_key }}
+          enableCrossOsArchive: true
+
+  publish:
+    if: ${{ needs.build.result == 'success' && needs.build.outputs.skipped != 'true' }}
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Restore build handoff without checking out source
+        id: handoff
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: .cindy-publish-bundle
+          key: ${{ needs.build.outputs.handoff_key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Strictly validate the isolated publication bundle
+        id: validate
+        shell: pwsh
+        env:
+          BUNDLE_DIR: ${{ github.workspace }}/.cindy-publish-bundle
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+          EXPECTED_BUILD_RUN_ATTEMPT: ${{ needs.build.outputs.build_run_attempt }}
+          EXPECTED_CHANNEL_HEAD: ${{ needs.build.outputs.channel_head_sha }}
+          EXPECTED_OFFICIAL_REF: ${{ needs.build.outputs.official_ref }}
+          EXPECTED_OFFICIAL_VERSION: ${{ needs.build.outputs.official_version }}
+          EXPECTED_OFFICIAL_SHA: ${{ needs.build.outputs.official_sha }}
+          EXPECTED_TRANSLATION_SHA: ${{ needs.build.outputs.translation_sha }}
+          EXPECTED_UPDATE_SHA: ${{ needs.build.outputs.update_sha }}
+          EXPECTED_CUSTOM_VERSION: ${{ needs.build.outputs.custom_version }}
+          EXPECTED_CUSTOM_REVISION: ${{ needs.build.outputs.custom_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $planPath = Join-Path $env:BUNDLE_DIR 'publish-plan.json'
+          $plan = Get-Content -Raw -LiteralPath $planPath | ConvertFrom-Json
+          $expectations = [ordered]@{
+            schemaVersion = '1'
+            repository = $env:EXPECTED_REPOSITORY
+            releaseTag = 'cindy-custom-stable'
+            channelHeadSha = $env:EXPECTED_CHANNEL_HEAD
+            officialRef = $env:EXPECTED_OFFICIAL_REF
+            officialVersion = $env:EXPECTED_OFFICIAL_VERSION
+            officialSha = $env:EXPECTED_OFFICIAL_SHA
+            translationFeatureSha = $env:EXPECTED_TRANSLATION_SHA
+            updateFeedFeatureSha = $env:EXPECTED_UPDATE_SHA
+            customVersion = $env:EXPECTED_CUSTOM_VERSION
+            customRevision = $env:EXPECTED_CUSTOM_REVISION
+            workflowRunId = $env:EXPECTED_RUN_ID
+            workflowRunAttempt = $env:EXPECTED_BUILD_RUN_ATTEMPT
+          }
+          foreach ($entry in $expectations.GetEnumerator()) {
+            if ([string]$plan.($entry.Key) -cne [string]$entry.Value) {
+              throw "Publication plan mismatch for $($entry.Key)"
+            }
+          }
+          if ($env:EXPECTED_CUSTOM_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw 'Expected custom version is invalid'
+          }
+          foreach ($sha in @($env:EXPECTED_OFFICIAL_SHA, $env:EXPECTED_TRANSLATION_SHA, $env:EXPECTED_UPDATE_SHA)) {
+            if ($sha -notmatch '^[a-f0-9]{40}$') { throw 'Expected source SHA is invalid' }
+          }
+
+          $files = @($plan.files)
+          $roles = @('installer', 'hotfix', 'buildInfo', 'provenance', 'checksums', 'manifest')
+          if ($files.Count -ne $roles.Count) { throw 'Publication plan must contain exactly six files' }
+          foreach ($role in $roles) {
+            if (@($files | Where-Object role -ceq $role).Count -ne 1) { throw "Missing or duplicate file role: $role" }
+          }
+          $names = @($files | ForEach-Object { [string]$_.name })
+          if (@($names | Select-Object -Unique).Count -ne $names.Count) { throw 'Publication plan contains duplicate names' }
+          $expectedEntries = @('publish-plan.json') + $names
+          $actualEntries = @(Get-ChildItem -Force -LiteralPath $env:BUNDLE_DIR)
+          if (@($actualEntries | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0) {
+            throw 'Publication bundle contains a directory or symbolic link'
+          }
+          $difference = @(Compare-Object ($expectedEntries | Sort-Object) ($actualEntries.Name | Sort-Object))
+          if ($difference.Count -ne 0) { throw 'Publication bundle contains missing or unexpected entries' }
+
+          foreach ($file in $files) {
+            $name = [string]$file.name
+            $sha = [string]$file.sha256
+            $size = [int64]$file.size
+            if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $sha -notmatch '^[a-f0-9]{64}$' -or $size -le 0) {
+              throw "Unsafe publication descriptor for role $($file.role)"
+            }
+            $path = Join-Path $env:BUNDLE_DIR $name
+            $item = Get-Item -LiteralPath $path
+            $actualSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($item.Length -ne $size -or $actualSha -cne $sha) { throw "Publication file mismatch: $name" }
+          }
+
+          function File-For([string]$Role) { return @($files | Where-Object role -ceq $Role)[0] }
+          $installer = File-For 'installer'
+          $hotfix = File-For 'hotfix'
+          $buildInfoFile = File-For 'buildInfo'
+          $provenanceFile = File-For 'provenance'
+          $checksumsFile = File-For 'checksums'
+          $manifestFile = File-For 'manifest'
+          $expectedAssetStem = "cindy-$env:EXPECTED_CUSTOM_VERSION-$env:EXPECTED_RUN_ID-$env:EXPECTED_BUILD_RUN_ATTEMPT"
+          if ([string]$installer.name -cne "$expectedAssetStem-Setup.exe") { throw 'Installer name is invalid' }
+          if ([string]$hotfix.name -cne "$expectedAssetStem-hotfix.zip") { throw 'Hotfix name is invalid' }
+          if ([string]$buildInfoFile.name -cne "$expectedAssetStem-build-info.json") { throw 'Build-info name is invalid' }
+          if ([string]$provenanceFile.name -cne "$expectedAssetStem-provenance.json") { throw 'Provenance name is invalid' }
+          if ([string]$checksumsFile.name -cne "$expectedAssetStem-SHA256SUMS.txt") { throw 'Checksum name is invalid' }
+          if ([string]$manifestFile.name -cne 'manifest-win32-x64.json') { throw 'Manifest name is invalid' }
+
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $env:BUNDLE_DIR $manifestFile.name) | ConvertFrom-Json
+          if ([string]$manifest.app.version -cne $env:EXPECTED_CUSTOM_VERSION) { throw 'Manifest version mismatch' }
+          foreach ($pair in @(
+            @{ Actual = $manifest.app.installer; Planned = $installer },
+            @{ Actual = $manifest.app.hotfix; Planned = $hotfix }
+          )) {
+            if ([string]$pair.Actual.file -cne [string]$pair.Planned.name -or
+                [string]$pair.Actual.sha256 -cne [string]$pair.Planned.sha256 -or
+                [int64]$pair.Actual.size -ne [int64]$pair.Planned.size) {
+              throw 'Manifest asset metadata mismatch'
+            }
+          }
+
+          $buildInfo = Get-Content -Raw -LiteralPath (Join-Path $env:BUNDLE_DIR $buildInfoFile.name) | ConvertFrom-Json
+          if ($buildInfo.versionless -or [string]$buildInfo.version -cne $env:EXPECTED_CUSTOM_VERSION -or [string]$buildInfo.platformKey -cne 'win32-x64') {
+            throw 'Versioned build-info validation failed'
+          }
+          $provenance = Get-Content -Raw -LiteralPath (Join-Path $env:BUNDLE_DIR $provenanceFile.name) | ConvertFrom-Json
+          foreach ($entry in ([ordered]@{
+            officialRepository = 'makecindy/cindy'
+            officialRef = $env:EXPECTED_OFFICIAL_REF
+            officialVersion = $env:EXPECTED_OFFICIAL_VERSION
+            officialSha = $env:EXPECTED_OFFICIAL_SHA
+            customizationRepository = 'hbyq/Cindy'
+            translationFeatureSha = $env:EXPECTED_TRANSLATION_SHA
+            updateFeedFeatureSha = $env:EXPECTED_UPDATE_SHA
+            customVersion = $env:EXPECTED_CUSTOM_VERSION
+            customRevision = $env:EXPECTED_CUSTOM_REVISION
+            workflowRepository = $env:EXPECTED_REPOSITORY
+            workflowRunId = $env:EXPECTED_RUN_ID
+            workflowRunAttempt = $env:EXPECTED_BUILD_RUN_ATTEMPT
+          }).GetEnumerator()) {
+            if ([string]$provenance.($entry.Key) -cne [string]$entry.Value) { throw "Provenance mismatch for $($entry.Key)" }
+          }
+
+          foreach ($role in @('installer', 'hotfix', 'buildInfo', 'provenance', 'checksums', 'manifest')) {
+            $file = File-For $role
+            "$($role)_path=$(Join-Path $env:BUNDLE_DIR $file.name)" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Publish only absent or byte-identical Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_PATH: ${{ steps.validate.outputs.installer_path }}
+          HOTFIX_PATH: ${{ steps.validate.outputs.hotfix_path }}
+          BUILD_INFO_PATH: ${{ steps.validate.outputs.buildInfo_path }}
+          PROVENANCE_PATH: ${{ steps.validate.outputs.provenance_path }}
+          CHECKSUMS_PATH: ${{ steps.validate.outputs.checksums_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $tag = 'cindy-custom-stable'
+          $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          try {
+            $release = Invoke-RestMethod -Headers $headers -Uri $releaseUri
+          } catch {
+            $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            if ($status -ne 404) { throw }
+            $payload = @{
+              tag_name = $tag
+              target_commitish = 'main'
+              name = 'Cindy 中文增强（自动更新通道）'
+              body = '非官方自动构建。首次从 0.0.0 迁移需手动安装；后续由应用内更新提示重启。'
+              draft = $false
+              prerelease = $true
+            } | ConvertTo-Json
+            $release = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases" -Body $payload
+          }
+          if ([string]$release.tag_name -cne $tag -or $release.draft -eq $true) { throw 'Unexpected Release state' }
+
+          function Get-RemoteAssetSha($Asset) {
+            $digest = [string]$Asset.digest
+            if ($digest -match '^sha256:([a-f0-9]{64})$') { return $Matches[1] }
+            $tempFile = Join-Path $env:RUNNER_TEMP "remote-asset-$($Asset.id)"
+            $downloadHeaders = $headers.Clone()
+            $downloadHeaders.Accept = 'application/octet-stream'
+            Invoke-WebRequest -Headers $downloadHeaders -Uri ([string]$Asset.url) -OutFile $tempFile
+            return (Get-FileHash -Algorithm SHA256 -LiteralPath $tempFile).Hash.ToLowerInvariant()
+          }
+
+          foreach ($path in @($env:INSTALLER_PATH, $env:HOTFIX_PATH, $env:BUILD_INFO_PATH, $env:PROVENANCE_PATH, $env:CHECKSUMS_PATH)) {
+            $local = Get-Item -LiteralPath $path
+            $localSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            $release = Invoke-RestMethod -Headers $headers -Uri $releaseUri
+            $matches = @($release.assets | Where-Object name -ceq $local.Name)
+            if ($matches.Count -gt 1) { throw "Release contains duplicate asset name: $($local.Name)" }
+            if ($matches.Count -eq 1) {
+              $remote = $matches[0]
+              if ([int64]$remote.size -ne $local.Length -or (Get-RemoteAssetSha $remote) -cne $localSha) {
+                throw "Refusing to overwrite a different Release asset: $($local.Name)"
+              }
+              Write-Host "Reusing byte-identical Release asset $($local.Name)"
+              continue
+            }
+            gh release upload $tag --repo $env:GITHUB_REPOSITORY $path
+            if ($LASTEXITCODE -ne 0) { throw "Unable to upload Release asset: $($local.Name)" }
+            $release = Invoke-RestMethod -Headers $headers -Uri $releaseUri
+            $uploaded = @($release.assets | Where-Object name -ceq $local.Name)
+            if ($uploaded.Count -ne 1 -or [int64]$uploaded[0].size -ne $local.Length -or (Get-RemoteAssetSha $uploaded[0]) -cne $localSha) {
+              throw "Uploaded Release asset did not verify: $($local.Name)"
+            }
+          }
+
+      - name: Advance the update channel as the final operation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_DIR: ${{ github.workspace }}/.cindy-publish-bundle
+          EXPECTED_CHANNEL_HEAD: ${{ needs.build.outputs.channel_head_sha }}
+          CUSTOM_VERSION: ${{ needs.build.outputs.custom_version }}
+          CUSTOM_REVISION: ${{ needs.build.outputs.custom_revision }}
+          OFFICIAL_REF: ${{ needs.build.outputs.official_ref }}
+          OFFICIAL_VERSION: ${{ needs.build.outputs.official_version }}
+          OFFICIAL_SHA: ${{ needs.build.outputs.official_sha }}
+          TRANSLATION_SHA: ${{ needs.build.outputs.translation_sha }}
+          UPDATE_SHA: ${{ needs.build.outputs.update_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifestPath = Join-Path $env:BUNDLE_DIR 'manifest-win32-x64.json'
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $channelDir = Join-Path $env:RUNNER_TEMP 'cindy-custom-update-channel'
+          New-Item -ItemType Directory -Path $channelDir | Out-Null
+          git -C $channelDir init
+          git -C $channelDir config user.name 'hbyq'
+          git -C $channelDir config user.email '51372765+hbyq@users.noreply.github.com'
+          $authUrl = "https://x-access-token:$env:GH_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git -C $channelDir remote add origin $authUrl
+
+          $remoteLines = @(git -C $channelDir ls-remote origin refs/heads/custom-update-channel)
+          $lsExit = $LASTEXITCODE
+          if ($lsExit -ne 0) { throw 'Unable to query custom-update-channel' }
+          if ($remoteLines.Count -gt 1) { throw 'custom-update-channel returned multiple heads' }
+          $remoteHead = if ($remoteLines.Count -eq 1) { ([string]$remoteLines[0] -split '\s+')[0] } else { '' }
+          if ($remoteHead -cne $env:EXPECTED_CHANNEL_HEAD) {
+            throw "Channel changed after the build: expected '$env:EXPECTED_CHANNEL_HEAD', found '$remoteHead'"
+          }
+          if ($remoteHead) {
+            git -C $channelDir fetch --depth=1 origin refs/heads/custom-update-channel
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to fetch custom-update-channel' }
+            git -C $channelDir checkout -B custom-update-channel FETCH_HEAD
+          } else {
+            git -C $channelDir checkout --orphan custom-update-channel
+          }
+
+          Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $channelDir 'manifest-win32-x64.json')
+          [ordered]@{
+            schemaVersion = 1
+            officialRef = $env:OFFICIAL_REF
+            officialVersion = $env:OFFICIAL_VERSION
+            officialSha = $env:OFFICIAL_SHA
+            translationFeatureSha = $env:TRANSLATION_SHA
+            updateFeedFeatureSha = $env:UPDATE_SHA
+            customRevision = [int]$env:CUSTOM_REVISION
+            customVersion = $env:CUSTOM_VERSION
+            releaseTag = 'cindy-custom-stable'
+            installerFile = [string]$manifest.app.installer.file
+            hotfixFile = [string]$manifest.app.hotfix.file
+            workflowRunUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            publishedAt = [DateTimeOffset]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $channelDir 'channel-state.json')
+          @'
+          # Cindy custom update channel
+
+          Machine-managed metadata for the unofficial hbyq/Cindy Windows update channel.
+          Release assets are uploaded and SHA-256 verified before this branch is advanced.
+          '@ | Set-Content -Encoding utf8 (Join-Path $channelDir 'README.md')
+
+          git -C $channelDir add README.md channel-state.json manifest-win32-x64.json
+          git -C $channelDir commit -s -m "chore(channel): publish Cindy $env:CUSTOM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to commit custom update channel state' }
+          git -C $channelDir push origin HEAD:refs/heads/custom-update-channel
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to advance custom-update-channel' }
+
+  cleanup-handoff:
+    if: ${{ needs.publish.result == 'success' }}
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Best-effort deletion of the temporary handoff cache
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HANDOFF_KEY: ${{ needs.build.outputs.handoff_key }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $key = [Uri]::EscapeDataString($env:HANDOFF_KEY)
+          $ref = [Uri]::EscapeDataString($env:GITHUB_REF)
+          Invoke-RestMethod -Method Delete -Headers $headers `
+            -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/caches?key=$key&ref=$ref" | Out-Null
+
+  report-status:
+    if: ${{ always() && github.repository == 'hbyq/Cindy' }}
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Open, update, or close the persistent failure issue
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          BUILD_SKIPPED: ${{ needs.build.outputs.skipped }}
+          CUSTOM_VERSION: ${{ needs.build.outputs.custom_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $repo = Invoke-RestMethod -Headers $headers -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY"
+          if ($repo.has_issues -ne $true) {
+            Write-Warning 'Repository Issues are disabled; native GitHub Actions failure notifications remain active.'
+            exit 0
+          }
+
+          $title = '[自动构建失败] Cindy 中文增强'
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $issues = Invoke-RestMethod -Headers $headers `
+            -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues?state=all&sort=updated&direction=desc&per_page=100"
+          $issue = @($issues | Where-Object { -not $_.pull_request -and [string]$_.title -ceq $title } | Select-Object -First 1)
+          $healthy = $env:BUILD_RESULT -eq 'success' -and (
+            $env:BUILD_SKIPPED -eq 'true' -or $env:PUBLISH_RESULT -eq 'success'
+          )
+
+          if (-not $healthy) {
+            $body = @"
+          自动整合、编译或发布没有成功。
+
+          - 构建任务：$env:BUILD_RESULT
+          - 发布任务：$env:PUBLISH_RESULT
+          - 运行：$runUrl
+          - 触发：$env:GITHUB_EVENT_NAME
+          - 分支提交：$env:GITHUB_SHA
+
+          构建任务没有 Release 写权限；发布任务只在最后一步推进更新通道。请以 custom-update-channel 的 channel-state.json 为实际发布状态。
+          "@
+            if ($issue.Count -eq 0) {
+              $payload = @{ title = $title; body = $body; assignees = @('hbyq') } | ConvertTo-Json
+              Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+                -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues" -Body $payload | Out-Null
+            } else {
+              $number = [int]$issue[0].number
+              if ([string]$issue[0].state -eq 'closed') {
+                $payload = @{ state = 'open' } | ConvertTo-Json
+                Invoke-RestMethod -Method Patch -Headers $headers -ContentType 'application/json' `
+                  -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$number" -Body $payload | Out-Null
+              }
+              $payload = @{ body = $body } | ConvertTo-Json
+              Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+                -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$number/comments" -Body $payload | Out-Null
+            }
+            exit 0
+          }
+
+          if ($issue.Count -gt 0 -and [string]$issue[0].state -eq 'open') {
+            $number = [int]$issue[0].number
+            $versionText = if ($env:CUSTOM_VERSION) { "，当前通道版本 $env:CUSTOM_VERSION" } else { '' }
+            $payload = @{ body = "自动构建已恢复$versionText。运行：$runUrl" } | ConvertTo-Json
+            Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$number/comments" -Body $payload | Out-Null
+            $payload = @{ state = 'closed' } | ConvertTo-Json
+            Invoke-RestMethod -Method Patch -Headers $headers -ContentType 'application/json' `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$number" -Body $payload | Out-Null
+          }
