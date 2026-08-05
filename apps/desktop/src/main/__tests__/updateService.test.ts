@@ -71,9 +71,26 @@ vi.mock('../auto-update-settings-store', () => ({
 }));
 
 vi.mock('../manifestService', () => ({
-  fetchManifest,
-  getBaseUrl,
   isDev,
+}));
+
+vi.mock('../customUpdateFeed', () => ({
+  compareCustomUpdateVersions: (left: string, right: string) => {
+    const pattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+    const leftMatch = pattern.exec(left);
+    const rightMatch = pattern.exec(right);
+    if (!leftMatch || !rightMatch) return null;
+    const leftParts = leftMatch.slice(1).map(Number);
+    const rightParts = rightMatch.slice(1).map(Number);
+    if ([...leftParts, ...rightParts].some((part) => !Number.isSafeInteger(part))) return null;
+    for (let index = 0; index < leftParts.length; index++) {
+      if (leftParts[index] < rightParts[index]) return -1;
+      if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
+  },
+  fetchCustomUpdateManifest: fetchManifest,
+  getCustomUpdateBaseUrl: getBaseUrl,
 }));
 
 vi.mock('../downloader/index', () => ({
@@ -314,6 +331,78 @@ describe('checkForUpdate 版本无关(占位 0.0.0)打包豁免', () => {
     expect(service.isVersionlessAppVersion('0.0.0-dev')).toBe(true);
     expect(service.isVersionlessAppVersion('0.0.1')).toBe(false);
     expect(service.isVersionlessAppVersion('1.0.0')).toBe(false);
+  });
+});
+
+describe('update version monotonicity', () => {
+  it.each(['0.0.64', '0.0.63', 'not-a-version'])(
+    'rejects a background manifest that is not newer than the current version: %s',
+    async (version) => {
+      const service = await freshUpdateService('win32');
+      expect(await service.checkForUpdate(updateManifest(version))).toBe('idle');
+      expect(service.getUpdateStatus()).toBe('idle');
+      expect(download).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps a newer ready patch when the channel temporarily serves an older version', async () => {
+    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
+    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, 'update');
+      return { path: targetPath, size: 123 };
+    });
+
+    const service = await freshUpdateService('win32');
+    expect(await service.checkForUpdate(updateManifest('0.0.66'))).toBe('ready');
+    expect(await service.checkForUpdate(updateManifest('0.0.65'))).toBe('ready');
+    expect(service.getUpdateStatus()).toBe('ready');
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['0.0.64', '0.0.63', 'invalid'])(
+    'rejects an offline local patch at v%s',
+    async (version) => {
+      fetchManifest.mockResolvedValue(null);
+      const updatesDir = path.join(TEST_USER_DATA, 'updates');
+      fs.mkdirSync(updatesDir, { recursive: true });
+      fs.writeFileSync(path.join(updatesDir, 'stale.zip'), 'zip');
+      fs.writeFileSync(
+        path.join(updatesDir, 'patch-info.json'),
+        JSON.stringify({ version, fileName: 'stale.zip', sha256: 'abc' }),
+      );
+
+      const service = await freshUpdateService('win32');
+      service.initUpdateService();
+      try {
+        const handler = ipcHandlers.get('update-check-startup');
+        if (!handler) throw new Error('update-check-startup handler not registered');
+        await expect(handler()).resolves.toMatchObject({
+          hasUpdate: false,
+          action: 'none',
+          error: 'manifest_failed',
+        });
+        expect(fs.existsSync(path.join(updatesDir, 'stale.zip'))).toBe(false);
+        expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
+        expect(download).not.toHaveBeenCalled();
+      } finally {
+        service.stopUpdateService();
+      }
+    },
+  );
+
+  it('rejects an older startup manifest without downloading it', async () => {
+    fetchManifest.mockResolvedValue(updateManifest('0.0.63'));
+    const service = await freshUpdateService('win32');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({ hasUpdate: false, action: 'none' });
+      expect(download).not.toHaveBeenCalled();
+    } finally {
+      service.stopUpdateService();
+    }
   });
 });
 

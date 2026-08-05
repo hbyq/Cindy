@@ -28,8 +28,13 @@ import os from 'node:os';
 
 import { BRAND_IDENTITY } from '@cindy/maker-shared/brand-identity';
 
-import { fetchManifest, getBaseUrl, isDev } from './manifestService';
+import { isDev } from './manifestService';
 import type { Manifest } from './manifestService';
+import {
+  compareCustomUpdateVersions,
+  fetchCustomUpdateManifest,
+  getCustomUpdateBaseUrl,
+} from './customUpdateFeed';
 import { download, DownloadError } from './downloader/index';
 import { ProgressNormalizer } from './updateProgressNormalizer';
 
@@ -507,9 +512,15 @@ function checkExistingPatch(): { action: 'relaunch' | 'check' | 'none'; version?
   }
 
   const currentVersion = app.getVersion();
-  if (patchInfo.version === currentVersion) {
-    // Patch matches current version → already applied; clean up and re-check.
-    try { fs.unlinkSync(patchFilePath); } catch { /* ignore */ }
+  const patchOrder = compareCustomUpdateVersions(patchInfo.version, currentVersion);
+  if (patchOrder === null || patchOrder <= 0) {
+    // Invalid, already-applied, or older patches must never be relaunched.
+    log.warn('Discarding non-upgrade patch v%s for current v%s', patchInfo.version, currentVersion);
+    try {
+      fs.unlinkSync(patchFilePath);
+    } catch {
+      /* ignore */
+    }
     removePatchInfo();
     return { action: 'check' };
   }
@@ -704,7 +715,7 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
     setStatus('checking');
   }
 
-  const manifest = manifestOverride ?? await fetchManifest();
+  const manifest = manifestOverride ?? await fetchCustomUpdateManifest();
   if (!manifest) {
     log.info('Manifest fetch failed');
     if (!wasReady) currentStatus = 'idle';
@@ -722,21 +733,30 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
   const currentVersion = app.getVersion();
   log.info('Version check: current=%s, latest=%s, ready=%s', currentVersion, latestVersion, previousReadyVersion ?? '<none>');
 
-  if (latestVersion === currentVersion) {
-    log.info('Versions match, no update needed');
+  const currentOrder = compareCustomUpdateVersions(latestVersion, currentVersion);
+  if (currentOrder === null || currentOrder <= 0) {
+    log.info('Manifest version is invalid or not newer; update rejected');
     if (!wasReady) currentStatus = 'idle';
-    return 'idle';
+    return wasReady ? 'ready' : 'idle';
   }
 
-  // wasReady 且 manifest 仍是已下好的同一个版本 → 无事发生,保持 ready。
-  if (wasReady && latestVersion === previousReadyVersion) {
-    log.info('Ready patch v%s still matches latest — no superseding needed', previousReadyVersion);
-    return 'ready';
+  if (wasReady) {
+    const readyOrder = previousReadyVersion === undefined
+      ? null
+      : compareCustomUpdateVersions(latestVersion, previousReadyVersion);
+    if (readyOrder === null || readyOrder <= 0) {
+      log.info(
+        'Manifest v%s does not supersede ready patch v%s; keeping ready patch',
+        latestVersion,
+        previousReadyVersion ?? '<invalid>',
+      );
+      return 'ready';
+    }
   }
 
   log.info('Update available: %s → %s (wasReady=%s)', currentVersion, latestVersion, wasReady);
 
-  const downloadUrl = `${getBaseUrl()}/${asset.file}`;
+  const downloadUrl = `${getCustomUpdateBaseUrl()}/${asset.file}`;
   const fileName = path.basename(asset.file);
   const destPath = path.join(getUpdatesDir(), fileName);
 
@@ -1234,7 +1254,7 @@ export function initUpdateService(): void {
       // Step 1: prefer manifest (so we don't relaunch into a stale intermediate version).
       // 启动态用短超时，避免 external CDN 慢时阻塞启动关键路径（#26）。
       // 后台 30-min 轮询仍走默认 30s 超时。
-      const manifest = await fetchManifest(STARTUP_MANIFEST_TIMEOUT_MS);
+      const manifest = await fetchCustomUpdateManifest(STARTUP_MANIFEST_TIMEOUT_MS);
 
       if (!manifest) {
         // Network unavailable — fall back to local patch.
@@ -1251,8 +1271,10 @@ export function initUpdateService(): void {
       const currentVersion = app.getVersion();
       log.info('Startup: current=%s, latest=%s', currentVersion, latestVersion);
 
-      if (latestVersion === currentVersion) {
-        // Already up to date — clean up any stale patch directory.
+      const currentOrder = compareCustomUpdateVersions(latestVersion, currentVersion);
+      if (currentOrder === null || currentOrder <= 0) {
+        // Invalid/equal/older manifests cannot trigger a download. Any local
+        // patch that is itself not an upgrade is removed by this check.
         checkExistingPatch();
         return { hasUpdate: false, action: 'none' as const };
       }
