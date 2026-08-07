@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       official_ref:
-        description: "stable，或指定官方稳定标签（例如 v0.1.33）；手动运行会生成新修订版"
+        description: "stable，或指定官方稳定标签（例如 v0.1.36）；手动运行会生成新修订版"
         required: true
         default: stable
         type: string
@@ -117,13 +117,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.33'
-          $updateRef = 'refs/remotes/customization/feature/custom-update-feed-v0.1.30'
+          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.36'
+          $updateRef = 'refs/remotes/customization/feature/custom-update-feed-v0.1.36'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
-            '+refs/heads/feature/visible-text-translation-v0.1.33:refs/remotes/customization/feature/visible-text-translation-v0.1.33' `
-            '+refs/heads/feature/custom-update-feed-v0.1.30:refs/remotes/customization/feature/custom-update-feed-v0.1.30'
+            '+refs/heads/feature/visible-text-translation-v0.1.36:refs/remotes/customization/feature/visible-text-translation-v0.1.36' `
+            '+refs/heads/feature/custom-update-feed-v0.1.36:refs/remotes/customization/feature/custom-update-feed-v0.1.36'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
 
           git config user.name 'hbyq'
