@@ -388,6 +388,9 @@ jobs:
         if: ${{ steps.channel.outputs.skip != 'true' }}
         env:
           CUSTOM_VERSION: ${{ steps.channel.outputs.custom_version }}
+          # A stable-tag build must freeze migrations against that selected release,
+          # not the moving upstream main branch fetched by actions/checkout.
+          XDT_MIGRATION_BASE_REF: ${{ steps.compose.outputs.official_sha }}
         run: >-
           pnpm release:package -- --platform win32 --arch x64 --region global
           --version $env:CUSTOM_VERSION --no-sign
