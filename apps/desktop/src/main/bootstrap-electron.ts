@@ -331,6 +331,7 @@ import { readFileBytesForPreview } from './fileReadBytes.js';
 import { initHeartbeatService } from './heartbeatService';
 import { initAnalyticsSettingsService, noteAuthColdStartState } from './analyticsSettingsService';
 import { initLogUploadService, scheduleStartupBackfill } from './log-upload';
+import { registerVisibleTextTranslationIpc } from './visibleTextTranslationService.js';
 import { WindowManualDragController } from './windowManualDrag';
 // 设备互联(跨设备远程控制): relay 连接 host + 开关/设备列表 IPC
 import {
@@ -6564,6 +6565,9 @@ app.on('ready', async () => {
   // log-upload:settings-get 决定入口可用性;更重要的是崩溃即时路径要在
   // onFatalShutdown 上就位,否则 createWindow 之后立刻崩的那一次拿不到标记。
   initLogUploadService();
+  // 可见工作摘要翻译是 owner 级全局显示增强。handler 只在请求发生时读取
+  // 设置/Provider，原始 agent 事件与启动关键路径均不等待网络。
+  registerVisibleTextTranslationIpc({ getMaker: getMakerCore });
   startupWindowCreationAllowed = true;
   createWindow();
   // 预热仅服务 dev macOS，延迟执行避免和启动关键路径争用 CPU；失败由入口内部吞掉。
