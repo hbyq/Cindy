@@ -118,12 +118,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
           $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.36'
-          $updateRef = 'refs/remotes/customization/feature/custom-update-feed-v0.1.36'
+          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.36'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
             '+refs/heads/feature/visible-text-translation-v0.1.36:refs/remotes/customization/feature/visible-text-translation-v0.1.36' `
-            '+refs/heads/feature/custom-update-feed-v0.1.36:refs/remotes/customization/feature/custom-update-feed-v0.1.36'
+            '+refs/heads/feature/fork-update-and-build-v0.1.36:refs/remotes/customization/feature/fork-update-and-build-v0.1.36'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
 
           git config user.name 'hbyq'
@@ -185,11 +185,13 @@ jobs:
             'apps/desktop/src/main/__tests__/customUpdateFeed.test.ts',
             'apps/desktop/src/main/__tests__/updateService.test.ts',
             'apps/desktop/src/main/customUpdateFeed.ts',
-            'apps/desktop/src/main/updateService.ts'
+            'apps/desktop/src/main/updateService.ts',
+            'scripts/__tests__/log-upload-build-env.test.mjs',
+            'scripts/shared/log-upload-build-env.mjs'
           )
 
           $translationSha = Assert-And-CherryPick -Label 'Translation customization' -Ref $translationRef -AllowedPaths $translationPaths
-          $updateSha = Assert-And-CherryPick -Label 'Fork update feed customization' -Ref $updateRef -AllowedPaths $updatePaths
+          $updateSha = Assert-And-CherryPick -Label 'Fork update/build customization' -Ref $updateRef -AllowedPaths $updatePaths
           $composedSha = (git rev-parse HEAD).Trim()
 
           "official_sha=$officialSha" >> $env:GITHUB_OUTPUT
@@ -391,6 +393,9 @@ jobs:
           # A stable-tag build must freeze migrations against that selected release,
           # not the moving upstream main branch fetched by actions/checkout.
           XDT_MIGRATION_BASE_REF: ${{ steps.compose.outputs.official_sha }}
+          # The fork has no access to the official private SLS config. Disable upload
+          # explicitly so no official or accidental endpoint is baked into fork builds.
+          XDT_FORK_DISABLE_LOG_UPLOAD: '1'
         run: >-
           pnpm release:package -- --platform win32 --arch x64 --region global
           --version $env:CUSTOM_VERSION --no-sign
