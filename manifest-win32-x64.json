@@ -1,16 +1,16 @@
 {
   "app": {
-    "version": "0.1.4301",
-    "releaseNotes": "基于 Cindy 官方 v0.1.43 的自动整合版，包含可见文本中文翻译。",
+    "version": "0.1.4401",
+    "releaseNotes": "基于 Cindy 官方 v0.1.44 的自动整合版，包含可见文本中文翻译。",
     "hotfix": {
-      "file": "cindy-0.1.4301-31407349038-1-hotfix.zip",
-      "sha256": "6cad5dc20147ff619f377d414233ad1ab75ddec91601005a3eab5abf6ddbc0d7",
-      "size": 292032687
+      "file": "cindy-0.1.4401-31459116706-1-hotfix.zip",
+      "sha256": "7596ec4b9efe88046a8347216c02aa98c3ce2d0072650d3c1698e1236d949bc5",
+      "size": 292029657
     },
     "installer": {
-      "file": "cindy-0.1.4301-31407349038-1-Setup.exe",
-      "sha256": "bca3b6066342b21a462aaf748844a0e0248c9b7680e4b9285b6f3bad737adb1e",
-      "size": 216779532
+      "file": "cindy-0.1.4401-31459116706-1-Setup.exe",
+      "sha256": "5e56801d50a38ba3716af31c09bfbb7798e549aacf3b234d92f0c7b50601b9c8",
+      "size": 216757955
     }
   }
 }
