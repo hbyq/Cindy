@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       official_ref:
-        description: "stable，或指定官方稳定标签（例如 v0.1.38）；手动运行会生成新修订版"
+        description: "stable，或指定官方稳定标签（例如 v0.1.45）；手动运行会生成新修订版"
         required: true
         default: stable
         type: string
@@ -96,20 +96,134 @@ jobs:
           lfs: true
           persist-credentials: false
 
-      - name: Verify and fetch the official protocol submodule
+      - name: Verify and prepare official protocol sources
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          function Get-TrackedEntries {
+            param([Parameter(Mandatory = $true)][string]$Path)
+            $entries = @(git ls-files --stage -- $Path)
+            if ($LASTEXITCODE -ne 0) { throw "Failed to inspect tracked path '$Path'" }
+            return $entries
+          }
+          function Assert-TrackedRegularFile {
+            param([Parameter(Mandatory = $true)][string]$Path)
+            $entries = @(Get-TrackedEntries -Path $Path)
+            $pattern = '^100644 [a-f0-9]{40} 0\t' + [regex]::Escape($Path) + '$'
+            if ($entries.Count -ne 1 -or $entries[0] -notmatch $pattern) {
+              throw "Expected one tracked regular file at '$Path'"
+            }
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Tracked file '$Path' is missing from the checkout"
+            }
+          }
+
           $expectedUrl = 'https://github.com/makecindy/cindy-protocol.git'
           $expectedPath = 'cindy-protocol'
-          $actualUrl = (git config -f .gitmodules --get submodule.cindy-protocol.url).Trim()
-          $actualPath = (git config -f .gitmodules --get submodule.cindy-protocol.path).Trim()
-          if ($actualUrl -ne $expectedUrl -or $actualPath -ne $expectedPath) {
-            throw "Unexpected cindy-protocol source: url='$actualUrl' path='$actualPath'"
+          $localPackages = [ordered]@{
+            'packages/device-link-protocol' = '@cindy/device-link-protocol'
+            'packages/plugin-protocol' = '@cindy/plugin-protocol'
+            'packages/slack-hook-protocol' = '@cindy/slack-hook-protocol'
           }
-          git submodule sync -- cindy-protocol
-          git submodule update --init --force --recursive -- cindy-protocol
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch cindy-protocol' }
+          $protocolEntries = @(Get-TrackedEntries -Path $expectedPath)
+          $gitlinkPattern = '^160000 ([a-f0-9]{40}) 0\tcindy-protocol$'
+          $hasLegacyGitlink = $protocolEntries.Count -eq 1 -and $protocolEntries[0] -match $gitlinkPattern
+          if ($protocolEntries.Count -gt 0 -and -not $hasLegacyGitlink) {
+            throw "Unexpected tracked layout at '$expectedPath'"
+          }
+          $expectedProtocolSha = if ($hasLegacyGitlink) { $Matches[1] } else { $null }
+
+          $gitmodulesEntries = @(Get-TrackedEntries -Path '.gitmodules')
+          if ($gitmodulesEntries.Count -gt 0) {
+            Assert-TrackedRegularFile -Path '.gitmodules'
+          } elseif (Test-Path -LiteralPath '.gitmodules') {
+            throw 'Untracked .gitmodules file is not allowed'
+          }
+          $hasGitmodules = $gitmodulesEntries.Count -eq 1
+          $protocolConfig = @()
+          $protocolPathClaims = @()
+          if ($hasGitmodules) {
+            $protocolConfig = @(git config --no-includes --file .gitmodules --get-regexp '^submodule\.cindy-protocol\.')
+            $configExit = $LASTEXITCODE
+            if ($configExit -ne 0 -and $configExit -ne 1) { throw 'Failed to parse cindy-protocol metadata' }
+            $submodulePaths = @(git config --no-includes --file .gitmodules --get-regexp '^submodule\..*\.path$')
+            $pathsExit = $LASTEXITCODE
+            if ($pathsExit -ne 0 -and $pathsExit -ne 1) { throw 'Failed to inspect submodule paths' }
+            $protocolPathClaims = @($submodulePaths | Where-Object {
+              $parts = $_ -split '\s+', 2
+              $parts.Count -eq 2 -and $parts[1] -ceq $expectedPath
+            })
+          }
+
+          if ($hasLegacyGitlink) {
+            if (-not $hasGitmodules) {
+              throw 'Legacy cindy-protocol gitlink requires a tracked .gitmodules file'
+            }
+            foreach ($packageDir in $localPackages.Keys) {
+              $packageEntries = @(Get-TrackedEntries -Path $packageDir)
+              if ($packageEntries.Count -ne 0 -or (Test-Path -LiteralPath $packageDir)) {
+                throw "Hybrid protocol layout contains '$packageDir'"
+              }
+            }
+            if ($protocolConfig.Count -ne 2 -or $protocolPathClaims.Count -ne 1) {
+              throw 'Ambiguous or incomplete cindy-protocol metadata'
+            }
+            $actualUrlLines = @(git config --no-includes --file .gitmodules --get-all submodule.cindy-protocol.url)
+            $urlExit = $LASTEXITCODE
+            $actualPathLines = @(git config --no-includes --file .gitmodules --get-all submodule.cindy-protocol.path)
+            $pathExit = $LASTEXITCODE
+            if (
+              $urlExit -ne 0 -or $pathExit -ne 0 -or
+              $actualUrlLines.Count -ne 1 -or $actualPathLines.Count -ne 1
+            ) {
+              throw 'Official cindy-protocol submodule metadata is incomplete'
+            }
+            $actualUrl = [string]$actualUrlLines[0]
+            $actualPath = [string]$actualPathLines[0]
+            if ($actualUrl -ne $expectedUrl -or $actualPath -ne $expectedPath) {
+              throw "Unexpected cindy-protocol source: url='$actualUrl' path='$actualPath'"
+            }
+            git submodule sync -- cindy-protocol
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to synchronize cindy-protocol metadata' }
+            git submodule update --init --force --recursive -- cindy-protocol
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch cindy-protocol' }
+            $actualProtocolLines = @(git -C cindy-protocol rev-parse HEAD)
+            $protocolExit = $LASTEXITCODE
+            if ($protocolExit -ne 0 -or $actualProtocolLines.Count -ne 1) {
+              throw 'Failed to resolve the checked-out cindy-protocol revision'
+            }
+            $actualProtocolSha = ([string]$actualProtocolLines[0]).Trim()
+            if ($actualProtocolSha -ne $expectedProtocolSha) {
+              throw "cindy-protocol checkout mismatch: expected '$expectedProtocolSha', got '$actualProtocolSha'"
+            }
+            $originUrlLines = @(git -C cindy-protocol remote get-url origin)
+            if (
+              $LASTEXITCODE -ne 0 -or
+              $originUrlLines.Count -ne 1 -or
+              ([string]$originUrlLines[0]).Trim() -ne $expectedUrl
+            ) {
+              throw "Unexpected initialized cindy-protocol origin: '$($originUrlLines -join ', ')'"
+            }
+            Write-Host "Verified official cindy-protocol submodule at $actualProtocolSha"
+          } else {
+            if ($protocolConfig.Count -ne 0 -or $protocolPathClaims.Count -ne 0) {
+              throw 'Dangling cindy-protocol metadata is not allowed'
+            }
+            if (Test-Path -LiteralPath $expectedPath) {
+              throw "Unexpected residual '$expectedPath' path"
+            }
+            foreach ($entry in $localPackages.GetEnumerator()) {
+              $packageDir = [string]$entry.Key
+              $manifestPath = "$packageDir/package.json"
+              Assert-TrackedRegularFile -Path $manifestPath
+              Assert-TrackedRegularFile -Path "$packageDir/src/index.ts"
+              $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+              if ([string]$manifest.name -ne [string]$entry.Value -or $manifest.private -ne $true) {
+                throw "Unexpected local protocol package identity in '$manifestPath'"
+              }
+            }
+            Write-Host 'Verified official repository-local protocol packages'
+          }
 
       - name: Apply allow-listed fork customizations
         id: compose
@@ -117,13 +231,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.38'
-          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.38'
+          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.45'
+          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.45'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
-            '+refs/heads/feature/visible-text-translation-v0.1.38:refs/remotes/customization/feature/visible-text-translation-v0.1.38' `
-            '+refs/heads/feature/fork-update-and-build-v0.1.38:refs/remotes/customization/feature/fork-update-and-build-v0.1.38'
+            '+refs/heads/feature/visible-text-translation-v0.1.45:refs/remotes/customization/feature/visible-text-translation-v0.1.45' `
+            '+refs/heads/feature/fork-update-and-build-v0.1.45:refs/remotes/customization/feature/fork-update-and-build-v0.1.45'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
 
           git config user.name 'hbyq'
