@@ -1,14 +1,18 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 
 import { ThinkingCard } from '@/components/chat/ThinkingCard';
 import { ThinkingText, tokenizeThinkingText } from '@/components/chat/ThinkingText';
 import { __test_internals as expandMemory } from '@/hooks/useExpandedBlockMemory';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  delete (window as unknown as { electronAPI?: unknown }).electronAPI;
+});
 beforeEach(() => expandMemory.reset());
 
 describe('ThinkingText — limited inline markup', () => {
@@ -67,5 +71,29 @@ describe('ThinkingCard — shared thinking presentation', () => {
     fireEvent.click(screen.getByRole('button'));
     expect(screen.getByText('Reviewing the implementation')).toBeTruthy();
     expect(container.textContent).not.toContain('**');
+  });
+
+  it('translates a finalized standalone block only after the user expands it', async () => {
+    const translate = vi.fn(async () => ({
+      status: 'translated' as const,
+      translation: '正在审查实现',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+    const { container } = render(
+      createElement(ThinkingCard, {
+        blockKey: 'translated-standalone-thinking',
+        content: 'Reviewing\nthe implementation',
+        durationMs: 1_000,
+      }),
+    );
+
+    expect(translate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button'));
+    expect(container.textContent).toContain('Reviewing\nthe implementation');
+    await waitFor(() => expect(screen.getByText('正在审查实现')).toBeTruthy());
+    expect(container.textContent).toContain('Reviewing\nthe implementation');
+    expect(translate).toHaveBeenCalledWith('Reviewing the implementation');
   });
 });
