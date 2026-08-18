@@ -35,6 +35,7 @@ import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import type { ChatMessage } from '@/lib/makerChatStore';
 import { useExpandedBlockMemory } from '@/hooks/useExpandedBlockMemory';
+import { useVisibleTextTranslation } from '@/hooks/useVisibleTextTranslation';
 import { Collapse } from '@/components/ui/collapse';
 import { Spinner } from '@/components/ui/spinner';
 
@@ -130,8 +131,13 @@ function ThinkingActivityRow({
   activity: ProjectedThinkingActivity;
 }) {
   const rawContent = activity.rawContent;
+  const { translation } = useVisibleTextTranslation(
+    activity.content,
+    activity.isStreaming !== true,
+  );
   const hasExplicitLineBreak = /[\r\n]/.test(rawContent);
   const textRef = useRef<HTMLSpanElement>(null);
+  const translationRef = useRef<HTMLSpanElement>(null);
   const [canExpand, setCanExpand] = useState(hasExplicitLineBreak);
   const { expanded, setExpanded } = useExpandedBlockMemory(`thinking:${activity.key}`);
 
@@ -144,7 +150,12 @@ function ThinkingActivityRow({
     if (!textElement) return;
     const updateOverflow = () => {
       setCanExpand(
-        hasExplicitLineBreak || textElement.scrollWidth > textElement.clientWidth + 1,
+        hasExplicitLineBreak
+        || textElement.scrollWidth > textElement.clientWidth + 1
+        || Boolean(
+          translationRef.current
+          && translationRef.current.scrollWidth > translationRef.current.clientWidth + 1,
+        ),
       );
     };
     updateOverflow();
@@ -152,7 +163,7 @@ function ThinkingActivityRow({
     const observer = new ResizeObserver(updateOverflow);
     observer.observe(textElement);
     return () => observer.disconnect();
-  }, [activity.content, expanded, hasExplicitLineBreak]);
+  }, [activity.content, expanded, hasExplicitLineBreak, translation]);
 
   return (
     <button
@@ -174,15 +185,30 @@ function ThinkingActivityRow({
       >
         <Sparkles size={13} />
       </span>
-      <span
-        ref={textRef}
-        className={cn(
-          'min-w-0 flex-1 text-14 italic text-[var(--thinking-body-text)]',
-          expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+      <span className="min-w-0 flex-1 text-14 italic text-[var(--thinking-body-text)]">
+        <span
+          ref={textRef}
+          className={cn(
+            'block min-w-0',
+            expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+          )}
+          title={expanded ? undefined : activity.content}
+        >
+          <ThinkingText content={expanded ? rawContent : activity.content} />
+        </span>
+        {translation && (
+          <span
+            ref={translationRef}
+            data-visible-text-translation="true"
+            className={cn(
+              'block min-w-0 not-italic text-[var(--text-secondary)]',
+              expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+            )}
+            title={expanded ? undefined : translation}
+          >
+            {translation}
+          </span>
         )}
-        title={expanded ? undefined : activity.content}
-      >
-        <ThinkingText content={expanded ? rawContent : activity.content} />
       </span>
       {canExpand && (
         <span aria-hidden="true" className="inline-flex h-[18px] shrink-0 items-center text-[var(--msg-tool-card-chevron)]">
@@ -204,8 +230,13 @@ function ThinkingActivityRow({
 function ExpandedThinkingRow({ message }: { message: ChatMessage }) {
   const activity = thinkingActivityForMessage(message);
   const rawContent = message.content.trim();
+  const { translation } = useVisibleTextTranslation(
+    activity?.content ?? '',
+    message.isStreaming !== true,
+  );
   const hasExplicitLineBreak = /[\r\n]/.test(rawContent);
   const textRef = useRef<HTMLSpanElement>(null);
+  const translationRef = useRef<HTMLSpanElement>(null);
   const [canExpand, setCanExpand] = useState(hasExplicitLineBreak);
   const { expanded, setExpanded } = useExpandedBlockMemory(`thinking:${message.clientId}`);
 
@@ -219,7 +250,12 @@ function ExpandedThinkingRow({ message }: { message: ChatMessage }) {
     if (!textElement) return;
     const updateOverflow = () => {
       setCanExpand(
-        hasExplicitLineBreak || textElement.scrollWidth > textElement.clientWidth + 1,
+        hasExplicitLineBreak
+        || textElement.scrollWidth > textElement.clientWidth + 1
+        || Boolean(
+          translationRef.current
+          && translationRef.current.scrollWidth > translationRef.current.clientWidth + 1,
+        ),
       );
     };
     updateOverflow();
@@ -227,7 +263,7 @@ function ExpandedThinkingRow({ message }: { message: ChatMessage }) {
     const observer = new ResizeObserver(updateOverflow);
     observer.observe(textElement);
     return () => observer.disconnect();
-  }, [activity?.content, expanded, hasExplicitLineBreak]);
+  }, [activity?.content, expanded, hasExplicitLineBreak, translation]);
 
   const onToggle = useCallback(() => {
     if (canExpand) setExpanded((value) => !value);
@@ -266,15 +302,30 @@ function ExpandedThinkingRow({ message }: { message: ChatMessage }) {
       >
         <Sparkles size={13} />
       </span>
-      <span
-        ref={textRef}
-        className={cn(
-          'min-w-0 flex-1 text-14 italic text-[var(--thinking-body-text)]',
-          expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+      <span className="min-w-0 flex-1 text-14 italic text-[var(--thinking-body-text)]">
+        <span
+          ref={textRef}
+          className={cn(
+            'block min-w-0',
+            expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+          )}
+          title={expanded ? undefined : activity.content}
+        >
+          <ThinkingText content={expanded ? rawContent : activity.content} />
+        </span>
+        {translation && (
+          <span
+            ref={translationRef}
+            data-visible-text-translation="true"
+            className={cn(
+              'block min-w-0 not-italic text-[var(--text-secondary)]',
+              expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+            )}
+            title={expanded ? undefined : translation}
+          >
+            {translation}
+          </span>
         )}
-        title={expanded ? undefined : activity.content}
-      >
-        <ThinkingText content={expanded ? rawContent : activity.content} />
       </span>
       {canExpand && (
         <span aria-hidden="true" className="inline-flex h-[18px] shrink-0 items-center text-[var(--msg-tool-card-chevron)]">
