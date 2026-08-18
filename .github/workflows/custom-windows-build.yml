@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       official_ref:
-        description: "stable，或指定官方稳定标签（例如 v0.1.45）；手动运行会生成新修订版"
+        description: "stable，或指定官方稳定标签（例如 v0.1.55）；手动运行会生成新修订版"
         required: true
         default: stable
         type: string
@@ -231,13 +231,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.45'
-          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.45'
+          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.55'
+          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.55'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
-            '+refs/heads/feature/visible-text-translation-v0.1.45:refs/remotes/customization/feature/visible-text-translation-v0.1.45' `
-            '+refs/heads/feature/fork-update-and-build-v0.1.45:refs/remotes/customization/feature/fork-update-and-build-v0.1.45'
+            '+refs/heads/feature/visible-text-translation-v0.1.55:refs/remotes/customization/feature/visible-text-translation-v0.1.55' `
+            '+refs/heads/feature/fork-update-and-build-v0.1.55:refs/remotes/customization/feature/fork-update-and-build-v0.1.55'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
 
           git config user.name 'hbyq'
@@ -297,8 +297,11 @@ jobs:
           )
           $updatePaths = @(
             'apps/desktop/src/main/__tests__/customUpdateFeed.test.ts',
+            'apps/desktop/src/main/__tests__/updateChannelStore.test.ts',
             'apps/desktop/src/main/__tests__/updateService.test.ts',
             'apps/desktop/src/main/customUpdateFeed.ts',
+            'apps/desktop/src/main/forkUpdatePolicy.ts',
+            'apps/desktop/src/main/updateChannelStore.ts',
             'apps/desktop/src/main/updateService.ts',
             'scripts/__tests__/log-upload-build-env.test.mjs',
             'scripts/shared/log-upload-build-env.mjs'
