@@ -28,8 +28,14 @@ import os from 'node:os';
 
 import { BRAND_IDENTITY } from '@cindy/maker-shared/brand-identity';
 
-import { fetchManifest, getBaseUrl, isDev, probeBetaManifest, clearCachedManifest } from './manifestService';
+import { clearCachedManifest, isDev, probeBetaManifest } from './manifestService';
 import type { Manifest } from './manifestService';
+import {
+  compareCustomUpdateVersions,
+  fetchCustomUpdateManifest,
+  getCustomUpdateBaseUrl,
+} from './customUpdateFeed';
+import { isForkBetaUpdateChannelAvailable } from './forkUpdatePolicy';
 import { download, DownloadError } from './downloader/index';
 import { ProgressNormalizer } from './updateProgressNormalizer';
 
@@ -199,6 +205,9 @@ function broadcastStatus(payload: UpdateStatusPayload): void {
 }
 
 function channelSettingsWire() {
+  if (!isForkBetaUpdateChannelAvailable()) {
+    return { enableBeta: false, isCustomized: true };
+  }
   return {
     enableBeta: readUpdateChannelSettings().enableBeta,
     isCustomized: isEnableBetaUserCustomized(),
@@ -601,9 +610,15 @@ function checkExistingPatch(): { action: 'relaunch' | 'check' | 'none'; version?
   }
 
   const currentVersion = app.getVersion();
-  if (patchInfo.version === currentVersion) {
-    // Patch matches current version → already applied; clean up and re-check.
-    try { fs.unlinkSync(patchFilePath); } catch { /* ignore */ }
+  const patchOrder = compareCustomUpdateVersions(patchInfo.version, currentVersion);
+  if (patchOrder === null || patchOrder <= 0) {
+    // Invalid, already-applied, or older patches must never be relaunched.
+    log.warn('Discarding non-upgrade patch v%s for current v%s', patchInfo.version, currentVersion);
+    try {
+      fs.unlinkSync(patchFilePath);
+    } catch {
+      /* ignore */
+    }
     removePatchInfo();
     return { action: 'check' };
   }
@@ -987,7 +1002,7 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
     setStatus('checking');
   }
 
-  const manifest = manifestOverride ?? await fetchManifest();
+  const manifest = manifestOverride ?? await fetchCustomUpdateManifest();
   if (!manifest) {
     log.info('Manifest fetch failed');
     if (!wasReady) currentStatus = 'idle';
@@ -1005,21 +1020,30 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
   const currentVersion = app.getVersion();
   log.info('Version check: current=%s, latest=%s, ready=%s', currentVersion, latestVersion, previousReadyVersion ?? '<none>');
 
-  if (latestVersion === currentVersion) {
-    log.info('Versions match, no update needed');
+  const currentOrder = compareCustomUpdateVersions(latestVersion, currentVersion);
+  if (currentOrder === null || currentOrder <= 0) {
+    log.info('Manifest version is invalid or not newer; update rejected');
     if (!wasReady) currentStatus = 'idle';
-    return 'idle';
+    return wasReady ? 'ready' : 'idle';
   }
 
-  // wasReady 且 manifest 仍是已下好的同一个版本 → 无事发生,保持 ready。
-  if (wasReady && latestVersion === previousReadyVersion) {
-    log.info('Ready patch v%s still matches latest — no superseding needed', previousReadyVersion);
-    return 'ready';
+  if (wasReady) {
+    const readyOrder = previousReadyVersion === undefined
+      ? null
+      : compareCustomUpdateVersions(latestVersion, previousReadyVersion);
+    if (readyOrder === null || readyOrder <= 0) {
+      log.info(
+        'Manifest v%s does not supersede ready patch v%s; keeping ready patch',
+        latestVersion,
+        previousReadyVersion ?? '<invalid>',
+      );
+      return 'ready';
+    }
   }
 
   log.info('Update available: %s → %s (wasReady=%s)', currentVersion, latestVersion, wasReady);
 
-  const downloadUrl = `${getBaseUrl()}/${asset.file}`;
+  const downloadUrl = `${getCustomUpdateBaseUrl()}/${asset.file}`;
   const fileName = path.basename(asset.file);
   const destPath = path.join(getUpdatesDir(), fileName);
 
@@ -1540,6 +1564,9 @@ export function initUpdateService(): void {
     if (typeof next !== 'boolean') {
       throwIpcError('INVALID_PARAMS', 'enableBeta required (boolean)');
     }
+    if (next && !isForkBetaUpdateChannelAvailable()) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'fork beta update channel is unavailable');
+    }
     const wasBeta = readUpdateChannelSettings().enableBeta;
     // 先拦住 apply 再等落盘:writeEnableBeta 可能卡住跨进程锁。
     // 真正写成之后再删 zip;写入失败则放开 hold,旧补丁还能用。
@@ -1591,6 +1618,7 @@ export function initUpdateService(): void {
   // 打开 beta 前的预检:探测 manifest-{platform}-beta.json 是否可达。
   ipcMain.handle('update-channel-probe-beta', async (event) => {
     assertTrustedAppRendererEvent(event);
+    if (!isForkBetaUpdateChannelAvailable()) return { available: false };
     const available = await probeBetaManifest();
     return { available };
   });
@@ -1601,6 +1629,9 @@ export function initUpdateService(): void {
   // app.relaunch() 只是标记「退出后重启」,真正触发重启的是 app.quit() 的退出流程。
   ipcMain.handle('update-channel-relaunch', (event) => {
     assertTrustedAppRendererEvent(event);
+    if (!isForkBetaUpdateChannelAvailable()) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'fork beta update channel is unavailable');
+    }
     log.info('relaunch requested for update channel change');
     discardUnappliedStagedPatchForChannelRelaunch();
     app.relaunch();
@@ -1660,7 +1691,7 @@ export function initUpdateService(): void {
       // Step 1: prefer manifest (so we don't relaunch into a stale intermediate version).
       // 启动态用短超时，避免 external CDN 慢时阻塞启动关键路径（#26）。
       // 后台 30-min 轮询仍走默认 30s 超时。
-      const manifest = await fetchManifest(STARTUP_MANIFEST_TIMEOUT_MS);
+      const manifest = await fetchCustomUpdateManifest(STARTUP_MANIFEST_TIMEOUT_MS);
 
       if (!manifest) {
         // Network unavailable — fall back to local patch.
@@ -1677,18 +1708,39 @@ export function initUpdateService(): void {
       const currentVersion = app.getVersion();
       log.info('Startup: current=%s, latest=%s', currentVersion, latestVersion);
 
-      if (latestVersion === currentVersion) {
-        // Already up to date — clean up any stale patch directory.
-        checkExistingPatch();
+      // Step 2: inspect the staged patch independently from the channel. The
+      // fork channel can briefly lag or roll back while publishing; a patch
+      // already verified as newer than the running app must never be replaced
+      // with, or hidden by, an older channel version.
+      const patchResult = checkExistingPatch();
+      const currentOrder = compareCustomUpdateVersions(latestVersion, currentVersion);
+      if (currentOrder === null || currentOrder <= 0) {
+        // Invalid/equal/older manifests cannot trigger a download. Any local
+        // patch that is itself not an upgrade was removed by the check above;
+        // a newer local patch remains eligible for relaunch.
+        if (patchResult.action === 'relaunch') {
+          log.info(
+            'Keeping local patch v%s while channel serves non-upgrade v%s',
+            patchResult.version,
+            latestVersion,
+          );
+          currentStatus = 'ready';
+          return await buildStartupReadyReply(patchResult.version);
+        }
         return { hasUpdate: false, action: 'none' as const };
       }
 
-      // Step 2: local patch may already match latest → skip download.
-      const patchResult = checkExistingPatch();
-      if (patchResult.action === 'relaunch' && patchResult.version === latestVersion) {
-        log.info('Local patch v%s matches latest, requesting relaunch', patchResult.version);
-        currentStatus = 'ready';
-        return await buildStartupReadyReply(patchResult.version);
+      if (patchResult.action === 'relaunch' && patchResult.version) {
+        const patchOrder = compareCustomUpdateVersions(patchResult.version, latestVersion);
+        if (patchOrder !== null && patchOrder >= 0) {
+          log.info(
+            'Local patch v%s is at least channel v%s, requesting relaunch',
+            patchResult.version,
+            latestVersion,
+          );
+          currentStatus = 'ready';
+          return await buildStartupReadyReply(patchResult.version);
+        }
       }
 
       // Stale local patch — drop refs, fresh download will overwrite.
@@ -1776,6 +1828,7 @@ export function initUpdateService(): void {
 export async function enableUncustomizedBetaChannel(
   shouldWrite: () => boolean = () => true,
 ): Promise<boolean> {
+  if (!isForkBetaUpdateChannelAvailable()) return false;
   const wasBeta = readUpdateChannelSettings().enableBeta;
   // 先拦住 apply 再等落盘。身份守卫拒绝或写入失败时,旧补丁还得能用。
   if (!wasBeta) {
