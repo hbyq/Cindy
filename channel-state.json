@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "officialRef": "v0.1.60",
-  "officialVersion": "0.1.60",
+  "officialRef": "v0.1.61",
+  "officialVersion": "0.1.61",
   "officialSha": "1e165ea83c806a62439fe6b7ad3ac2279f9f3d87",
   "translationFeatureSha": "840df34a3087ccbec9a1ec309bd2880df474c7be",
   "updateFeedFeatureSha": "6b37c3125547a72a21e50add61ab0a0506caeb0a",
   "customRevision": 1,
-  "customVersion": "0.1.6001",
+  "customVersion": "0.1.6101",
   "releaseTag": "cindy-custom-stable",
-  "installerFile": "cindy-0.1.6001-32827206373-1-Setup.exe",
-  "hotfixFile": "cindy-0.1.6001-32827206373-1-hotfix.zip",
-  "workflowRunUrl": "https://github.com/hbyq/Cindy/actions/runs/32827206373",
-  "publishedAt": "2026-08-25T09:06:50.9178554+00:00"
+  "installerFile": "cindy-0.1.6101-32928617188-1-Setup.exe",
+  "hotfixFile": "cindy-0.1.6101-32928617188-1-hotfix.zip",
+  "workflowRunUrl": "https://github.com/hbyq/Cindy/actions/runs/32928617188",
+  "publishedAt": "2026-08-26T04:41:37.1950683+00:00"
 }
