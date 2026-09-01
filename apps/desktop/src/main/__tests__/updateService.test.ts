@@ -33,6 +33,13 @@ const getBaseUrl = vi.fn(() => CDN_EXTERNAL_BASE_URL);
 const isDev = vi.fn(() => false);
 const download = vi.fn();
 const readAutoUpdateSettings = vi.fn(() => ({ autoRelaunchOnIdle: true }));
+const forkPolicy = vi.hoisted(() => ({ betaAvailable: true }));
+const customUpdatePolicy = vi.hoisted(() => ({
+  feedId: 'hbyq-cindy-custom-stable-v1',
+  platformKey: 'win32-x64',
+  platformSupported: true,
+}));
+const probeBetaManifest = vi.fn(async () => true);
 
 const logInfo = vi.fn();
 const logWarn = vi.fn();
@@ -84,10 +91,13 @@ const readUpdateChannelSettings = vi.fn(() => ({
 }));
 
 vi.mock('../manifestService', () => ({
-  fetchManifest,
-  getBaseUrl,
   isDev,
   clearCachedManifest: vi.fn(),
+  probeBetaManifest,
+}));
+
+vi.mock('../forkUpdatePolicy', () => ({
+  isForkBetaUpdateChannelAvailable: () => forkPolicy.betaAvailable,
 }));
 
 vi.mock('../updateChannelStore', () => ({
@@ -103,6 +113,28 @@ vi.mock('../updateChannelStore', () => ({
   tryEnableUncustomizedBetaAtomic,
   isEnableBetaUserCustomized: () => false,
   isBetaChannelEnabled: () => readUpdateChannelSettings().enableBeta === true,
+}));
+
+vi.mock('../customUpdateFeed', () => ({
+  CUSTOM_UPDATE_FEED_ID: customUpdatePolicy.feedId,
+  compareCustomUpdateVersions: (left: string, right: string) => {
+    const pattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+    const leftMatch = pattern.exec(left);
+    const rightMatch = pattern.exec(right);
+    if (!leftMatch || !rightMatch) return null;
+    const leftParts = leftMatch.slice(1).map(Number);
+    const rightParts = rightMatch.slice(1).map(Number);
+    if ([...leftParts, ...rightParts].some((part) => !Number.isSafeInteger(part))) return null;
+    for (let index = 0; index < leftParts.length; index++) {
+      if (leftParts[index] < rightParts[index]) return -1;
+      if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
+  },
+  fetchCustomUpdateManifest: fetchManifest,
+  getCustomUpdateBaseUrl: getBaseUrl,
+  getCustomUpdatePlatformKey: () => customUpdatePolicy.platformKey,
+  isCustomUpdatePlatformSupported: () => customUpdatePolicy.platformSupported,
 }));
 
 vi.mock('../downloader/index', () => ({
@@ -169,6 +201,10 @@ afterAll(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 beforeEach(() => {
+  forkPolicy.betaAvailable = true;
+  customUpdatePolicy.platformSupported = true;
+  probeBetaManifest.mockReset();
+  probeBetaManifest.mockResolvedValue(true);
   browserWindowGetAllWindows.mockReset();
   browserWindowGetAllWindows.mockReturnValue([]);
   ipcHandlers.clear();
@@ -220,7 +256,7 @@ beforeEach(() => {
   logWarn.mockReset();
   logError.mockReset();
   logDebug.mockReset();
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 afterEach(() => {
   vi.clearAllTimers();
@@ -287,11 +323,32 @@ function linuxInstallerManifest(version = '0.0.65') {
       version,
       installer: {
         file: `app/linux-x64/cindy-${version}-amd64.deb`,
-        sha256: 'abc',
+        sha256: 'a'.repeat(64),
         size: 123,
       },
     },
   };
+}
+
+function stageLinuxPatch(version: string): { patchPath: string; infoPath: string } {
+  const updatesDir = path.join(TEST_USER_DATA, 'updates');
+  const fileName = `cindy-${version}-amd64.deb`;
+  const patchPath = path.join(updatesDir, fileName);
+  const infoPath = path.join(updatesDir, 'patch-info.json');
+  fs.mkdirSync(updatesDir, { recursive: true });
+  fs.writeFileSync(patchPath, 'deb');
+  fs.writeFileSync(
+    infoPath,
+    JSON.stringify({
+      version,
+      fileName,
+      sha256: 'abc',
+      feedId: customUpdatePolicy.feedId,
+      platformKey: customUpdatePolicy.platformKey,
+      enableBeta: false,
+    }),
+  );
+  return { patchPath, infoPath };
 }
 
 describe('checkForUpdate Linux installer flow', () => {
@@ -311,7 +368,7 @@ describe('checkForUpdate Linux installer flow', () => {
     expect(download).toHaveBeenCalledTimes(1);
     expect(download.mock.calls[0]?.[0]).toMatchObject({
       url: expect.stringContaining('cindy-9.9.9-amd64.deb'),
-      sha256: 'abc',
+      sha256: 'a'.repeat(64),
     });
   });
 
@@ -340,6 +397,160 @@ describe('checkForUpdate Linux installer flow', () => {
       action: 'none',
       version: '0.0.65',
     });
+  });
+
+  it('reuses an exact-version staged Linux .deb only with its matching manifest', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(linuxInstallerManifest('0.0.65'));
+    const staged = stageLinuxPatch('0.0.65');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({
+        hasUpdate: true,
+        action: 'none',
+        version: '0.0.65',
+      });
+      expect(service.getUpdateStatus()).toBe('ready');
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(true);
+      expect(fs.existsSync(staged.infoPath)).toBe(true);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('reactivates a deferred Linux .deb when its matching manifest arrives', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(linuxInstallerManifest('0.0.65'));
+    const staged = stageLinuxPatch('0.0.66');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+
+      await expect(service.checkForUpdate(linuxInstallerManifest('0.0.66'))).resolves.toBe('ready');
+      expect(service.getUpdateStatus()).toBe('ready');
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(true);
+      expect(fs.existsSync(staged.infoPath)).toBe(true);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('replaces a deferred Linux .deb only when the channel moves past it', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(linuxInstallerManifest('0.0.65'));
+    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, 'new-deb');
+      return { path: targetPath, size: 123 };
+    });
+    const staged = stageLinuxPatch('0.0.66');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+
+      await expect(service.checkForUpdate(linuxInstallerManifest('0.0.67'))).resolves.toBe('ready');
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(staged.patchPath)).toBe(false);
+      expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', 'cindy-0.0.67-amd64.deb')))
+        .toBe(true);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('keeps a newer staged Linux .deb hidden until its matching manifest arrives', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(linuxInstallerManifest('0.0.65'));
+    const staged = stageLinuxPatch('0.0.66');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+      expect(service.getUpdateStatus()).toBe('idle');
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(true);
+      expect(fs.existsSync(staged.infoPath)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(download).not.toHaveBeenCalled();
+      expect(service.getUpdateStatus()).toBe('idle');
+      expect(fs.existsSync(staged.patchPath)).toBe(true);
+      expect(fs.existsSync(staged.infoPath)).toBe(true);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('does not expose a newer staged Linux .deb when the manifest is not an upgrade', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(linuxInstallerManifest('0.0.64'));
+    const staged = stageLinuxPatch('0.0.66');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+      expect(service.getUpdateStatus()).toBe('idle');
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(true);
+      expect(fs.existsSync(staged.infoPath)).toBe(true);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('discards an exact-version staged Linux .deb without a trusted installer digest', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue({ app: { version: '0.0.65' } });
+    const staged = stageLinuxPatch('0.0.65');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(false);
+      expect(fs.existsSync(staged.infoPath)).toBe(false);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('discards a staged Linux .deb when no manifest can supply a trusted digest', async () => {
+    vi.useFakeTimers();
+    fetchManifest.mockResolvedValue(null);
+    const staged = stageLinuxPatch('0.0.65');
+    const service = await freshUpdateService('linux');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toEqual({
+        hasUpdate: false,
+        action: 'none',
+        error: 'manifest_failed',
+      });
+      expect(download).not.toHaveBeenCalled();
+      expect(fs.existsSync(staged.patchPath)).toBe(false);
+      expect(fs.existsSync(staged.infoPath)).toBe(false);
+    } finally {
+      service.stopUpdateService();
+    }
   });
 
   it('refuses the xd org beta default on Linux without writing to disk', async () => {
@@ -406,295 +617,350 @@ describe('checkForUpdate 版本无关(占位 0.0.0)打包豁免', () => {
   });
 });
 
-describe('app update forward-only policy', () => {
-  it('does not download a manifest version lower than the running app', async () => {
-    const service = await freshUpdateService('darwin');
+describe('update version monotonicity', () => {
+  it.each(['0.0.64', '0.0.63'])(
+    'rejects a background manifest that is not newer than the current version: %s',
+    async (version) => {
+      const service = await freshUpdateService('win32');
+      expect(await service.checkForUpdate(updateManifest(version))).toBe('idle');
+      expect(service.getUpdateStatus()).toBe('idle');
+      expect(download).not.toHaveBeenCalled();
+    },
+  );
 
-    await expect(service.checkForUpdate(updateManifest('0.0.63'))).resolves.toBe('idle');
+  it('fails closed when a background manifest has an invalid version', async () => {
+    const service = await freshUpdateService('win32');
 
-    expect(service.getUpdateStatus()).toBe('idle');
-    expect(download).not.toHaveBeenCalled();
-    expect(logWarn.mock.calls.map((call) => String(call[0]))).toContain(
-      'Skipping app downgrade from %s to %s',
-    );
-  });
-
-  it('fails closed when the manifest app version is not valid SemVer', async () => {
-    const service = await freshUpdateService('darwin');
-
-    await expect(service.checkForUpdate(updateManifest('not-semver'))).resolves.toBe(
+    await expect(service.checkForUpdate(updateManifest('not-a-version'))).resolves.toBe(
       'manifest_failed',
     );
-
     expect(service.getUpdateStatus()).toBe('idle');
     expect(download).not.toHaveBeenCalled();
   });
 
-  it.each(['0.0.63', 'not-semver'])(
-    'does not apply an offline non-upgrade staged patch (%s)',
-    async (patchVersion) => {
-      vi.useFakeTimers();
+  it('keeps a newer ready patch when the channel temporarily serves an older version', async () => {
+    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
+    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, 'update');
+      return { path: targetPath, size: 123 };
+    });
+
+    const service = await freshUpdateService('win32');
+    expect(await service.checkForUpdate(updateManifest('0.0.66'))).toBe('ready');
+    expect(await service.checkForUpdate(updateManifest('0.0.65'))).toBe('ready');
+    expect(service.getUpdateStatus()).toBe('ready');
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(TEST_USER_DATA, 'updates', 'patch-info.json'), 'utf-8'),
+      ),
+    ).toMatchObject({ feedId: customUpdatePolicy.feedId, version: '0.0.66' });
+  });
+
+  it.each(['0.0.64', '0.0.63', 'invalid'])(
+    'rejects an offline local patch at v%s',
+    async (version) => {
       fetchManifest.mockResolvedValue(null);
       const updatesDir = path.join(TEST_USER_DATA, 'updates');
-      const patchPath = path.join(updatesDir, 'staged.zip');
-      const flagPath = path.join(TEST_USER_DATA, 'relogin-required.flag');
       fs.mkdirSync(updatesDir, { recursive: true });
-      fs.writeFileSync(patchPath, 'update');
+      fs.writeFileSync(path.join(updatesDir, 'stale.zip'), 'zip');
       fs.writeFileSync(
         path.join(updatesDir, 'patch-info.json'),
         JSON.stringify({
-          version: patchVersion,
-          fileName: 'staged.zip',
+          version,
+          fileName: 'stale.zip',
           sha256: 'abc',
-          requireRelogin: true,
+          feedId: customUpdatePolicy.feedId,
+          platformKey: customUpdatePolicy.platformKey,
           enableBeta: false,
         }),
       );
-      fs.writeFileSync(flagPath, JSON.stringify({ version: patchVersion }));
 
-      const service = await freshUpdateService('darwin');
+      const service = await freshUpdateService('win32');
       service.initUpdateService();
       try {
         const handler = ipcHandlers.get('update-check-startup');
-        await expect(handler?.()).resolves.toMatchObject({
+        if (!handler) throw new Error('update-check-startup handler not registered');
+        await expect(handler()).resolves.toMatchObject({
           hasUpdate: false,
           action: 'none',
           error: 'manifest_failed',
         });
-        expect(service.getUpdateStatus()).toBe('idle');
-        expect(fs.existsSync(patchPath)).toBe(false);
+        expect(fs.existsSync(path.join(updatesDir, 'stale.zip'))).toBe(false);
         expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
-        expect(fs.existsSync(flagPath)).toBe(false);
+        expect(download).not.toHaveBeenCalled();
       } finally {
         service.stopUpdateService();
       }
     },
   );
 
-  it('still restores a newer staged patch when startup is offline', async () => {
-    vi.useFakeTimers();
+  it('rejects an older startup manifest without downloading it', async () => {
+    fetchManifest.mockResolvedValue(updateManifest('0.0.63'));
+    const service = await freshUpdateService('win32');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({ hasUpdate: false, action: 'none' });
+      expect(download).not.toHaveBeenCalled();
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it.each(['0.0.65', '0.0.64', '0.0.63'])(
+    'keeps a newer staged patch when the startup channel serves v%s',
+    async (channelVersion) => {
+      fetchManifest.mockResolvedValue(updateManifest(channelVersion));
+      const updatesDir = path.join(TEST_USER_DATA, 'updates');
+      fs.mkdirSync(updatesDir, { recursive: true });
+      fs.writeFileSync(path.join(updatesDir, 'newer.zip'), 'zip');
+      fs.writeFileSync(
+        path.join(updatesDir, 'patch-info.json'),
+        JSON.stringify({
+          version: '0.0.66',
+          fileName: 'newer.zip',
+          sha256: 'abc',
+          feedId: customUpdatePolicy.feedId,
+          platformKey: customUpdatePolicy.platformKey,
+          enableBeta: false,
+        }),
+      );
+
+      const service = await freshUpdateService('win32');
+      service.initUpdateService();
+      try {
+        const handler = ipcHandlers.get('update-check-startup');
+        if (!handler) throw new Error('update-check-startup handler not registered');
+        await expect(handler()).resolves.toMatchObject({
+          hasUpdate: true,
+          action: 'relaunch',
+          version: '0.0.66',
+        });
+        expect(download).not.toHaveBeenCalled();
+        expect(fs.existsSync(path.join(updatesDir, 'newer.zip'))).toBe(true);
+      } finally {
+        service.stopUpdateService();
+      }
+    },
+  );
+
+  it('reuses an identity-matched staged patch while the fork feed is offline', async () => {
     fetchManifest.mockResolvedValue(null);
     const updatesDir = path.join(TEST_USER_DATA, 'updates');
-    const patchPath = path.join(updatesDir, 'staged.zip');
     fs.mkdirSync(updatesDir, { recursive: true });
-    fs.writeFileSync(patchPath, 'update');
+    fs.writeFileSync(path.join(updatesDir, 'fork.zip'), 'zip');
     fs.writeFileSync(
       path.join(updatesDir, 'patch-info.json'),
       JSON.stringify({
         version: '0.0.65',
-        fileName: 'staged.zip',
+        fileName: 'fork.zip',
         sha256: 'abc',
+        feedId: customUpdatePolicy.feedId,
+        platformKey: customUpdatePolicy.platformKey,
         enableBeta: false,
       }),
     );
 
-    const service = await freshUpdateService('darwin');
+    const service = await freshUpdateService('win32');
     service.initUpdateService();
     try {
       const handler = ipcHandlers.get('update-check-startup');
-      await expect(handler?.()).resolves.toMatchObject({
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({
         hasUpdate: true,
         action: 'relaunch',
         version: '0.0.65',
       });
-      expect(service.getUpdateStatus()).toBe('ready');
-      expect(fs.existsSync(patchPath)).toBe(true);
-    } finally {
-      service.stopUpdateService();
-    }
-  });
-
-  it('does not apply a lower local patch that matches the online manifest', async () => {
-    vi.useFakeTimers();
-    fetchManifest.mockResolvedValue(updateManifest('0.0.63'));
-    const updatesDir = path.join(TEST_USER_DATA, 'updates');
-    const patchPath = path.join(updatesDir, 'staged.zip');
-    fs.mkdirSync(updatesDir, { recursive: true });
-    fs.writeFileSync(patchPath, 'update');
-    fs.writeFileSync(
-      path.join(updatesDir, 'patch-info.json'),
-      JSON.stringify({
-        version: '0.0.63',
-        fileName: 'staged.zip',
-        sha256: 'abc',
-        enableBeta: false,
-      }),
-    );
-
-    const service = await freshUpdateService('darwin');
-    service.initUpdateService();
-    try {
-      const handler = ipcHandlers.get('update-check-startup');
-      await expect(handler?.()).resolves.toMatchObject({
-        hasUpdate: false,
-        action: 'none',
-      });
       expect(download).not.toHaveBeenCalled();
-      expect(fs.existsSync(patchPath)).toBe(false);
-      expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
     } finally {
       service.stopUpdateService();
     }
   });
 
-  it('discards a newer local patch that is no longer advertised by the online manifest', async () => {
-    vi.useFakeTimers();
-    fetchManifest.mockResolvedValue(updateManifest('0.0.64'));
+  it.each([
+    { feedId: undefined, platformKey: customUpdatePolicy.platformKey, label: 'missing feed' },
+    {
+      feedId: 'official-cindy-stable-v1',
+      platformKey: customUpdatePolicy.platformKey,
+      label: 'foreign feed',
+    },
+    { feedId: customUpdatePolicy.feedId, platformKey: 'darwin-arm64', label: 'foreign platform' },
+  ])(
+    'rejects and removes an offline staged patch with $label identity',
+    async ({ feedId, platformKey }) => {
+      fetchManifest.mockResolvedValue(null);
+      const updatesDir = path.join(TEST_USER_DATA, 'updates');
+      fs.mkdirSync(updatesDir, { recursive: true });
+      fs.writeFileSync(path.join(updatesDir, 'foreign.zip'), 'zip');
+      fs.writeFileSync(
+        path.join(updatesDir, 'patch-info.json'),
+        JSON.stringify({
+          version: '0.0.66',
+          fileName: 'foreign.zip',
+          sha256: 'abc',
+          feedId,
+          platformKey,
+        }),
+      );
+
+      const service = await freshUpdateService('win32');
+      service.initUpdateService();
+      try {
+        const handler = ipcHandlers.get('update-check-startup');
+        if (!handler) throw new Error('update-check-startup handler not registered');
+        await expect(handler()).resolves.toMatchObject({
+          hasUpdate: false,
+          action: 'none',
+          error: 'manifest_failed',
+        });
+        expect(service.getUpdateStatus()).toBe('idle');
+        expect(fs.existsSync(path.join(updatesDir, 'foreign.zip'))).toBe(false);
+        expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
+      } finally {
+        service.stopUpdateService();
+      }
+    },
+  );
+
+  it('replaces a foreign staged patch with a fresh fork download when online', async () => {
+    fetchManifest.mockResolvedValue(updateManifest('0.0.67'));
+    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, 'fork-update');
+      return { path: targetPath, size: 123 };
+    });
     const updatesDir = path.join(TEST_USER_DATA, 'updates');
-    const patchPath = path.join(updatesDir, 'staged.zip');
     fs.mkdirSync(updatesDir, { recursive: true });
-    fs.writeFileSync(patchPath, 'update');
+    fs.writeFileSync(path.join(updatesDir, 'official.zip'), 'official-update');
     fs.writeFileSync(
       path.join(updatesDir, 'patch-info.json'),
       JSON.stringify({
-        version: '0.0.65',
-        fileName: 'staged.zip',
+        version: '0.0.66',
+        fileName: 'official.zip',
         sha256: 'abc',
-        enableBeta: false,
+        feedId: 'official-cindy-stable-v1',
+        platformKey: customUpdatePolicy.platformKey,
       }),
     );
 
-    const service = await freshUpdateService('darwin');
+    const service = await freshUpdateService('win32');
     service.initUpdateService();
     try {
       const handler = ipcHandlers.get('update-check-startup');
-      await expect(handler?.()).resolves.toMatchObject({
-        hasUpdate: false,
-        action: 'none',
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({
+        hasUpdate: true,
+        action: 'relaunch',
+        version: '0.0.67',
       });
-      expect(service.getUpdateStatus()).toBe('idle');
-      expect(fs.existsSync(patchPath)).toBe(false);
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(updatesDir, 'official.zip'))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(updatesDir, 'patch-info.json'), 'utf-8')))
+        .toMatchObject({ feedId: customUpdatePolicy.feedId, version: '0.0.67' });
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('does not follow a staged patch file name outside the updates directory', async () => {
+    fetchManifest.mockResolvedValue(null);
+    const updatesDir = path.join(TEST_USER_DATA, 'updates');
+    const outsidePath = path.join(TEST_USER_DATA, 'outside.zip');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    fs.writeFileSync(outsidePath, 'keep');
+    fs.writeFileSync(
+      path.join(updatesDir, 'patch-info.json'),
+      JSON.stringify({
+        version: '0.0.66',
+        fileName: '../outside.zip',
+        sha256: 'abc',
+        feedId: customUpdatePolicy.feedId,
+        platformKey: customUpdatePolicy.platformKey,
+      }),
+    );
+
+    const service = await freshUpdateService('win32');
+    service.initUpdateService();
+    try {
+      const handler = ipcHandlers.get('update-check-startup');
+      if (!handler) throw new Error('update-check-startup handler not registered');
+      await expect(handler()).resolves.toMatchObject({ hasUpdate: false, action: 'none' });
+      expect(fs.readFileSync(outsidePath, 'utf-8')).toBe('keep');
       expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
     } finally {
       service.stopUpdateService();
     }
   });
 
-  it('drops a ready patch when a later manifest no longer advertises an upgrade', async () => {
-    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
-    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.writeFileSync(targetPath, 'update');
-      return { path: targetPath, size: 123 };
-    });
-    const service = await freshUpdateService('darwin');
+  it.each([
+    ['darwin', 'macOS'],
+    ['linux', 'Linux'],
+    ['win32', 'Windows arm64'],
+  ] as const)(
+    'does not fetch or reuse a staged patch on unsupported %s (%s)',
+    async (platform, _label) => {
+      customUpdatePolicy.platformSupported = false;
+      fetchManifest.mockResolvedValue(updateManifest('0.0.67'));
+      const updatesDir = path.join(TEST_USER_DATA, 'updates');
+      fs.mkdirSync(updatesDir, { recursive: true });
+      fs.writeFileSync(path.join(updatesDir, 'fork.zip'), 'zip');
+      fs.writeFileSync(
+        path.join(updatesDir, 'patch-info.json'),
+        JSON.stringify({
+          version: '0.0.66',
+          fileName: 'fork.zip',
+          sha256: 'abc',
+          feedId: customUpdatePolicy.feedId,
+          platformKey: customUpdatePolicy.platformKey,
+          enableBeta: false,
+        }),
+      );
 
-    await expect(service.checkForUpdate(updateManifest('0.0.65'))).resolves.toBe('ready');
-    await expect(service.checkForUpdate(updateManifest('0.0.63'))).resolves.toBe('idle');
+      const service = await freshUpdateService(platform);
+      await expect(service.checkForUpdate(updateManifest('0.0.67'))).resolves.toBe('idle');
+      service.initUpdateService();
+      try {
+        const handler = ipcHandlers.get('update-check-startup');
+        if (!handler) throw new Error('update-check-startup handler not registered');
+        await expect(handler()).resolves.toEqual({ hasUpdate: false, action: 'none' });
+        expect(fetchManifest).not.toHaveBeenCalled();
+        expect(download).not.toHaveBeenCalled();
+        expect(fs.existsSync(path.join(updatesDir, 'fork.zip'))).toBe(false);
+        expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
+      } finally {
+        service.stopUpdateService();
+      }
+    },
+  );
+});
 
-    expect(service.getUpdateStatus()).toBe('idle');
-    expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', 'patch-info.json'))).toBe(false);
-  });
-
-  it('rechecks the version immediately before launching the native updater', async () => {
-    vi.useFakeTimers();
-    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
-    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.writeFileSync(targetPath, 'update');
-      return { path: targetPath, size: 123 };
-    });
-
-    const service = await freshUpdateService('darwin');
+describe('fork client Beta update policy', () => {
+  it('reports unavailable, rejects opt-in and blocks the organization default', async () => {
+    forkPolicy.betaAvailable = false;
+    const service = await freshUpdateService('win32');
     service.initUpdateService();
     try {
-      await expect(service.checkForUpdate(updateManifest('0.0.65'))).resolves.toBe('ready');
-      expect(service.getUpdateStatus()).toBe('ready');
+      const event = { sender: { id: 1 } };
+      const getHandler = ipcHandlers.get('update-channel-settings-get');
+      const probeHandler = ipcHandlers.get('update-channel-probe-beta');
+      const setHandler = ipcHandlers.get('update-channel-settings-set');
+      const relaunchHandler = ipcHandlers.get('update-channel-relaunch');
 
-      appGetVersion.mockReturnValue('0.0.65');
-      ipcListeners.get('update-relaunch')?.({}, 'dark');
-
-      await vi.waitFor(() => {
-        expect(service.getUpdateStatus()).toBe('idle');
-      });
-      expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', 'patch-info.json'))).toBe(false);
-      expect(logError.mock.calls.map((call) => String(call[0]))).toContain(
-        'executeRelaunch() refused non-upgrade patch: current=%s patch=%s relation=%s',
+      expect(getHandler?.(event)).toEqual({ enableBeta: false, isCustomized: true });
+      await expect(probeHandler?.(event)).resolves.toEqual({ available: false });
+      expect(probeBetaManifest).not.toHaveBeenCalled();
+      await expect(setHandler?.(event, { enableBeta: true })).rejects.toThrow(
+        'UNSUPPORTED_CAPABILITY',
       );
+      expect(writeEnableBeta).not.toHaveBeenCalled();
+      expect(() => relaunchHandler?.(event)).toThrow('UNSUPPORTED_CAPABILITY');
+      expect(appRelaunch).not.toHaveBeenCalled();
+      await expect(service.enableUncustomizedBetaChannel()).resolves.toBe(false);
+      expect(tryEnableUncustomizedBetaAtomic).not.toHaveBeenCalled();
     } finally {
-      service.stopUpdateService();
-    }
-  });
-
-  it('does not discard a staged patch while the native updater is already applying it', async () => {
-    vi.useFakeTimers();
-    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
-    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.writeFileSync(targetPath, 'update');
-      return { path: targetPath, size: 123 };
-    });
-
-    const service = await freshUpdateService('darwin');
-    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
-    service.initUpdateService();
-    try {
-      await expect(service.checkForUpdate(updateManifest('0.0.65'))).resolves.toBe('ready');
-      expect(service.getUpdateStatus()).toBe('ready');
-
-      ipcListeners.get('update-relaunch')?.({}, 'dark');
-      await vi.waitFor(() => {
-        expect(logInfo.mock.calls.map((call) => String(call[0]))).toContain(
-          'executeRelaunch() called, theme=%s, readyFilePath=%s',
-        );
-      });
-
-      await expect(service.checkForUpdate(updateManifest('0.0.63'))).resolves.toBe('idle');
-      const stagedFile = path.basename(updateManifest('0.0.65').app.hotfix.file);
-      expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', stagedFile))).toBe(true);
-      expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', 'patch-info.json'))).toBe(true);
-    } finally {
-      exitSpy.mockRestore();
-      service.stopUpdateService();
-    }
-  });
-
-  it('defers manifest-driven discard while auto-relaunch eligibility is pending', async () => {
-    vi.useFakeTimers();
-    readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: false });
-    download.mockImplementation(async ({ targetPath }: { targetPath: string }) => {
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.writeFileSync(targetPath, 'update');
-      return { path: targetPath, size: 123 };
-    });
-
-    const service = await freshUpdateService('darwin');
-    let releaseProbe: ((busy: boolean) => void) | undefined;
-    try {
-      await expect(service.checkForUpdate(updateManifest('0.0.65'))).resolves.toBe('ready');
-      const stagedFile = path.join(
-        TEST_USER_DATA,
-        'updates',
-        path.basename(updateManifest('0.0.65').app.hotfix.file),
-      );
-      expect(fs.existsSync(stagedFile)).toBe(true);
-
-      readAutoUpdateSettings.mockReturnValue({ autoRelaunchOnIdle: true });
-      const probeStarted = new Promise<void>((resolveStarted) => {
-        service.setUpdateAutoRelaunchBusyProbe(
-          () =>
-            new Promise<boolean>((resolveProbe) => {
-              resolveStarted();
-              releaseProbe = resolveProbe;
-            }),
-        );
-      });
-      await probeStarted;
-
-      await expect(service.checkForUpdate(updateManifest('0.0.63'))).resolves.toBe('idle');
-      // The manifest says the staged version is no longer eligible, but the
-      // pending busy probe still owns the apply decision. Keep the zip intact
-      // until that decision settles; only the marker is removed immediately.
-      expect(fs.existsSync(stagedFile)).toBe(true);
-      expect(fs.existsSync(path.join(TEST_USER_DATA, 'updates', 'patch-info.json'))).toBe(false);
-
-      releaseProbe?.(true);
-      await vi.waitFor(() => {
-        expect(service.getUpdateStatus()).toBe('idle');
-      });
-      expect(fs.existsSync(stagedFile)).toBe(false);
-    } finally {
-      releaseProbe?.(true);
       service.stopUpdateService();
     }
   });
@@ -796,6 +1062,40 @@ describe('startup update relaunch safety', () => {
     await handler();
     return service;
   }
+
+  it('revalidates fork platform and feed binding at the native apply boundary', async () => {
+    const service = await bootWithStagedPatch({ enabled: true });
+    const updatesDir = path.join(TEST_USER_DATA, 'updates');
+    customUpdatePolicy.platformSupported = false;
+    try {
+      const relaunch = ipcListeners.get('update-relaunch');
+      expect(relaunch).toBeTypeOf('function');
+      relaunch?.({ sender: { id: 1 } }, 'dark');
+      await vi.waitFor(() => expect(service.getUpdateStatus()).toBe('error'));
+      expect(fs.existsSync(path.join(updatesDir, 'patch-info.json'))).toBe(false);
+      expect(fs.existsSync(path.join(updatesDir, 'xdt-maker-0.0.65.zip'))).toBe(false);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
+
+  it('rejects patch-info replacement at the native apply boundary', async () => {
+    const service = await bootWithStagedPatch({ enabled: true });
+    const updatesDir = path.join(TEST_USER_DATA, 'updates');
+    const infoPath = path.join(updatesDir, 'patch-info.json');
+    const info = JSON.parse(fs.readFileSync(infoPath, 'utf-8')) as Record<string, unknown>;
+    fs.writeFileSync(infoPath, JSON.stringify({ ...info, feedId: 'official-cindy-stable-v1' }));
+    try {
+      const relaunch = ipcListeners.get('update-relaunch');
+      expect(relaunch).toBeTypeOf('function');
+      relaunch?.({ sender: { id: 1 } }, 'dark');
+      await vi.waitFor(() => expect(service.getUpdateStatus()).toBe('error'));
+      expect(fs.existsSync(infoPath)).toBe(false);
+      expect(fs.existsSync(path.join(updatesDir, 'xdt-maker-0.0.65.zip'))).toBe(false);
+    } finally {
+      service.stopUpdateService();
+    }
+  });
 
   it('is false with nothing staged', async () => {
     const service = await freshUpdateService('darwin');
@@ -1491,6 +1791,8 @@ describe('startup update relaunch safety', () => {
         fileName: 'xdt-maker-0.0.65.zip',
         sha256: 'abc',
         enableBeta: false,
+        feedId: customUpdatePolicy.feedId,
+        platformKey: customUpdatePolicy.platformKey,
       }),
     );
     const flagPath = path.join(TEST_USER_DATA, 'relogin-required.flag');
