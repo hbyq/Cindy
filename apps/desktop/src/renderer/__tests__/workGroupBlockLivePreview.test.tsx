@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 
@@ -69,6 +69,7 @@ import type { ChatMessage } from '@/lib/makerChatStore';
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  delete (window as unknown as { electronAPI?: unknown }).electronAPI;
 });
 beforeEach(() => expandMemory.reset());
 
@@ -129,6 +130,101 @@ function clickGroup(label: string) {
 }
 
 describe('WorkGroupBlock — running latest-five preview', () => {
+  it('adds the Chinese translation as a second visible line without replacing the source', async () => {
+    const translate = vi.fn(async (source: string) => ({
+      status: 'translated' as const,
+      translation: source === 'Inspecting files' ? '正在检查文件' : '正在检查设置',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+
+    const { rerender } = render(
+      createElement(WorkGroupBlock, {
+        blockId: 'work:translated',
+        isStreaming: true,
+        childItems: [thinking({
+          ...mkThinking('translated', 'Inspecting files'),
+          isStreaming: false,
+        })],
+      }),
+    );
+
+    expect(screen.getByText('Inspecting files')).toBeTruthy();
+    expect(screen.queryByText('正在检查文件')).toBeNull();
+    await waitFor(() => expect(screen.getByText('正在检查文件')).toBeTruthy());
+    const translatedLine = document.querySelector('[data-visible-text-translation="true"]');
+    expect(translatedLine?.previousElementSibling?.textContent).toBe('Inspecting files');
+    expect(translatedLine?.textContent).toBe('正在检查文件');
+    expect(translate).toHaveBeenCalledWith('Inspecting files');
+
+    rerender(
+      createElement(WorkGroupBlock, {
+        blockId: 'work:translated',
+        isStreaming: true,
+        childItems: [thinking({
+          ...mkThinking('translated', 'Inspecting settings'),
+          isStreaming: false,
+        })],
+      }),
+    );
+    // A source mutation must never show the previous source's translation,
+    // even for the single render before the effect cleanup runs.
+    expect(screen.queryByText('正在检查文件')).toBeNull();
+    expect(screen.getByText('Inspecting settings')).toBeTruthy();
+    await waitFor(() => expect(screen.getByText('正在检查设置')).toBeTruthy());
+  });
+
+  it('does not translate the current thinking block while deltas can still mutate it', async () => {
+    const translate = vi.fn(async () => ({
+      status: 'translated' as const,
+      translation: '不应出现',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+    render(
+      createElement(WorkGroupBlock, {
+        blockId: 'work:streaming-translation',
+        isStreaming: true,
+        childItems: [thinking(mkThinking('streaming-translation', 'Inspecting files'))],
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(translate).not.toHaveBeenCalled();
+    expect(screen.getByText('Inspecting files')).toBeTruthy();
+    expect(screen.queryByText('不应出现')).toBeNull();
+  });
+
+  it('does not translate the expanded copy of a thinking block that is still streaming', async () => {
+    const translate = vi.fn(async () => ({
+      status: 'translated' as const,
+      translation: '不应出现',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+    render(
+      createElement(WorkGroupBlock, {
+        blockId: 'work:expanded-streaming-translation',
+        isStreaming: true,
+        childItems: [
+          thinking(mkThinking('expanded-streaming-translation', 'Inspecting files')),
+          rendered('progress', 'continuing the analysis'),
+        ],
+      }),
+    );
+
+    clickGroup('chat.workGroup.working');
+    expect(document.querySelectorAll('[data-live-work-activity="thinking"]')).toHaveLength(1);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    expect(translate).not.toHaveBeenCalled();
+    expect(screen.queryByText('不应出现')).toBeNull();
+  });
+
   it('keeps the latest five tools/reasoning rows in chronological order and drops empty thinking', async () => {
     const children: WorkGroupChild[] = [
       tools('seg-1', [mkTool('t1'), mkTool('t2')]),

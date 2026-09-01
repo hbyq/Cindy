@@ -1,14 +1,19 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 
 import { ThinkingCard } from '@/components/chat/ThinkingCard';
 import { ThinkingText, tokenizeThinkingText } from '@/components/chat/ThinkingText';
 import { __test_internals as expandMemory } from '@/hooks/useExpandedBlockMemory';
+import { VISIBLE_TEXT_TRANSLATION_MAX_SOURCE_CHARS } from '@/../shared/visibleTextTranslation';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  delete (window as unknown as { electronAPI?: unknown }).electronAPI;
+});
 beforeEach(() => expandMemory.reset());
 
 describe('ThinkingText — limited inline markup', () => {
@@ -67,5 +72,62 @@ describe('ThinkingCard — shared thinking presentation', () => {
     fireEvent.click(screen.getByRole('button'));
     expect(screen.getByText('Reviewing the implementation')).toBeTruthy();
     expect(container.textContent).not.toContain('**');
+  });
+
+  it('translates a finalized standalone block only after the user expands it', async () => {
+    const translate = vi.fn(async () => ({
+      status: 'translated' as const,
+      translation: '正在审查实现',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+    const { container } = render(
+      createElement(ThinkingCard, {
+        blockKey: 'translated-standalone-thinking',
+        content: 'Reviewing\nthe implementation',
+        durationMs: 1_000,
+      }),
+    );
+
+    expect(translate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button'));
+    expect(container.textContent).toContain('Reviewing\nthe implementation');
+    await waitFor(() => expect(screen.getByText('正在审查实现')).toBeTruthy());
+    expect(container.textContent).toContain('Reviewing\nthe implementation');
+    expect(translate).toHaveBeenCalledWith('Reviewing the implementation');
+  });
+
+  it('never sends oversized reasoning while streaming or after it settles', async () => {
+    const translate = vi.fn(async () => ({
+      status: 'translated' as const,
+      translation: '不应出现',
+    }));
+    (window as unknown as {
+      electronAPI: { visibleTextTranslation: { translate: typeof translate } };
+    }).electronAPI = { visibleTextTranslation: { translate } };
+    const content = `Inspecting ${'x'.repeat(VISIBLE_TEXT_TRANSLATION_MAX_SOURCE_CHARS)}`;
+    const { rerender } = render(
+      createElement(ThinkingCard, {
+        blockKey: 'oversized-streaming-thinking',
+        content,
+        isStreaming: true,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole('button'));
+    expect(translate).not.toHaveBeenCalled();
+    rerender(
+      createElement(ThinkingCard, {
+        blockKey: 'oversized-streaming-thinking',
+        content,
+        isStreaming: false,
+        durationMs: 1_000,
+      }),
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    expect(translate).not.toHaveBeenCalled();
   });
 });
