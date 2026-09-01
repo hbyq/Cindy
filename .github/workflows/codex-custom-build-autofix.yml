@@ -641,6 +641,8 @@ jobs:
             SKIP_CUSTOMIZATION_FETCH=1 \
             TRANSLATION_REF="$new_translation" \
             UPDATE_REF="$new_update" \
+            EXPECTED_TRANSLATION_SHA="$new_translation" \
+            EXPECTED_UPDATE_SHA="$new_update" \
             "$GITHUB_WORKSPACE/.github/scripts/compose-custom-source.sh"
             [[ "$(git write-tree)" == "$VALIDATED_TREE" ]]
           )

@@ -52,8 +52,8 @@ jobs:
       official_ref: ${{ steps.release.outputs.official_ref }}
       official_version: ${{ steps.release.outputs.official_version }}
       official_sha: ${{ steps.release.outputs.official_sha }}
-      translation_sha: ${{ steps.compose.outputs.translation_sha }}
-      update_sha: ${{ steps.compose.outputs.update_sha }}
+      translation_sha: ${{ steps.features.outputs.translation_sha }}
+      update_sha: ${{ steps.features.outputs.update_sha }}
 
     steps:
       - name: Resolve official stable tag
@@ -115,6 +115,69 @@ jobs:
           "official_sha=$officialSha" >> $env:GITHUB_OUTPUT
           "require_relogin=$($requireRelogin.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Official source: makecindy/cindy@$officialRef ($officialSha)"
+
+      - name: Resolve exact fork customization heads
+        id: features
+        shell: pwsh
+        env:
+          CUSTOMIZATION_REPOSITORY: https://github.com/hbyq/Cindy.git
+          TRANSLATION_BRANCH: feature/visible-text-translation-v0.1.60
+          UPDATE_BRANCH: feature/fork-update-and-build-v0.1.60
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Resolve-ExactHead([string]$Branch) {
+            $ref = "refs/heads/$Branch"
+            $lines = @(git ls-remote --heads $env:CUSTOMIZATION_REPOSITORY $ref)
+            if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 1) {
+              throw "Unable to resolve exactly one fork feature head for '$ref'"
+            }
+            $pattern = '^([a-f0-9]{40})\s+' + [regex]::Escape($ref) + '$'
+            if ([string]$lines[0] -notmatch $pattern) {
+              throw "Invalid fork feature response for '$ref'"
+            }
+            return $Matches[1]
+          }
+          $translationSha = Resolve-ExactHead $env:TRANSLATION_BRANCH
+          $updateSha = Resolve-ExactHead $env:UPDATE_BRANCH
+          "translation_sha=$translationSha" >> $env:GITHUB_OUTPUT
+          "update_sha=$updateSha" >> $env:GITHUB_OUTPUT
+
+      # This artifact is deliberately created before checkout/composition. Even a
+      # merge conflict must leave the listener an exact, immutable source identity.
+      - name: Write immutable source metadata
+        shell: bash
+        env:
+          OFFICIAL_REF: ${{ steps.release.outputs.official_ref }}
+          OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
+          OFFICIAL_SHA: ${{ steps.release.outputs.official_sha }}
+          TRANSLATION_SHA: ${{ steps.features.outputs.translation_sha }}
+          UPDATE_SHA: ${{ steps.features.outputs.update_sha }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema 'cindy-custom-source-v1' \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson runId "$GITHUB_RUN_ID" \
+            --argjson runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg officialRef "$OFFICIAL_REF" \
+            --arg officialVersion "$OFFICIAL_VERSION" \
+            --arg officialSha "$OFFICIAL_SHA" \
+            --arg translationFeatureSha "$TRANSLATION_SHA" \
+            --arg updateBuildFeatureSha "$UPDATE_SHA" \
+            '{schema: $schema, repository: $repository, runId: $runId, runAttempt: $runAttempt,
+              officialRef: $officialRef, officialVersion: $officialVersion, officialSha: $officialSha,
+              translationFeatureSha: $translationFeatureSha, updateBuildFeatureSha: $updateBuildFeatureSha}' \
+            > source-metadata.json
+          jq -e . source-metadata.json >/dev/null
+
+      - name: Upload immutable source metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: custom-source-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: source-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
 
       - name: Checkout trusted fork automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -286,44 +349,11 @@ jobs:
           UPDATE_REF: refs/remotes/customization/feature/fork-update-and-build-v0.1.60
           TRANSLATION_SOURCE_REF: refs/heads/feature/visible-text-translation-v0.1.60
           UPDATE_SOURCE_REF: refs/heads/feature/fork-update-and-build-v0.1.60
+          EXPECTED_TRANSLATION_SHA: ${{ steps.features.outputs.translation_sha }}
+          EXPECTED_UPDATE_SHA: ${{ steps.features.outputs.update_sha }}
         run: |
           script_path="$(cygpath -u "$AUTOMATION_SCRIPT")"
           "$script_path"
-
-      - name: Write immutable source metadata
-        shell: bash
-        env:
-          OFFICIAL_REF: ${{ steps.release.outputs.official_ref }}
-          OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
-          OFFICIAL_SHA: ${{ steps.release.outputs.official_sha }}
-          TRANSLATION_SHA: ${{ steps.compose.outputs.translation_sha }}
-          UPDATE_SHA: ${{ steps.compose.outputs.update_sha }}
-        run: |
-          set -euo pipefail
-          jq -n \
-            --arg schema 'cindy-custom-source-v1' \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --argjson runId "$GITHUB_RUN_ID" \
-            --argjson runAttempt "$GITHUB_RUN_ATTEMPT" \
-            --arg officialRef "$OFFICIAL_REF" \
-            --arg officialVersion "$OFFICIAL_VERSION" \
-            --arg officialSha "$OFFICIAL_SHA" \
-            --arg translationFeatureSha "$TRANSLATION_SHA" \
-            --arg updateBuildFeatureSha "$UPDATE_SHA" \
-            '{schema: $schema, repository: $repository, runId: $runId, runAttempt: $runAttempt,
-              officialRef: $officialRef, officialVersion: $officialVersion, officialSha: $officialSha,
-              translationFeatureSha: $translationFeatureSha, updateBuildFeatureSha: $updateBuildFeatureSha}' \
-            > source-metadata.json
-          jq -e . source-metadata.json >/dev/null
-
-      - name: Upload immutable source metadata
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: custom-source-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: source-metadata.json
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
 
       - name: Resolve monotonic custom version
         id: channel
@@ -333,9 +363,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           OFFICIAL_REF: ${{ steps.release.outputs.official_ref }}
           OFFICIAL_VERSION: ${{ steps.release.outputs.official_version }}
-          OFFICIAL_SHA: ${{ steps.compose.outputs.official_sha }}
-          TRANSLATION_SHA: ${{ steps.compose.outputs.translation_sha }}
-          UPDATE_SHA: ${{ steps.compose.outputs.update_sha }}
+          OFFICIAL_SHA: ${{ steps.release.outputs.official_sha }}
+          TRANSLATION_SHA: ${{ steps.features.outputs.translation_sha }}
+          UPDATE_SHA: ${{ steps.features.outputs.update_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $headers = @{

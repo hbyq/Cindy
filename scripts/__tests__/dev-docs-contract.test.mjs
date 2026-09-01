@@ -285,6 +285,9 @@ test("custom build autofix binds exact source metadata and atomically updates on
 	assert.doesNotMatch(workflow, /output-file: \.\.\/review\.json/);
 	assert.match(workflow, /git push --atomic origin "\$\{refspecs\[@\]\}"/);
 	assert.match(workflow, /expected_official_sha: \$expectedOfficialSha/);
+	assert.match(workflow,
+		/SKIP_CUSTOMIZATION_FETCH=1 \\\n\s+TRANSLATION_REF="\$new_translation" \\\n\s+UPDATE_REF="\$new_update" \\\n\s+EXPECTED_TRANSLATION_SHA="\$new_translation" \\\n\s+EXPECTED_UPDATE_SHA="\$new_update"/,
+		"publication reproduction must bind the newly created feature heads");
 	assert.match(workflow, /git remote get-url origin.*https:\/\/github\.com\/hbyq\/Cindy/);
 	assert.doesNotMatch(workflowJob(workflow, "publish"), /OPENAI_API_KEY/);
 	assert.doesNotMatch(workflow, /refs\/heads\/main"\)|gh pr create|pull-requests:\s*write|push --force/);
@@ -299,6 +302,14 @@ test("custom Windows build publishes immutable exact-SHA source metadata before 
 	assert.match(workflow, /schema 'cindy-custom-source-v1'/);
 	assert.match(workflow, /translationFeatureSha/);
 	assert.match(workflow, /updateBuildFeatureSha/);
+	const metadataUpload = workflow.indexOf("- name: Upload immutable source metadata");
+	const sourceComposition = workflow.indexOf("- name: Apply allow-listed fork customizations");
+	assert.ok(metadataUpload >= 0 && sourceComposition >= 0 && metadataUpload < sourceComposition,
+		"source metadata must be uploaded before composition can fail");
+	assert.match(workflow, /translation_sha: \$\{\{ steps\.features\.outputs\.translation_sha \}\}/);
+	assert.match(workflow, /update_sha: \$\{\{ steps\.features\.outputs\.update_sha \}\}/);
+	assert.match(composeScript, /translation ref changed after source metadata was locked/);
+	assert.match(composeScript, /update ref changed after source metadata was locked/);
 	assert.match(composeScript, /count >= 1 && count <= 20/);
 	assert.match(composeScript, /Signed-off-by matching its author or committer/);
 	assert.match(composeScript, /history is not linear/);

@@ -8,6 +8,8 @@ set -euo pipefail
 : "${OFFICIAL_SHA:?OFFICIAL_SHA is required}"
 : "${TRANSLATION_REF:?TRANSLATION_REF is required}"
 : "${UPDATE_REF:?UPDATE_REF is required}"
+: "${EXPECTED_TRANSLATION_SHA:?EXPECTED_TRANSLATION_SHA is required}"
+: "${EXPECTED_UPDATE_SHA:?EXPECTED_UPDATE_SHA is required}"
 
 CUSTOMIZATION_REMOTE_NAME="${CUSTOMIZATION_REMOTE_NAME:-customization}"
 CUSTOMIZATION_REMOTE_URL="${CUSTOMIZATION_REMOTE_URL:-https://github.com/hbyq/Cindy.git}"
@@ -202,6 +204,15 @@ if [[ "$SKIP_CUSTOMIZATION_FETCH" != '1' ]]; then
     "+${TRANSLATION_SOURCE_REF:-refs/heads/feature/visible-text-translation-v0.1.60}:$TRANSLATION_REF" \
     "+${UPDATE_SOURCE_REF:-refs/heads/feature/fork-update-and-build-v0.1.60}:$UPDATE_REF"
 fi
+
+[[ "$EXPECTED_TRANSLATION_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  || fail 'EXPECTED_TRANSLATION_SHA is not a full lowercase SHA'
+[[ "$EXPECTED_UPDATE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  || fail 'EXPECTED_UPDATE_SHA is not a full lowercase SHA'
+[[ "$(git rev-parse "$TRANSLATION_REF^{commit}")" == "$EXPECTED_TRANSLATION_SHA" ]] \
+  || fail 'translation ref changed after source metadata was locked'
+[[ "$(git rev-parse "$UPDATE_REF^{commit}")" == "$EXPECTED_UPDATE_SHA" ]] \
+  || fail 'update ref changed after source metadata was locked'
 
 assert_feature_and_compose translation "$TRANSLATION_REF" "${translation_allowed_paths[@]}"
 assert_feature_and_compose update "$UPDATE_REF" "${update_allowed_paths[@]}"
