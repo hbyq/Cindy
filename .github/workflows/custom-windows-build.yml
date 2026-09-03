@@ -231,13 +231,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.69'
-          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.69'
+          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.72'
+          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.72'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
-            '+refs/heads/feature/visible-text-translation-v0.1.69:refs/remotes/customization/feature/visible-text-translation-v0.1.69' `
-            '+refs/heads/feature/fork-update-and-build-v0.1.69:refs/remotes/customization/feature/fork-update-and-build-v0.1.69'
+            '+refs/heads/feature/visible-text-translation-v0.1.72:refs/remotes/customization/feature/visible-text-translation-v0.1.72' `
+            '+refs/heads/feature/fork-update-and-build-v0.1.72:refs/remotes/customization/feature/fork-update-and-build-v0.1.72'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
 
           git config user.name 'hbyq'
