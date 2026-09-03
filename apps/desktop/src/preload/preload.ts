@@ -157,6 +157,10 @@ import { isDataOwnerPushStamp, type DataOwnerPushStamp } from '../shared/dataOwn
 import type { VoiceInputSyncErrorResult } from '../shared/voiceInputData';
 import type { UtilityTextFailure } from '../shared/utilityTextResult';
 import { DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL } from '../shared/localDbMaintenance';
+import {
+  VISIBLE_TEXT_TRANSLATION_INVOKE,
+  type VisibleTextTranslationResult,
+} from '../shared/visibleTextTranslation';
 import type { BrowserBackendHealth, BrowserBackendRecoveryResult } from '../shared/browserBackend';
 import type {
   ReviewBranchDiffData,
@@ -969,6 +973,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * catch 后兜底当作 false (那个阶段本来就不可能有 in-flight)。
    */
   anySessionInTurn: (): Promise<boolean> => ipcRenderer.invoke('maker:any-session-in-turn'),
+  visibleTextTranslation: {
+    translate: (source: string): Promise<VisibleTextTranslationResult> =>
+      ipcRenderer.invoke(VISIBLE_TEXT_TRANSLATION_INVOKE, source),
+  },
   pageZoomIn: (): Promise<{ ok: true; zoomFactor: number }> => ipcRenderer.invoke('page-zoom:in'),
   pageZoomOut: (): Promise<{ ok: true; zoomFactor: number }> => ipcRenderer.invoke('page-zoom:out'),
   pageZoomReset: (): Promise<{ ok: true; zoomFactor: number }> =>
