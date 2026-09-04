@@ -462,6 +462,7 @@ import { readFileBytesForPreview } from './fileReadBytes.js';
 import { initHeartbeatService } from './heartbeatService';
 import { initAnalyticsSettingsService, noteAuthColdStartState } from './analyticsSettingsService';
 import { initLogUploadService, scheduleStartupBackfill } from './log-upload';
+import { registerVisibleTextTranslationIpc } from './visibleTextTranslationService.js';
 import { WindowManualDragController } from './windowManualDrag';
 import { issueWritableDirectoryPickerGrant } from './maker-ipc/writableDirectoryPickerGrant.js';
 // 设备互联(跨设备远程控制): relay 连接 host + 开关/设备列表 IPC
@@ -8736,6 +8737,9 @@ app.on('ready', async () => {
   if (getActiveAppSession().mode === 'local') {
     await warmStaleProcessProvenance();
   }
+  // 可见工作摘要翻译是 owner 级全局显示增强。handler 只在请求发生时读取
+  // 设置/Provider，原始 agent 事件与启动关键路径均不等待网络。
+  registerVisibleTextTranslationIpc({ getMaker: getMakerCore });
   startupWindowCreationAllowed = true;
   createWindow();
   // The macOS release watcher stays disarmed until a task drag begins. Start
