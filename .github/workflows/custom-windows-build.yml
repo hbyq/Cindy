@@ -231,14 +231,20 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $featureUrl = 'https://github.com/hbyq/Cindy.git'
-          $translationRef = 'refs/remotes/customization/feature/visible-text-translation-v0.1.72'
-          $updateRef = 'refs/remotes/customization/feature/fork-update-and-build-v0.1.72'
+          $customizationRef = 'refs/remotes/customization/main'
+          $translationRef = '0ed16b3947162e5446120a9146c011f1bf75dd48'
+          $updateRef = 'c1cc8a9ddd30e166db7a172d065aee686eb22da2'
 
           git remote add customization $featureUrl
           git fetch --no-tags customization `
-            '+refs/heads/feature/visible-text-translation-v0.1.72:refs/remotes/customization/feature/visible-text-translation-v0.1.72' `
-            '+refs/heads/feature/fork-update-and-build-v0.1.72:refs/remotes/customization/feature/fork-update-and-build-v0.1.72'
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization branches' }
+            '+refs/heads/main:refs/remotes/customization/main'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch fork customization history' }
+          foreach ($featureSha in @($translationRef, $updateRef)) {
+            git merge-base --is-ancestor $featureSha $customizationRef
+            if ($LASTEXITCODE -ne 0) {
+              throw "Customization commit $featureSha is not retained by fork main"
+            }
+          }
 
           git config user.name 'hbyq'
           git config user.email '51372765+hbyq@users.noreply.github.com'
