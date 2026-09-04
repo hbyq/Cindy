@@ -33,6 +33,7 @@ import { Sparkles, ChevronRight, Lock } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Collapse } from '@/components/ui/collapse';
 import { useExpandedBlockMemory } from '@/hooks/useExpandedBlockMemory';
+import { useVisibleTextTranslation } from '@/hooks/useVisibleTextTranslation';
 
 import { ThinkingText } from './ThinkingText';
 
@@ -114,6 +115,10 @@ export function ThinkingCard({
     return 'thinking:unknown';
   }, [blockKey, startedAt]);
   const { expanded, setExpanded } = useExpandedBlockMemory(persistedKey);
+  const visibleTranslation = useVisibleTextTranslation(
+    content,
+    expanded && !isStreaming && !isRedacted,
+  );
 
   const onToggle = useCallback(() => {
     setExpanded((v) => !v);
@@ -254,7 +259,17 @@ export function ThinkingCard({
           <BodyRail>
             {content ? (
               <p className="whitespace-pre-wrap italic text-14 leading-[1.6] text-[var(--thinking-body-text)]">
-                <ThinkingText content={content} />
+                <span className="block">
+                  <ThinkingText content={content} />
+                </span>
+                {visibleTranslation.translation && (
+                  <span
+                    data-visible-text-translation="true"
+                    className="block not-italic text-[var(--text-secondary)]"
+                  >
+                    {visibleTranslation.translation}
+                  </span>
+                )}
               </p>
             ) : (
               <p className="italic text-14 leading-[1.6] text-[var(--thinking-body-text)] opacity-70">
