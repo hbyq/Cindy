@@ -13,6 +13,7 @@ import path from 'node:path';
 import { afterEach, test } from 'node:test';
 
 import {
+  FORK_DISABLE_LOG_UPLOAD_ENV,
   LOG_UPLOAD_TARGET_ENV,
   desktopLogUploadBuildEnv,
   loadLogUploadTargets,
@@ -133,6 +134,40 @@ test('desktopLogUploadBuildEnv: allowMissing + 文件缺失 ⇒ 注入空串（�
     allowMissing: true,
   });
   assert.equal(env[LOG_UPLOAD_TARGET_ENV], '');
+});
+
+test('desktopLogUploadBuildEnv: fork 显式禁用 + 文件缺失 ⇒ 强制注入空串', () => {
+  const dir = makeTempDir('cindy-log-upload-fork-disabled-');
+  const buildEnv = desktopLogUploadBuildEnv({
+    authRegion: 'global',
+    configPath: path.join(dir, 'log-upload.json'),
+    env: { [FORK_DISABLE_LOG_UPLOAD_ENV]: '1' },
+  });
+  assert.equal(buildEnv[LOG_UPLOAD_TARGET_ENV], '');
+});
+
+test('desktopLogUploadBuildEnv: fork 显式禁用时即使配置存在也不烘焙目标', () => {
+  const buildEnv = desktopLogUploadBuildEnv({
+    authRegion: 'global',
+    configPath: writeConfig(VALID),
+    env: { [FORK_DISABLE_LOG_UPLOAD_ENV]: '1' },
+  });
+  assert.equal(buildEnv[LOG_UPLOAD_TARGET_ENV], '');
+});
+
+test('desktopLogUploadBuildEnv: fork 禁用开关只接受精确值 1', () => {
+  const dir = makeTempDir('cindy-log-upload-fork-flag-invalid-');
+  for (const value of ['', '0', 'true']) {
+    assert.throws(
+      () =>
+        desktopLogUploadBuildEnv({
+          authRegion: 'global',
+          configPath: path.join(dir, 'log-upload.json'),
+          env: { [FORK_DISABLE_LOG_UPLOAD_ENV]: value },
+        }),
+      /缺少日志上报配置/,
+    );
+  }
 });
 
 test('desktopLogUploadBuildEnv: 默认(发行打包)文件缺失仍抛 —— 不静默关掉发行观测', () => {
