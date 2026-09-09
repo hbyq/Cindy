@@ -1,1 +1,6 @@
-RESTORE_FROM_DISK
+name: custom-windows-build
+
+on:
+  push:
+    branches:
+      - main
