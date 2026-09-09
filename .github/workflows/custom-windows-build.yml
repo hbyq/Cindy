@@ -1,1 +1,16 @@
-PLACEHOLDER_WILL_FAIL_IF_NOT_REPLACED
+name: custom-windows-build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      official_ref:
+        description: "stable，或指定官方稳定标签（例如 v0.1.60）；手动运行会生成新修订版"
+        required: true
+        default: stable
+        type: string
+  schedule:
+    # 每 3 小时检查一次；输入不变时会在安装依赖前退出。
+    - cron: "17 */3 * * *"
