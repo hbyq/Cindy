@@ -105,25 +105,9 @@ jobs:
           Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>" \
             "$translation_sha" "$update_sha"
 
-          cat > /tmp/retarget_shas.py <<PY
-          from pathlib import Path
-          path = Path(".github/workflows/custom-windows-build.yml")
-          text = path.read_text()
-          text = text.replace("0ed16b3947162e5446120a9146c011f1bf75dd48", "${translation_sha}")
-          text = text.replace("c1cc8a9ddd30e166db7a172d065aee686eb22da2", "${update_sha}")
-          if "${translation_sha}" not in text or "${update_sha}" not in text:
-              raise SystemExit("failed to retarget customization SHAs")
-          path.write_text(text)
-          PY
-          python3 /tmp/retarget_shas.py
-          git rm --ignore-unmatch -- .github/workflows/rebase-customizations-v0.1.76.yml
-          git add -- .github/workflows/custom-windows-build.yml
-          git commit -m "fix(ci): rebase custom Windows build onto v0.1.76
-
-          Retain the two reviewed customization commits through main and fetch them by immutable SHA, avoiding extra remote feature refs.
-
-          Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>"
-
+          echo "translation_sha=${translation_sha}" >> "$GITHUB_STEP_SUMMARY"
+          echo "update_sha=${update_sha}" >> "$GITHUB_STEP_SUMMARY"
+          echo "main_head=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           echo "translation_sha=${translation_sha}"
           echo "update_sha=${update_sha}"
           echo "main_head=$(git rev-parse HEAD)"
