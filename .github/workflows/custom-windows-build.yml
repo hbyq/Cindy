@@ -1,1 +1,30 @@
-RESTORE_FROM_DISK
+name: custom-windows-build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      official_ref:
+        description: "stable，或指定官方稳定标签（例如 v0.1.60）；手动运行会生成新修订版"
+        required: true
+        default: stable
+        type: string
+  schedule:
+    # 每 3 小时检查一次；输入不变时会在安装依赖前退出。
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  restore-guard:
+    if: ${{ github.repository == 'hbyq/Cindy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail closed until the full workflow body is restored
+        run: |
+          echo "::error file=.github/workflows/custom-windows-build.yml::Workflow body is missing. Restore the last good definition from be8b033ae7116d8d60178fe6a50716cb4286b63f and pin SHAs 2af786b50024961a205060b351504c64bc4222fc and 6984dda24f1c1bac29f14c3e6179fee2a234e78f."
+          exit 1
