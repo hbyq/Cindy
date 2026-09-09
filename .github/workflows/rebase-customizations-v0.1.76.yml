@@ -41,7 +41,7 @@ jobs:
           fi
 
           git switch --detach "$official_sha"
-          git cherry-pick --allow-empty=false "$TRANSLATION_SRC"
+          git cherry-pick "$TRANSLATION_SRC"
           git commit --amend -m "feat(desktop): rebase visible text translation onto v0.1.76
 
           (cherry picked from commit ${TRANSLATION_SRC})
@@ -50,7 +50,7 @@ jobs:
 
           git switch --detach "$official_sha"
           set +e
-          git cherry-pick --allow-empty=false "$UPDATE_SRC"
+          git cherry-pick "$UPDATE_SRC"
           pick_status=$?
           set -e
           if [ "$pick_status" -ne 0 ]; then
