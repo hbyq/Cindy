@@ -1,6 +1,1 @@
-name: custom-windows-build
-
-on:
-  push:
-    branches:
-      - main
+RESTORE_FROM_DISK
