@@ -1,1 +1,76 @@
-RESTORE_FROM_FILE:/tmp/custom-windows-build.yml
+name: custom-windows-build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      official_ref:
+        description: "stable，或指定官方稳定标签（例如 v0.1.60）；手动运行会生成新修订版"
+        required: true
+        default: stable
+        type: string
+  schedule:
+    - cron: "17 */3 * * *"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: custom-windows-stable-channel
+  cancel-in-progress: false
+
+env:
+  XDT_SKIP_AGENT_BIN_INSTALL: "1"
+  NODE_OPTIONS: "--max-old-space-size=8192"
+
+jobs:
+  build:
+    if: ${{ github.repository == 'hbyq/Cindy' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skipped: ${{ steps.channel.outputs.skip }}
+      handoff_key: ${{ steps.metadata.outputs.cache_key }}
+      build_run_attempt: ${{ steps.metadata.outputs.run_attempt }}
+      custom_version: ${{ steps.channel.outputs.custom_version }}
+      custom_revision: ${{ steps.channel.outputs.custom_revision }}
+      channel_head_sha: ${{ steps.channel.outputs.channel_head_sha }}
+      official_ref: ${{ steps.release.outputs.official_ref }}
+      official_version: ${{ steps.release.outputs.official_version }}
+      official_sha: ${{ steps.compose.outputs.official_sha }}
+      translation_sha: ${{ steps.compose.outputs.translation_sha }}
+      update_sha: ${{ steps.compose.outputs.update_sha }}
+    steps:
+      - name: Resolve official stable tag
+        id: release
+        shell: pwsh
+        env:
+          REQUESTED_REF: ${{ github.event.inputs.official_ref || 'stable' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requested = $env:REQUESTED_REF.Trim()
+          if ($requested -eq 'stable') {
+            $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $manifest = Invoke-RestMethod -Uri "https://hotfix.cindy.app/cindy/manifest-win32-x64.json?t=$cacheBust"
+            $version = [string]$manifest.app.version
+            if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw "Official stable manifest returned an invalid version: '$version'" }
+            $officialRef = "v$version"
+            $requireRelogin = $manifest.app.requireRelogin -eq $true
+          } elseif ($requested -match '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            $officialRef = $requested
+            $version = $requested.Substring(1)
+            $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $manifest = Invoke-RestMethod -Uri "https://hotfix.cindy.app/cindy/manifest-win32-x64.json?t=$cacheBust"
+            $requireRelogin = ([string]$manifest.app.version -eq $version -and $manifest.app.requireRelogin -eq $true)
+          } else {
+            throw "official_ref must be 'stable' or an official vX.Y.Z tag"
+          }
+          "official_ref=$officialRef" >> $env:GITHUB_OUTPUT
+          "official_version=$version" >> $env:GITHUB_OUTPUT
+          "require_relogin=$($requireRelogin.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
