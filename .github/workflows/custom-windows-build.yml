@@ -1,1 +1,30 @@
-PLACEHOLDER
+name: custom-windows-build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      official_ref:
+        description: "stable，或指定官方稳定标签（例如 v0.1.60）；手动运行会生成新修订版"
+        required: true
+        default: stable
+        type: string
+  schedule:
+    # 每 3 小时检查一次；输入不变时会在安装依赖前退出。
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  restore-guard:
+    if: ${{ github.repository == 'hbyq/Cindy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail closed until the full workflow body is restored
+        run: |
+          echo "::error file=.github/workflows/custom-windows-build.yml::Workflow body is missing. Restore the last good definition from 612a1bd62e7e89ab69449eb095cd14b9dd17a0b5 and pin SHAs 3ed8a221a47a4482b7e102b8bbc7e1b0de2bbe16 and 6d9dd6a42190be64fbab7539d8a7b83bb0bbcf60."
+          exit 1
