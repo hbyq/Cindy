@@ -1,0 +1,121 @@
+name: rebase-customizations-v0.1.79
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebase:
+    if: ${{ github.repository == 'hbyq/Cindy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Rebase customizations onto official v0.1.79 and pin SHAs
+        env:
+          GIT_AUTHOR_NAME: hbyq
+          GIT_AUTHOR_EMAIL: 51372765+hbyq@users.noreply.github.com
+          GIT_COMMITTER_NAME: hbyq
+          GIT_COMMITTER_EMAIL: 51372765+hbyq@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_COMMITTER_NAME"
+          git config user.email "$GIT_COMMITTER_EMAIL"
+
+          old_translation=2af786b50024961a205060b351504c64bc4222fc
+          old_update=6984dda24f1c1bac29f14c3e6179fee2a234e78f
+          official_ref=v0.1.79
+          workflow_path=.github/workflows/custom-windows-build.yml
+          repair_path=.github/workflows/rebase-customizations-v0.1.79.yml
+
+          git cat-file -e "$old_translation^{commit}"
+          git cat-file -e "$old_update^{commit}"
+
+          git remote add official https://github.com/makecindy/cindy.git
+          git fetch --no-tags official "refs/tags/${official_ref}:refs/tags/${official_ref}"
+          official_sha=$(git rev-parse "refs/tags/${official_ref}^{commit}")
+          test "$official_sha" = "abcf92c2b34e99209e505662a3fe4e11868e8aa1"
+
+          git switch --detach "$official_sha"
+          if ! git cherry-pick --allow-empty "$old_translation"; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('apps/desktop/src/renderer/__tests__/workGroupBlockLivePreview.test.tsx')
+          text = p.read_text()
+          start = text.index('<<<<<<< HEAD\n')
+          mid = text.index('\n=======\n')
+          end = text.index('\n>>>>>>>')
+          end_line_end = text.index('\n', end + 1)
+          head = text[start + len('<<<<<<< HEAD\n'):mid]
+          incoming = text[mid + len('\n=======\n'):end]
+          resolved = text[:start] + head
+          if not head.endswith('\n'):
+              resolved += '\n'
+          if not resolved.endswith('\n\n'):
+              resolved += '\n'
+          resolved += incoming
+          if not incoming.endswith('\n'):
+              resolved += '\n'
+          resolved += text[end_line_end + 1:]
+          if '<<<<<<<' in resolved or '>>>>>>>' in resolved:
+              raise SystemExit('conflict markers remain')
+          p.write_text(resolved)
+          PY
+            git add -- 'apps/desktop/src/renderer/__tests__/workGroupBlockLivePreview.test.tsx'
+            git -c core.editor=true cherry-pick --continue
+          fi
+          translation_sha=$(git rev-parse HEAD)
+          test "$(git rev-parse HEAD^)" = "$official_sha"
+          test "$(git rev-list --count ${official_sha}..HEAD)" = "1"
+
+          git switch --detach "$official_sha"
+          git cherry-pick --allow-empty "$old_update"
+          update_sha=$(git rev-parse HEAD)
+          test "$(git rev-parse HEAD^)" = "$official_sha"
+          test "$(git rev-list --count ${official_sha}..HEAD)" = "1"
+
+          git switch --detach origin/main
+          git merge -s ours --no-ff --allow-unrelated-histories \
+            -m "chore(ci): retain v0.1.79 customization commits
+
+          Keep the reviewed single-parent customization commits reachable from main without applying their source tree to the workflow branch.
+
+          Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>" \
+            "$translation_sha" "$update_sha"
+
+          python3 - "$workflow_path" "$old_translation" "$old_update" "$translation_sha" "$update_sha" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          old_translation, old_update, translation_sha, update_sha = sys.argv[2:6]
+          text = path.read_text()
+          if text.count(old_translation) != 1 or text.count(old_update) != 1:
+              raise SystemExit('expected one occurrence of each old customization SHA')
+          text = text.replace(old_translation, translation_sha).replace(old_update, update_sha)
+          if translation_sha not in text or update_sha not in text:
+              raise SystemExit('failed to pin new customization SHAs')
+          if old_translation in text or old_update in text:
+              raise SystemExit('old customization SHAs remain')
+          path.write_text(text)
+          PY
+
+          git rm --ignore-unmatch -- "$repair_path"
+          git add -- "$workflow_path"
+          git commit -m "fix(ci): pin reviewed v0.1.79 customization SHAs
+
+          Official stable is v0.1.79. Keep the allow-listed translation and updater customizations as single-parent commits on that tag.
+
+          Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>"
+          git push origin HEAD:refs/heads/main
+          git log -5 --format='%H %s'
+          echo "translation_sha=$translation_sha"
+          echo "update_sha=$update_sha"
