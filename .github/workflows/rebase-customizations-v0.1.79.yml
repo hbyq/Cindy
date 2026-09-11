@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Rebase customizations onto official v0.1.79 and pin SHAs
+      - name: Rebase customizations onto official v0.1.79
         env:
           GIT_AUTHOR_NAME: hbyq
           GIT_AUTHOR_EMAIL: 51372765+hbyq@users.noreply.github.com
@@ -34,8 +34,6 @@ jobs:
           old_translation=2af786b50024961a205060b351504c64bc4222fc
           old_update=6984dda24f1c1bac29f14c3e6179fee2a234e78f
           official_ref=v0.1.79
-          workflow_path=.github/workflows/custom-windows-build.yml
-          repair_path=.github/workflows/rebase-customizations-v0.1.79.yml
 
           git cat-file -e "$old_translation^{commit}"
           git cat-file -e "$old_update^{commit}"
@@ -92,30 +90,7 @@ jobs:
           Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>" \
             "$translation_sha" "$update_sha"
 
-          python3 - "$workflow_path" "$old_translation" "$old_update" "$translation_sha" "$update_sha" <<'PY'
-          import sys
-          from pathlib import Path
-          path = Path(sys.argv[1])
-          old_translation, old_update, translation_sha, update_sha = sys.argv[2:6]
-          text = path.read_text()
-          if text.count(old_translation) != 1 or text.count(old_update) != 1:
-              raise SystemExit('expected one occurrence of each old customization SHA')
-          text = text.replace(old_translation, translation_sha).replace(old_update, update_sha)
-          if translation_sha not in text or update_sha not in text:
-              raise SystemExit('failed to pin new customization SHAs')
-          if old_translation in text or old_update in text:
-              raise SystemExit('old customization SHAs remain')
-          path.write_text(text)
-          PY
-
-          git rm --ignore-unmatch -- "$repair_path"
-          git add -- "$workflow_path"
-          git commit -m "fix(ci): pin reviewed v0.1.79 customization SHAs
-
-          Official stable is v0.1.79. Keep the allow-listed translation and updater customizations as single-parent commits on that tag.
-
-          Signed-off-by: hbyq <51372765+hbyq@users.noreply.github.com>"
           git push origin HEAD:refs/heads/main
-          git log -5 --format='%H %s'
+          git log -5 --format='%H %P %s'
           echo "translation_sha=$translation_sha"
           echo "update_sha=$update_sha"
