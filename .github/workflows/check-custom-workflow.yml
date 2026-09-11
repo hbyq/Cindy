@@ -1,0 +1,81 @@
+name: custom-workflow-integrity
+on:
+  push:
+    branches: [main]
+    paths: [.github/**]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: ${{ github.repository == 'hbyq/Cindy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check workflow completeness, pins and safety gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python3 <<'PY'
+          import copy, json, pathlib, re
+          import yaml
+
+          def expression(body):
+              return '$' + '{{ ' + body + ' }}'
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def validate(doc, pins):
+              require(isinstance(doc, dict), 'Workflow must be a YAML mapping')
+              require(doc.get('name') == 'custom-windows-build', 'Unexpected workflow name')
+              jobs = doc.get('jobs', {})
+              require(set(jobs) == {'build', 'publish', 'cleanup-handoff', 'report-status'}, 'Incomplete job graph or placeholder workflow')
+              build = jobs['build']
+              require(build.get('permissions') == {'actions': 'read', 'contents': 'read'}, 'Build must not gain write permissions')
+              require(build.get('if') == expression("github.repository == 'hbyq/Cindy'"), 'Fork boundary changed')
+              steps = build.get('steps', [])
+              for command in ('pnpm --filter desktop typecheck', 'pnpm test:unit'):
+                  gate = [s for s in steps if s.get('run', '').strip() == command]
+                  require(len(gate) == 1, f'Missing test gate: {command}')
+                  require(gate[0].get('continue-on-error', 'false') == 'false', 'Tests may not ignore failures')
+                  require(gate[0].get('if') == expression("steps.channel.outputs.skip != 'true'"), 'Test gate condition changed')
+              compose = [s for s in steps if s.get('id') == 'compose']
+              require(len(compose) == 1, 'Missing compose step')
+              for snippet in ('$customizationRef = $env:GITHUB_SHA', '.github/cindy-customizations.json', 'git merge-base --is-ancestor', 'Assert-And-CherryPick', 'Signed-off-by', 'git diff-tree'):
+                  require(snippet in compose[0].get('run', ''), f'Missing source check: {snippet}')
+              publish = jobs['publish']
+              require(publish.get('needs') == ['build'], 'Publish must depend on build')
+              require(publish.get('if') == expression("needs.build.result == 'success' && needs.build.outputs.skipped != 'true'"), 'Publish success gate changed')
+              pub_steps = publish.get('steps', [])
+              require(pub_steps and pub_steps[-1].get('name') == 'Advance the update channel as the final operation', 'Channel must advance last')
+              require(not any('actions/checkout@' in s.get('uses', '') for s in pub_steps), 'Publisher must not check out application code')
+              require(isinstance(pins, dict) and set(pins) == {'schemaVersion', 'translationSha', 'updateSha'}, 'Invalid pin keys')
+              require(type(pins['schemaVersion']) is int and pins['schemaVersion'] == 1, 'Invalid pin schema version')
+              for key in ('translationSha', 'updateSha'):
+                  require(isinstance(pins[key], str) and re.fullmatch('[a-f0-9]{40}', pins[key]), f'Invalid {key}')
+
+          text = pathlib.Path('.github/workflows/custom-windows-build.yml').read_text(encoding='utf-8')
+          require(len(text.splitlines()) >= 1000, 'Workflow was truncated')
+          doc = yaml.load(text, Loader=yaml.BaseLoader)
+          pins = json.loads(pathlib.Path('.github/cindy-customizations.json').read_text(encoding='utf-8'))
+          validate(doc, pins)
+          mutations = []
+          broken = copy.deepcopy(doc); broken['jobs'] = {}; mutations.append((broken, pins))
+          broken = copy.deepcopy(doc); broken['jobs']['build']['permissions']['contents'] = 'write'; mutations.append((broken, pins))
+          broken = copy.deepcopy(doc); broken['jobs']['build']['steps'] = [s for s in broken['jobs']['build']['steps'] if s.get('run', '').strip() != 'pnpm test:unit']; mutations.append((broken, pins))
+          broken = copy.deepcopy(doc); broken['jobs']['publish']['if'] = expression('always()'); mutations.append((broken, pins))
+          bad_pins = dict(pins, translationSha='main'); mutations.append((doc, bad_pins))
+          for broken_doc, broken_pins in mutations:
+              try:
+                  validate(broken_doc, broken_pins)
+              except ValueError:
+                  continue
+              raise SystemExit('Integrity guard accepted a regression fixture')
+          print(f'Workflow integrity passed; {len(mutations)} regression fixtures rejected.')
+          PY
