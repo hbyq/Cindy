@@ -526,6 +526,9 @@ jobs:
         if: ${{ steps.channel.outputs.skip != 'true' }}
         env:
           CUSTOM_VERSION: ${{ steps.channel.outputs.custom_version }}
+          # The windows-host bin and cdylib share a PDB output path on MSVC.
+          # Serialize Cargo jobs so their linkers cannot write it concurrently.
+          CARGO_BUILD_JOBS: '1'
           # A stable-tag build must freeze migrations against that selected release,
           # not the moving upstream main branch fetched by actions/checkout.
           XDT_MIGRATION_BASE_REF: ${{ steps.compose.outputs.official_sha }}
