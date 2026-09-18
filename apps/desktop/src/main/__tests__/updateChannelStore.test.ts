@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const appGetPath = vi.fn();
+const forkPolicy = vi.hoisted(() => ({ betaAvailable: true }));
 
 vi.mock('electron', () => ({
   app: {
@@ -20,6 +21,10 @@ vi.mock('../maker-host/logger-adapter.js', () => ({
   },
 }));
 
+vi.mock('../forkUpdatePolicy.js', () => ({
+  isForkBetaUpdateChannelAvailable: () => forkPolicy.betaAvailable,
+}));
+
 let tempDir: string;
 
 async function loadStore() {
@@ -28,10 +33,42 @@ async function loadStore() {
 }
 
 beforeEach(() => {
+  forkPolicy.betaAvailable = true;
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-update-channel-'));
   appGetPath.mockImplementation((name: string) => {
     if (name === 'userData') return tempDir;
     return tempDir;
+  });
+});
+
+describe('fork Beta update policy', () => {
+  it('pins every client update consumer to stable and blocks organization defaults', async () => {
+    forkPolicy.betaAvailable = false;
+    const store = await loadStore();
+
+    expect(store.readUpdateChannelSettings()).toEqual({
+      enableBeta: false,
+      orgDefaultEnableBeta: false,
+    });
+    expect(store.isBetaChannelEnabled()).toBe(false);
+    expect(store.isEnableBetaUserCustomized()).toBe(true);
+    await expect(store.tryEnableUncustomizedBetaAtomic()).resolves.toBe(false);
+    await expect(store.writeEnableBeta(true)).rejects.toThrow(
+      'fork beta update channel is unavailable',
+    );
+    expect(fs.existsSync(path.join(tempDir, 'update-channel-settings.json'))).toBe(false);
+  });
+
+  it('ignores a Beta choice persisted by an earlier official build', async () => {
+    const store = await loadStore();
+    await store.writeEnableBeta(true);
+    expect(store.readUpdateChannelSettings().enableBeta).toBe(true);
+
+    forkPolicy.betaAvailable = false;
+    expect(store.readUpdateChannelSettings()).toMatchObject({ enableBeta: false });
+    expect(store.isBetaChannelEnabled()).toBe(false);
+    expect(store.isEnableBetaUserCustomized()).toBe(true);
+    await expect(store.tryEnableUncustomizedBetaAtomic()).resolves.toBe(false);
   });
 });
 
