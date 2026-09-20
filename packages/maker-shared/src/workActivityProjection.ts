@@ -19,6 +19,7 @@ import {
 export interface WorkActivityMessageLike {
   clientId: string;
   content: string;
+  isStreaming?: boolean;
   toolName?: string | null;
   toolInput?: unknown;
   thinkingRedacted?: boolean;
@@ -51,6 +52,8 @@ export interface ProjectedThinkingActivity {
   /** Original trimmed content, retained for an expanded live-preview row. */
   rawContent: string;
   content: string;
+  /** True while this text can still grow through thinking deltas. */
+  isStreaming?: boolean;
 }
 
 export type ProjectedWorkActivity<
@@ -212,7 +215,15 @@ function projectThinkingMessage<TMessage extends WorkActivityMessageLike>(
   const rawContent = message.content.trim();
   const content = rawContent.replace(/\s+/g, ' ');
   return content
-    ? { kind: 'thinking', key: message.clientId, rawContent, content }
+    ? {
+        kind: 'thinking',
+        key: message.clientId,
+        rawContent,
+        content,
+        ...(typeof message.isStreaming === 'boolean'
+          ? { isStreaming: message.isStreaming }
+          : {}),
+      }
     : null;
 }
 

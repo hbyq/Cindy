@@ -1,10379 +1,2575 @@
-import { listWorktreeRecycleStatus, controlWorktreeRecycle } from './worktree/recycleControls';
-import { registerFilePeerIpc } from './device-link/filePeer';
-import { registerLoginItemIpc } from './login-item-ipc.js';
-import { createLatestSourceVersionReader } from './cindy-make/latestSourceVersion.js';
-import { refreshCindySourceStatus } from './cindy-make/sourceStatusRefresh.js';
-import {
-  configureUpstreamMerge,
-  actUpstreamMerge,
-  refreshUpstreamMergeProjection,
-} from './cindy-make/upstreamMergeRuntime.js';
-import {
-  configureMakeHistory,
-  getCindyMakeHistory,
-  actCindyMakeHistory,
-  generateHistoryPersonalVersion,
-  cancelHistoryPersonalVersion,
-  openHistoryPersonalBuild,
-  stopMakeHistoryBuild,
-} from './cindy-make/historyRuntime.js';
-import { retainProviderPresentationAfterAuthChange } from './maker-host/provider-presentation-store.js';
-import { codexAccountState } from './maker-host/codex-account-auth.js';
-import { syncSubscriptionAccountUsage } from './usage/subscriptionAccountUsage.js';
-import {
-  clearSubscriptionAccountDiscoveredModels,
-  setSubscriptionAccountInvalidatedHandler,
-} from './maker-host/subscription-account-auth.js';
-import {
-  startWorktreeRecycleMaintenance,
-  stopWorktreeRecycleMaintenance,
-  auditRegisteredWorktrees,
-} from './worktree/recycleMaintenance';
-import { requestWorktreeRecycle } from './worktree/managedRecycle';
-import {
-  patchSessionMetaInDb,
-  recycleSessionWorktreeForStatusChange,
-} from './localDb/ipc/sessions';
-import { tryGetDbClient } from './localDb/client/current';
-import {
-  app,
-  BrowserWindow,
-  clipboard,
-  dialog,
-  ipcMain,
-  Menu,
-  nativeImage,
-  nativeTheme,
-  net,
-  powerMonitor,
-  protocol,
-  safeStorage,
-  screen,
-  session,
-  shell,
-  Tray,
-  type WebContents,
-} from 'electron';
-import { resolveVibrancyConfig } from './vibrancyConfig';
-import { getSessionThinkingSnapshots, getHistoryToolName } from './messagePersistBroadcaster';
-import { applyVibrancyToSecondaryWindows } from './secondary-windows';
-import { rememberResolvedAppTheme, resolveAppThemeIsDark } from './resolved-app-theme';
-import {
-  parseWindowThemeVibrancyPayload,
-  readWindowThemeSnapshot,
-  writeWindowThemeSnapshot,
-} from './window-theme-mode-store';
-import {
-  createWindowBackdropMaterialArgument,
-  WINDOW_BACKDROP_MATERIAL_CHANGED_CHANNEL,
-} from '../shared/windowBackdrop.js';
-import { isAllowedBillingMailtoRequest } from '../shared/billing.js';
-import path from 'node:path';
-import fs from 'node:fs';
-import os from 'node:os';
-import { pipeline } from 'node:stream/promises';
-import { execFile, execFileSync, spawn } from 'node:child_process';
-import { machineIdSync } from 'node-machine-id';
-import windowStateKeeper from 'electron-window-state';
-import { BRAND_NAME } from '@cindy/maker-shared/branding';
-import {
-  shouldRequestSingleInstanceLock,
-  resolveSingleInstanceLockUserDataDir,
-} from './devCliFlags.js';
-import {
-  recordDesktopDevAuthStartupResult,
-  markDesktopDevStartupFailed,
-  markDesktopDevWindowReady,
-} from './devStartupStatus';
-import {
-  installWindowFullscreenStateBroadcast,
-  readWindowFullscreenState,
-  showMainWindowAndRestoreFullscreen,
-} from './mainWindowFullscreenStartup';
-import {
-  installMainWindowMaximizeRecovery,
-  installMainWindowNativeRestoreIntent,
-  readPersistedWindowMaximized,
-  type MainWindowMaximizeRecoveryController,
-} from './mainWindowMaximizeRecovery';
-import { prewarmMacComputerPermissionGuideHelper } from './computer-permission-guide/MacComputerPermissionGuideNativeHost.js';
-import { handleOpenChatGPTApp } from './chatgpt-app.js';
-import { tapWindowBroadcast } from './device-link/broadcast-tap.js';
-import {
-  waitForTurnChangeSetActions,
-  waitForTurnChangeSetPersistence,
-} from './turn-change-set/store.js';
-
-let retryPiRuntimeAfterNetworkRecovery: (() => void) | null = null;
-let disposePiRuntimeRecovery: (() => void) | null = null;
-// Official Linux binaries total hundreds of MB. Keep one shared deadline for
-// both downloads, but allow normal consumer connections to finish while the
-// splash displays real byte progress.
-const LINUX_AGENT_INSTALL_STARTUP_DEADLINE_MS = 5 * 60_000;
-// Pi æ˜¯å¯é€‰èƒ½åŠ›ã€‚é¦–å¯å¯ä»¥ç»™å®ƒä¸€å°æ®µæ—¶é—´ä»Ž CDN å‡†å¤‡ï¼Œä½†ç½‘ç»œå¼‚å¸¸æ—¶ä¸èƒ½è®©
-// æ•´ä¸ª Cindy ä¸€ç›´åœåœ¨å¯åŠ¨é¡µï¼›åˆ°æœŸåŽå–æ¶ˆæœ¬æ¬¡ä¸‹è½½å¹¶ç¦ç”¨æœ¬æ¬¡ Piã€‚
-const PI_AGENT_INSTALL_STARTUP_DEADLINE_MS = 60_000;
-
-/** Preserve actionable saved-account failures across Electron serialization. */
-function throwAuthAccountIpcError(error: unknown): never {
-  const code =
-    error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string'
-      ? (error as { code: string }).code
-      : null;
-  const message = error instanceof Error ? error.message : 'Saved account operation failed';
-  switch (code) {
-    case 'INVALID_AUTH_ACTION':
-    case 'PASSIVE_AUTH_MUTATION_BLOCKED':
-    case 'ACCOUNT_NOT_FOUND':
-    case 'ACCOUNT_REAUTH_REQUIRED':
-    case 'REGION_MISMATCH':
-    case 'CREDENTIAL_STORE_UNAVAILABLE':
-    case 'AUTH_FLOW_SUPERSEDED':
-      throwIpcError(code, message);
-    default:
-      throwIpcError('INTERNAL', 'Saved account operation failed');
-  }
-}
-
-if (
-  process.platform === 'linux' &&
-  !app.isPackaged &&
-  process.env.XDT_DEV_SAFE_STORAGE_BASIC === '1'
-) {
-  app.commandLine.appendSwitch('password-store', 'basic');
-  safeStorage.setUsePlainTextEncryption(true);
-}
-
-// TapTap Maker ç­‰ç«™ç‚¹çš„ WASM å¤šçº¿ç¨‹å¼•æ“Žä¾èµ– SharedArrayBufferã€‚Chromium æŠŠ SAB é”åœ¨
-// crossOriginIsolated(COOP/COEP å“åº”å¤´)ä¹‹åŽ,è€Œ Electron ä¸å®žçŽ° COOP è¿›ç¨‹éš”ç¦»â€”â€”
-// å³ä¾¿ç«™ç‚¹å“åº”å¤´æ­£ç¡®,BrowserWindow / `<webview>` é‡Œ crossOriginIsolated æ’ä¸º false,
-// SAB æ‹¿ä¸åˆ°,RSB å†…ç½®æµè§ˆå™¨é‡Œè¿™ç±»ç«™ç‚¹ç›´æŽ¥æŠ¥"ç¼ºå°‘è¿è¡Œæ—¶æ”¯æŒ"(Electron 41.2.0 å®žæµ‹,
-// çœŸ Chrome åŒé¡µé¢ä¸º true)ã€‚è¿™é‡Œç”¨ Chromium å®˜æ–¹ feature å¼€å…³æ— æ¡ä»¶æ¢å¤ SAB æž„é€ å™¨,
-// TapTap Maker æ¡Œé¢ç«¯(xdt-maker.exe)ã€VS Code åŒæ¬¾åšæ³•ã€‚é£Žé™©é¢æ˜¯å‘æ‰€æœ‰ç½‘é¡µå†…å®¹æ”¾å¼€
-// é«˜ç²¾åº¦å…±äº«å†…å­˜è®¡æ—¶å™¨(Spectre ç±»),ç¼“è§£ä¾èµ–è¿œç¨‹å†…å®¹åªè·‘åœ¨ webview-security.ts å¼ºåˆ¶
-// åŠ å›ºçš„ webview é‡Œ(sandbox + webSecurity + éš”ç¦»åˆ†åŒº,æ—  Node)ã€‚æ³¨æ„ appendSwitch
-// åŒ key åŽå†™è¦†ç›–å‰å†™:å¦‚éœ€å†åŠ å…¶ä»–
-// enable-features,å¿…é¡»åˆå¹¶è¿›åŒä¸€æ¬¡è°ƒç”¨çš„é€—å·åˆ†éš”å€¼,ä¸èƒ½å¦èµ·ä¸€è¡Œã€‚
-app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
-
-// agentManager å·²åœ¨ vendor å¤§æ‰«é™¤æ—¶é€€å½¹ã€‚app é€€å‡º / å´©æºƒè·¯å¾„èµ° maker.shutdown()
-// ä¸€åˆ€åˆ‡ â€” session detach ä¸Ž agent dispose å¹¶å‘ï¼Œé¿å…æŸä¸ª session å¡ä½å…¶å®ƒè¿›ç¨‹æ”¶å°¾ã€‚
-// **å¿…é¡» await**: Codex ä¼šå…ˆé€šè¿‡ stdin EOF ä¿å­˜å¹¶é€€å‡ºï¼Œè¶…æ—¶æ‰å‘ä¿¡å·ã€‚
-// å¦‚æžœåœ¨ sync é˜¶æ®µ fire-and-forget, app.exit(0) ä¼šåœ¨æ”¶å°¾å‰æŠŠ Node ä¸»è¿›ç¨‹æŽæŽ‰,
-// Windows ä¸Š codex app-server å­è¿›ç¨‹ä¸ä¼šéšçˆ¶æ­» â†’ æ®‹ç•™å­¤å„¿, æŒæœ‰ binary æ–‡ä»¶é”,
-// ç”¨æˆ·ä¸‹æ¬¡å¯åŠ¨æ—¶æ’ž EBUSY / ç«¯å£å ç”¨ (anthropic-compat-proxy ç­‰)ã€‚
-async function shutdownMaker(): Promise<{ piSessionFailures: number }> {
-  stopWorktreeRecycleMaintenance();
-  // Do not terminate Main while one workspace patch command is settling.
-  await waitForTurnChangeSetActions();
-  // é€€å‡ºå‰å…ˆæŠŠ onClose é‡å‰¯ä½œç”¨(worktree stash/åˆ é™¤ã€ä¸´æ—¶é™„ä»¶æ¸…ç†)ä¸€åˆ€åˆ‡æŠ‘åˆ¶æŽ‰:
-  // shutdown è§¦å‘çš„æ‰¹é‡ onClose æ˜¯ fire-and-forget çš„,ä¸ä¼šè¢« await,worktree å›žæ”¶ä¼š
-  // å’Œ app.exit ç«žäº‰â€”â€”å¯èƒ½ stash äº†ä¸€åŠè¿›ç¨‹å°±æ²¡äº†,ç•™ä¸‹åŠæ‹†çš„ worktreeã€‚é€€å‡ºæœŸä¸åš
-  // ä»»ä½•å›žæ”¶,worktree åŽŸæ ·ç•™åœ¨ç£ç›˜,ä¸‹æ¬¡å¯åŠ¨ recoverPool å¯¹è´¦(clean ephemeral é‡æ–°
-  // å…¥æ± ,dirty / äº¤äº’å¼çš„ä¿ç•™,session é‡å¼€å¯æ— ç¼ç»­ç”¨)ã€‚
-  rehydrateCloseSuppression.suppressAllForShutdown();
-  let piSessionFailures = 0;
-  try {
-    // splash å¤±è´¥æ—¶ maker æœª init / getMakerCore() æŠ›é”™ â€”â€” é™é»˜å…œåº•, æ²¡ä¸œè¥¿è¦æ¸…ã€‚
-    const m = getMakerCore();
-    // Process exit, not an ownership change: detached PI Subagent runners are
-    // stopped by the dedicated `pi-subagent-runners` quit step above, and the
-    // account's DB/credentials are not being handed to anyone else.
-    const report = await m.shutdown({ reason: 'app-quit' });
-    piSessionFailures = report.sessionFailures.filter((f) => f.agentKind === 'pi').length;
-  } catch (err) {
-    // maker æœªå°±ç»ª (getMakerCore æŠ›) æˆ– shutdown è‡ªèº«æŠ› â€”â€” éƒ½ä¸èƒ½é˜»æ–­é€€å‡ºã€‚
-    // æ³¨æ„: getMakerCore æœªå°±ç»ªæ—¶æŠ›çš„æ˜¯ sync error, await m.shutdown() ä¹Ÿèµ°è¿™é‡Œã€‚
-    console.error('[main] maker.shutdown failed (or not ready):', err);
-  }
-  // Session shutdown may enqueue the final turn sidecar write. Drain only
-  // after maker.shutdown() has closed every session and emitted those writes.
-  await waitForTurnChangeSetPersistence();
-  WorktreePool.parkAll();
-  // Reported so the quit fence can tell "the parent is down" from "the parent
-  // was asked to go down". A PI session that failed to detach may still have a
-  // live process able to launch a durable runner.
-  return { piSessionFailures };
-}
-
-function readGitText(args: string[]): string | null {
-  try {
-    const value = execFileSync('git', args, {
-      cwd: app.getAppPath(),
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    return value || null;
-  } catch {
-    return null;
-  }
-}
-
-interface AppDisplayVersionInfo {
-  display: string;
-  detail: string;
-}
-
-function getAppDisplayVersionInfo(): AppDisplayVersionInfo {
-  const version = app.getVersion();
-  if (app.isPackaged) {
-    return {
-      display: version,
-      detail: version,
-    };
-  }
-
-  const branch = readGitText(['branch', '--show-current']);
-  const sha = readGitText(['rev-parse', '--short=7', 'HEAD']);
-  const current = branch && sha ? `${branch}@${sha}` : sha;
-  const display = current ? `${version} Â· ${current}` : version;
-
-  return {
-    display,
-    detail: display,
-  };
-}
-
-import {
-  initUpdateService,
-  getUpdateLockPath,
-  notifyUpdateAutoRelaunchBusyStateChanged,
-  setUpdateAutoRelaunchBusyProbe,
-} from './updateService';
-import {
-  isWindowsUpdateLockSharingViolation,
-  shouldKeepWaitingForWindowsUpdateLock,
-} from './updateLockWait';
-import {
-  createUpdatePresentationRecoveryController,
-  decideUpdateRelaunchBusyTransition,
-  hasUpdateRelaunchBusyActivity,
-  isMacOSUpdateRelaunch,
-  readUpdateRelaunchScheduleBusy,
-} from './updateRelaunchSafety';
-import {
-  prepare as binaryPrepare,
-  peekNeedsDownload as binaryPeekNeedsDownload,
-  broadcastResetForStep as binaryBroadcastResetForStep,
-  type AgentBinaryKind,
-  type PrepareResult,
-} from './agent-binaries';
-import { RendererBootGuard } from './renderer-boot-guard';
-import yaml from 'js-yaml';
-import matter from 'gray-matter';
-import type { Maker } from '@cindy/maker-core';
-import {
-  im,
-  feishuIm,
-  telegramIm,
-  registerTelegramBotConfigIpc,
-  startImOrchestrators,
-  startImConnection,
-  stopImConnection,
-} from './im';
-import { setTelegramRemoteSource } from './device-link/telegramRemoteControl';
-import * as authManager from './authManager';
-import { createAuthCredentialRecovery } from './authCredentialRecovery';
-import {
-  evaluateRelaunchBusyActivity,
-  type RelaunchBusyActivitySources,
-} from './relaunchBusyActivity';
-import { hasPersistedSessionHint } from './authSessionHint';
-import {
-  hasExclusiveSharedLegacyUserDataAccess,
-  warmStaleProcessProvenance,
-} from './ownerNamespaceMigration.js';
-import { createAccountDeletionIpcHandlers } from './accountDeletionIpc';
-import * as profileEdit from './profileEdit';
-import { uploadPublicAsset } from './ossPublicUpload';
-import { removeRefs as removeMediaRefs } from './cindy-media/ledger';
-import {
-  installWebviewHardener,
-  setLoginCaptchaOriginResolver,
-  setRsbPopupHostResolver,
-  setRsbPopupOpenerReportSubscriber,
-  setRsbPopupOpenerResolver,
-} from './webview-security';
-import { configureRsbBrowserWebAuthn } from './rsb-browser-webauthn.js';
-import {
-  installSelectionContextMenu,
-  setSelectionContextMenuLocale,
-} from './selection-context-menu.js';
-import { installContentSecurityPolicy, parseOrigin } from './security/csp';
-import {
-  getRsbBrowserBridge,
-  registerRsbBrowserBridgeIpc,
-  registerTabOpResultHandler,
-} from './rsb-browser-bridge';
-import {
-  getRsbNativePopupOwnerWebContents,
-  hasActiveRsbNativePopupSurfaces,
-  registerRsbNativePopupSurfaceIpc,
-} from './rsb-browser-bridge/native-popup-surfaces.js';
-import { disposeAndroidAdb } from './mcp-integrations/android.js';
-import { shutdownCodexEnvironment } from './mcp-integrations/codexEnvironment.js';
-import {
-  invalidatePiEnvironment,
-  shutdownPiEnvironment,
-} from './mcp-integrations/piEnvironment.js';
-import { fetchRemoteMediaImageBytes } from './device-link/remoteMediaProtocol';
-import * as imageCacheStore from './imageCacheStore';
-import {
-  collectStreamWithLimit,
-  createLightboxMediaHandlers,
-  REMOTE_IMAGE_MAX_BYTES,
-} from './lightboxMediaActions';
-import { createChatAttachmentSaveHandler } from './chatAttachmentSave';
-import { createChatAttachmentStageHandler } from './chatAttachmentStage';
-import {
-  cleanupOwnedUnpersistedStagedChatAttachments,
-  getChatAttachmentCacheRoot,
-  getChatAttachmentOwnerCacheRoot,
-  getRemoteFileCacheRoot,
-  stageLocalFileToCache,
-} from './file-browser/remote-file-cache';
-import { sweepLegacyDialogueWorkingDirs } from './localDb/dialogueWorkdirSelfHeal';
-import { BRAND_IDENTITY, legacyDialogueUserDataDirNames } from '@cindy/maker-shared/brand-identity';
-import * as videoCacheStore from './videoCacheStore';
-import { imageSchemePrivilege, registerImageProtocolHandler } from './imageProtocol';
-import { videoSchemePrivilege, registerVideoProtocolHandler } from './videoProtocol';
-import { modelSchemePrivilege, registerModelProtocolHandler } from './modelProtocol';
-import {
-  cindyMediaSchemePrivilege,
-  registerCindyMediaProtocolHandler,
-} from './cindy-media/cindyMediaProtocol';
-import * as cindyMediaBlobStore from './cindy-media/blobStore';
-import * as cindyChatAttachments from './cindy-media/chatAttachments';
-import { getFixedDirectoryStats, openOrCreateFixedDirectory } from './cindy-media/fixedDirectory';
-import { openMakeSourceDirectory, openMakeToolsDirectory } from './cindy-make/toolsDirectory';
-import {
-  cancelCindySourcePreparation,
-  makeSourceRoot,
-  readCurrentCindySourceStatus,
-  subscribeCindySourceStatus,
-} from './cindy-make/sourcePreparation.js';
-import { broadcastCindyMakeSourceStatus } from './cindy-make/sourceStatusBroadcast.js';
-import { cindyMakeManager } from './cindy-make/manager.js';
-import { broadcastCindyMakeState } from './cindy-make/stateBroadcast.js';
-import {
-  createMakeToolchainEnvironment,
-  resolveMakeToolEnvironment,
-} from './cindy-make/toolchainEnvironment.js';
-import {
-  CINDY_MAKE_RUN_ID_PATTERN,
-  isCindyMakeManagedWorktreePath,
-} from './cindy-make/sourcePaths.js';
-import { prepareCindyMakeWorkspace } from './cindy-make/taskWorkspace.js';
-import { restoreCindyMakeTaskState, startCindyMakeTask, configureCindyMakeEditingGuard } from './cindy-make/taskRuntime.js';
-import { registerMakeRemoteResources } from './cindy-make/remoteRuntime.js';
-import {
-  configureCindyMakeTaskManagement,
-  manageCindyMakeTask,
-  refreshCindyMakeTaskIntegration,
-} from './cindy-make/taskManagement.js';
-import {
-  actCindyMakeTest,
-  cindyMakeTestController,
-  configureCindyMakeTestRuntime,
-} from './cindy-make/testRuntime.js';
-import {
-  actCindyVersion,
-  configureCindyVersions,
-  getCindyVersions,
-} from './cindy-make/versionService.js';
-import {
-  deliverCindyVersionOpenEvents,
-  isCindyVersionLaunchPending,
-  recordCindyVersionActive,
-  watchCindyVersionStartupResult,
-} from './cindy-make/versionStartup.js';
-import {
-  getCindyVersionLockScope,
-  isCindyPersonalRuntime,
-} from './cindy-make/versionRuntimeIdentity.js';
-import { createStorageIpcHandlers } from './cindy-media/storageIpc';
-import {
-  collectDatabaseSizeWarningStatus,
-  type DatabaseSizeWarningStatus,
-} from './database-size-warning-status';
-import {
-  getAllRegisteredDraftUrls,
-  reportDraftUrls as registerWindowDraftUrls,
-} from './cindy-media/draftUrlRegistry';
-import { loadAllQueueSnapshotPayloads } from './localDb/agentInputQueueSnapshots';
-import {
-  remoteMediaSchemePrivilege,
-  registerRemoteMediaProtocolHandler,
-} from './device-link/remoteMediaProtocol';
-import { localFileSchemePrivilege, registerLocalFileProtocolHandler } from './localFileProtocol';
-import { audioFileSchemePrivilege, registerAudioFileProtocolHandler } from './audioFileProtocol';
-import {
-  buildSystemPathBlocklist,
-  getSensitiveMediaBlocklist,
-  isPathAllowedAgainst,
-} from './filePathPolicy';
-import { readFileThumbnail } from './fileThumbnail';
-import { createOpenWithHandlers, decodeRegOutput, parseChcpCodepage } from './openWithApps';
-import { resolveShellOpenPathTarget } from './shellOpenPath';
-import { handleOpenFileInBrowser } from './openFileInBrowser';
-import { createWindowsFileUrlOpener } from './windowsFileUrlOpener';
-import { cindyGhostSchemePrivilege } from './cindy-brain/runtime/electronSandboxAdapter';
-import { fetchReleaseNotes, fetchReleaseNotesIndex } from './releaseNotesService';
-import { resolveWorkspacePathCached, resolveWorkspacePathBatchCached } from './pathResolver';
-import { registerLocalDbIpc } from './localDb/ipc/registerAll';
-import { getActiveCatalog } from './maker-host/active-catalog';
-import { resolveSessionContextWindow } from '../shared/sessionContextWindow';
-import { getSessionRowSnapshot, resumeDeletedPiSubagentCleanup } from './localDb/ipc/sessions';
-import {
-  registerLegacyMigrationIpc,
-  runLegacyUserDataMigrationForUser,
-} from './legacyUserDataMigration';
-import {
-  adoptLocalProfileDatabase,
-  createProductionLocalProfileDataMigrationDeps,
-  inspectPassiveLocalProfileAdoption,
-} from './localProfileDataMigration';
-import { acquireWindowsPackagedInstanceBarrier } from './windowsPackagedInstanceBarrier';
-import { registerFsBrowseIpc } from './fsBrowse/ipc';
-import {
-  ensureReady as localDbEnsureReady,
-  getRawDb as localDbGetRawDb,
-  closeDb as localDbCloseDb,
-  getCurrentDbPath as localDbGetCurrentDbPath,
-  getDbPathForUser,
-} from './localDb/index';
-import { createDbClient, createInprocDbClient } from './localDb/client/DbClient';
-import { createLifecycleDbClientManager } from './localDb/client/lifecycleDbClient';
-import {
-  clearCurrentDbClient,
-  getCurrentDbClientUserId,
-  getDbClient,
-  setCurrentDbClient,
-} from './localDb/client/current';
-import {
-  readDatabaseSizeWarningSettingsState,
-  parseDatabaseSizeWarningSettingsPatch,
-  writeDatabaseSizeWarningSettings,
-  resetDatabaseSizeWarningSettings,
-  DEFAULT_DATABASE_SIZE_WARNING_THRESHOLD_GIB,
-  getDatabaseSizeWarningSettingsFilePath,
-} from './database-size-warning-settings';
-import { createDatabaseSizeWarningSettingsWatcher } from './database-size-warning-settings-watcher.js';
-import { createLocalDbMaintenanceIpcHandlers } from './localDb/ipc/maintenance';
-import {
-  createDialogueWorkspaceHandlers,
-  checkDialogueDirectoryWritable,
-  customDialogueWorkspaceRoot,
-} from './dialogue-workspace-ipc.js';
-import {
-  readDialogueWorkspaceSettings,
-  writeDialogueWorkspaceDirectory,
-} from './dialogue-workspace-settings.js';
-import { writeDbSlimmingDevRelaunchSignal } from './localDb/devDbSlimmingRelaunch';
-import {
-  cancelDbSlimmingStartupProgress,
-  getDbSlimmingStartupProgress,
-  subscribeDbSlimmingStartupProgress,
-} from './localDb/dbSlimmingStartupState';
-import { DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL } from '../shared/localDbMaintenance';
-import {
-  resolveBetterSqliteModuleEntry,
-  resolveBetterSqliteNativeBinding,
-} from './localDb/betterSqliteFactory';
-import {
-  beginSessionTurnEndedSuppression,
-  freezeSessionActiveTurnMarkers,
-} from './localDb/sessionActiveTurn';
-import { getDrizzleDir } from './localDb/migrate';
-import { resolveSqliteVecExtPath } from './localDb/sqliteVecLoader';
-import {
-  startEmbeddingHost,
-  stopEmbeddingHost,
-  stopEmbeddingHostIfNoPluginVectorConsumer,
-  isEmbeddingHostStarted,
-  getEmbeddingService,
-  isPluginVectorConsumerActive,
-  registerEmbeddingHostLazyStart,
-  setEmbeddingSourceSuspended,
-  type EmbeddingService,
-} from './embedding-host';
-import { readClaudeApiKey } from './maker-host/auth-adapters';
-import { outboundFetch } from './maker-host/outbound-fetch';
-import { registerDevEmbeddingIpc } from './ipc/dev/embedding';
-import {
-  acquirePiSubagentLaunchFence,
-  clearStalePiSubagentLaunchFence,
-  hasActivePiSubagentRunsSync,
-  stopAllPiSubagentRunsForExit,
-} from '@cindy/maker-core/pi-subagent-runs';
-
-import { onQuit, installQuitHandler } from './lifecycle';
-import {
-  cancelIOSSimulatorSessionOperations,
-  cleanupIOSSimulatorRemovedSession,
-  disposeIOSSimulatorHost,
-  flushIOSSimulatorOwnershipRegistry,
-  getIOSSimulatorSessionStatus,
-  reconcilePersistedIOSSimulatorOwnership,
-} from './mcp-integrations/ios-simulator';
-import { abortIOSSimulatorOperationsForExit } from './mcp-integrations/ios-simulator-exit';
-import {
-  clearIOSSimulatorRendererAccess,
-  configureIOSSimulatorAgentControlConfirmation,
-  configureIOSSimulatorRendererAccessConfirmation,
-  configureIOSSimulatorRendererTargets,
-  inheritIOSSimulatorRendererSessionAccess,
-  syncIOSSimulatorRendererAccessForSessionChange,
-} from './mcp-integrations/ios-simulator-renderer-access';
-import {
-  parseIOSSimulatorReleaseGateArgs,
-  runIOSSimulatorReleaseGate,
-  type IOSSimulatorReleaseGateMode,
-} from './mcp-integrations/ios-simulator-release-gate';
-import { initStartupDiagnostics } from './startup-diagnostics';
-import {
-  installPowerEventDiagnostics,
-  installWindowResponsivenessDiagnostics,
-} from './powerWakeDiagnostics';
-import {
-  broadcastVoiceInputPowerState,
-  installVoiceInputPowerRelease,
-} from './voice-input/powerReleaseNotifier';
-import { reapClaudeOrphansSync } from './claude-orphan-reaper';
-import { startAgentProcessPriorityWatcher } from './agent-process-priority';
-import { registerProcessMonitorIpc } from './process-monitor/ipc.js';
-import { disposeWindowsProcessScanWorkers } from './process-monitor/windowsProcessScanWorkerClient.js';
-import {
-  initAppBadgeService,
-  clearAllSessionAttention,
-  refreshWindowsAppBadge,
-} from './appBadgeService';
-import { initNotificationService } from './notificationService';
-import { initWecomGroupNotificationIpc } from './wecomGroupNotification';
-import { getAgentIslandService, initAgentIslandService } from './agent-island/service.js';
-import { attachWorkLouderCodexWindowReveal } from './worklouder-codex/index.js';
-import {
-  disposeInputDevices,
-  resumeInputDeviceTaskSlots,
-  startInputDeviceRuntime,
-  startInputDevices,
-  suspendInputDeviceTaskSlots,
-  updateInputDeviceSessionActivity,
-} from './input-devices/index.js';
-import {
-  isAppContentWindow,
-  isFocusedAppContentWindow,
-  markAppContentWindow,
-} from './windowFocusClassifier.js';
-import {
-  assertTrustedAppRendererEvent,
-  isTrustedAppRendererEvent,
-  isTrustedCindyRendererWindow,
-  isTrustedAppRendererWindow,
-} from './security/trustedAppRenderer.js';
-import { isMainShellWindowUrl } from './cindy-brain/scheduleSlot.js';
-import { sanitizeGhostNoticeText } from './cindy-brain/notifySlot.js';
-import { isIpcError } from '../shared/ipc-errors';
-import { readFileBytesForPreview } from './fileReadBytes.js';
-import { copyPngToClipboard } from './pngClipboard.js';
-import { COPY_PNG_TO_CLIPBOARD_CHANNEL } from '../shared/pngClipboard.js';
-import { initHeartbeatService } from './heartbeatService';
-import { registerRemoteDesktopIpc } from './remote-desktop';
-import { initAnalyticsSettingsService, noteAuthColdStartState } from './analyticsSettingsService';
-import { initLogUploadService, scheduleStartupBackfill } from './log-upload';
-import { WindowManualDragController } from './windowManualDrag';
-import { issueWritableDirectoryPickerGrant } from './maker-ipc/writableDirectoryPickerGrant.js';
-// è®¾å¤‡äº’è”(è·¨è®¾å¤‡è¿œç¨‹æŽ§åˆ¶): relay è¿žæŽ¥ host + å¼€å…³/è®¾å¤‡åˆ—è¡¨ IPC
-import {
-  initDeviceLinkService,
-  releaseDeviceLinkOwnershipBeforeLogout,
-  handleDeviceLinkSystemResume,
-} from './device-link';
-import {
-  getUpdateRelaunchControllers,
-  hasInFlightRemoteInvokes,
-  setHistoryToolNameReader,
-  pushSessionActivityToController,
-  setSessionsSubscribedListener,
-} from './device-link/dispatch';
-import {
-  registerDeviceLinkIpc,
-  defaultDeps as deviceLinkIpcDeps,
-  handleInvoke as deviceLinkHandleInvoke,
-  setMirrorCacheReadGate,
-} from './device-link/ipc';
-import { getMirrorCache, MirrorCachePurgeError } from './device-link/mirrorCacheStore';
-import { drainPurgeQueue, enqueuePurge } from './device-link/mirrorCachePurgeQueue';
-import { assertCaptureHealthy } from './device-link/invoke-registry';
-import { registerRemoteResourcesIpc } from './device-link/remoteResourcesIpc';
-// worktree-parallel-sessions: IPC æ³¨å†Œ + close-session å†…çš„ fire-and-forget åˆ é™¤é’©å­
-import {
-  registerWorktreeIpc,
-  WorktreePool,
-  reconcilePendingSafeDirectoryCleanups,
-} from './worktree';
-// shadow savepoint é“¾çš„å¯åŠ¨æœŸå¯¹è´¦(å­¤å„¿ refs/cindy/savepoints/* æ¸…ç†)
-import { reconcileSavepointRefsForDeletedSessions } from './git-snapshot/savepointCleanup';
-// session-git-pr-context: ä¼šè¯åˆ†æ”¯æ„ŸçŸ¥ + PR å…³è”çŠ¶æ€ IPC
-import { registerGitContextIpc, disposeGitContext } from './git-context';
-import { registerGitReviewDeviceOp, registerGitReviewIpc } from './git-review';
-import { registerProjectOrderIpc } from './projectOrderStore';
-import { registerSidebarSettingsIpc } from './sidebarSettingsStore';
-import { registerModelVisibilityOwnerClaimIpc } from './maker-host/model-visibility-owner-claim.js';
-import { registerRemotePrecreatedWorktreeLedgerIpc } from './remotePrecreatedWorktreeLedger';
-import { registerTerminalHandlers } from './maker-ipc/terminal-handlers';
-import { registerLocalThemesIpc } from './local-themes/register';
-import {
-  registerRemoteSshIpc,
-  disposeRemoteSshPool,
-  startAutoConnectHostsBackground,
-  isCcMgrUpgradeInFlight,
-} from './remote-ssh';
-import {
-  registerHookControlIpc,
-  startHookControlAccount,
-  stopHookControlAccount,
-  resetHookControlOwnerBoundary,
-  disposeHookControl,
-} from './hook-control';
-import { startAccountIntegrationsAfterOwnerDbReady } from './accountIntegrationStartup';
-import { registerSkillhubIpc } from './skillhub/registerIpc';
-import { listAllowedSkillhubProjectRoots } from './skillhub/allowedProjectRoots';
-import { SkillhubMarketService } from './skillhub/marketService';
-import { skillhubAutoSyncService } from './skillhub/autoSyncService';
-import { rehydrateCloseSuppression } from './maker-host/rehydrateCloseSuppression.js';
-import {
-  builtInSkillDescriptors,
-} from './maker-host/built-in-skills.js';
-import { isCindyLearnSkillEnabled } from './skillhub/activationPreferences';
-// Maker Core ä¸€é˜¶æ®µé‡æž„ï¼ˆæ–°é“¾è·¯ï¼‰â€”â€” é™æ€ import é¿å… dynamic import è§¦å‘ vite chunking
-// è®© imageProtocol ç­‰éœ€è¦ app.ready å‰æ³¨å†Œçš„æ¨¡å—è·‘åœ¨é”™è¯¯æ—¶æœºã€‚getMaker() æ˜¯ lazy çš„ï¼Œ
-// é™æ€ import ä¸ä¼šè§¦å‘ Maker / Agent çš„å®žä¾‹åŒ–ã€‚
-import {
-  desktopClaudeAuthAdapter,
-  getMaker as getMakerCore,
-  getMakerIfReady,
-  resetMaker,
-  shutdownLspServerPool,
-  prepareCodexForAuthModeChange,
-  cancelCodexAuthModeChange,
-  finalizeCodexAfterAuthModeChange,
-  readCodexRuntimeRoute,
-  broadcastClaudeAuthStateChanged,
-  refreshSelectableModelsAndBroadcast,
-  broadcastXaiAuthStateChanged,
-  refreshProviderAccessAfterAuthChange,
-  setProviderAccessRuntimeRefreshListener,
-  restartCodexAfterAuthModeChange,
-  waitForInitialCustomMcpRefresh,
-  registerPiAgentIfAvailable,
-} from './maker-host/index.js';
-import { createPiRuntimeRecovery } from './agent-binaries/pi-runtime-recovery.js';
-import { createDynamicMaker } from './maker-host/dynamic-maker.js';
-import { ensureBundledRipgrepReady } from './maker-host/runtime-configs.js';
-import {
-  ensureActiveCatalogLoaded,
-  getDesktopSelectableCatalog,
-  refreshCustomProvidersIntoCatalog,
-} from './maker-host/createDesktopProviderService.js';
-import { isCindyEmbeddingModelAvailable } from './maker-host/provider-access-policy.js';
-import { setCustomProviders } from './maker-host/active-catalog.js';
-import { clearModelVisibilityMirror } from './maker-host/model-visibility-mirror.js';
-import { setClaudeSupportedModelsListener } from '@cindy/maker-core';
-import {
-  noteAnthropicSdkSupportedModels,
-  refreshAnthropicModelsFromHttp,
-  clearAnthropicDiscoveredModels,
-} from './maker-host/model-discovery/anthropic.js';
-import {
-  clearXaiDiscoveredModels,
-  discardXaiModelsDiskCache,
-  loadXaiModelsFromDiskCache,
-  refreshXaiModelsFromHttp,
-} from './maker-host/model-discovery/xai.js';
-import { notifyOpenAiMediaCredentialChanged } from './maker-host/model-discovery/openai-media.js';
-import { refreshCustomMcpProviders } from './mcp-integrations/custom-mcp-registry.js';
-import {
-  clearXaiRateLimitSnapshot,
-  clearXaiSubscriptionUsageSnapshot,
-} from './usageBroadcaster.js';
-import {
-  ensureAnthropicCompatProxyReady,
-  disposeAnthropicCompatProxy,
-} from './maker-host/anthropic-compat-proxy-host.js';
-import {
-  onClaudeSessionRouteChange,
-  readClaudeSessionRoute,
-} from './maker-host/claude-session-route-registry.js';
-import {
-  disposeCodexProxy,
-  getCodexProxyAuthInjectionState,
-} from './maker-host/codex-proxy-host.js';
-import {
-  disposeBrowserRuntime,
-  registerBrowserBackendIpc,
-  setBrowserSessionUploadRootResolver,
-  setMainWindowAccessorForBackend,
-  setEnsureHostForBackend,
-  setIsDetachedForBackend,
-} from './mcp-integrations/browser.js';
-import { RsbWindowController } from './right-sidebar-window/controller.js';
-import { resolveRsbHostContextFromSession } from './right-sidebar-window/resolveHostContext.js';
-import { createRightSidebarWindow } from './right-sidebar-window/window.js';
-import { registerRsbWindowIpc } from './right-sidebar-window/ipc.js';
-import { RemoteDesktopViewerWindows } from './remote-desktop-viewer/windows.js';
-import { ResourceUsageWindowController } from './resource-usage-window/controller.js';
-import { createResourceUsageWindow } from './resource-usage-window/window.js';
-import { registerResourceUsageWindowIpc } from './resource-usage-window/ipc.js';
-import { isResourceUsageOpenSender } from './resource-usage-window/open-sender.js';
-import { GhostPanelWindowsController } from './ghost-panel-window/controller.js';
-import { createGhostPanelWindow } from './ghost-panel-window/window.js';
-import { registerGhostPanelWindowIpc } from './ghost-panel-window/ipc.js';
-import {
-  patchGhostPanelWindowEntry,
-  readGhostPanelWindowsSettings,
-  removeGhostPanelWindowEntry,
-  resetGhostPanelWindowSettingsForStartup,
-} from './ghost-panel-window/settings-store.js';
-import {
-  readRsbWindowSettings,
-  resetRsbWindowSettingsForStartup,
-  writeRsbWindowSettingsPatch,
-} from './right-sidebar-window/settings-store.js';
-import {
-  anySessionInTurn,
-  applyCodexSpawnConfigChangeWithRestart,
-  clearDeferredCodexRestartForOwnerBoundary,
-  scheduleDeferredCodexRestart,
-  clearWorkingDirectoryRecoveryForOwnerBoundary,
-  collectAgentInputQueueScanTexts,
-  createAutomationUserTurnGitBaselineHooks,
-  registerModelVisibilitySyncIpc,
-  registerMakerIpc as registerMakerCoreIpc,
-  restoreBotRuntimeForCurrentOwner,
-  isSessionTurnPendingCompletion,
-  stopOrcaIdleWatcher,
-  setGoalClearObserver,
-  setGoalDeferredResumeCancelObserver,
-  setGoalIdleObserver,
-  setGoalStopObserver,
-  setGoalAskAnswerObserver,
-  withSendToSessionLock,
-} from './maker-ipc/register.js';
-import { cleanupActiveReviewArtifactSnapshots } from './reviewer/reviewArtifactSnapshot.js';
-import { MAKER_INVOKE as MAKER_IPC_INVOKE, MAKER_PUSH, MAKER_SEND } from './maker-ipc/channels.js';
-import {
-  preserveLegacyMakerMemoryDisabled,
-  readMemorySettings,
-  readMemorySettingsState,
-} from './maker-host/memory-settings-store.js';
-import {
-  createAppFocusAutoRefreshTracker,
-  refreshProviderModelsManually,
-  requestProviderModelAutoRefresh,
-  resetProviderModelAutoRefreshCooldowns,
-} from './maker-host/provider-model-auto-refresh.js';
-import {
-  discoverAccountProviderModels,
-  resetAccountProviderRuntimes,
-} from './maker-host/account-provider-model-refresh.js';
-import {
-  accountProviderReadinessBarrier,
-  shouldClearCatalogAfterJoiningPreviousScope,
-} from './maker-host/account-provider-readiness-barrier.js';
-import {
-  accountProviderReadinessArm,
-  shouldFirePendingReadinessStart,
-  shouldKeepPendingReadinessStart,
-} from './maker-host/account-provider-readiness-arm.js';
-import {
-  ensureCurrentAccountProviderReadiness,
-  setAccountProviderReadinessReadyHandler,
-  shouldStartReadinessConsumers,
-} from './maker-host/account-provider-readiness-ensure.js';
-import {
-  readImDefaultSettingsState,
-  resetImDefaultSettings,
-  resetImDefaultSettingsGlobal,
-  resetImDefaultSettingsChannel,
-  writeImDefaultSettingsPatch,
-} from './im/defaultSettingsStore.js';
-import { hasClaudeAiOAuth } from './maker-host/claude-credentials-store.js';
-import {
-  disconnectClaudeAiOAuth,
-  reconnectClaudeAiOAuth,
-} from './maker-host/claude-oauth-refresh.js';
-import { beginClaudeLocalLogin, cancelClaudeOAuthLogin } from './maker-host/claude-oauth-login.js';
-import {
-  runGrokOAuthLogin,
-  cancelGrokOAuthLogin,
-  logoutGrok,
-  hasGrokOAuthLogin,
-} from './maker-host/grok-oauth-login.js';
-import { setXaiAuthInvalidatedHandler } from './maker-host/xai-auth-invalidation-host.js';
-import { clearXaiMediaModels } from './maker-host/model-discovery/xai-media.js';
-import {
-  getChatgptBridgeAuth,
-  invalidateChatgptBridgeAuth,
-} from './maker-host/anthropic-responses-bridge-host.js';
-import {
-  readSilentEncryptedRetrySettingsState,
-  resetSilentEncryptedRetrySettings,
-  writeSilentEncryptedRetryEnabled,
-} from './maker-host/silent-encrypted-retry-store.js';
-import {
-  readSessionRuntimeFallbackSettingsState,
-  resetSessionRuntimeFallbackSettings,
-  writeSessionRuntimeFallbackEnabled,
-} from './maker-host/session-runtime-fallback-store.js';
-import { clearAllSessionProviders } from './maker-host/session-provider-store.js';
-import { clearAllSessionRuntimeAxes } from './maker-host/session-effort-store.js';
-import { clearAllSessionRuntimeControlStates } from './maker-ipc/sessionRuntimeControl.js';
-import {
-  resolveOwnerScopedSecretStorageKey,
-  getProviderSecretStore,
-} from './secrets/providerSecretStore.js';
-import {
-  builtinApiKeyHas,
-  builtinApiKeyRemove,
-  builtinApiKeyStore,
-  builtinApiKeyPresentationId,
-  type BuiltinApiKeyBridgeDeps,
-} from './secrets/builtinApiKeyBridge.js';
-import {
-  isCustomProviderRuntimeKeyStorageKey,
-  isRendererAccessibleSafeStorageKey,
-  type ProviderSecretId,
-} from '../shared/providerSecrets.js';
-import {
-  readCompactionPct,
-  readCompactionState,
-  resetCompactionPct,
-  writeCompactionPct,
-  readPiCompactionPct,
-  readPiCompactionState,
-  resetPiCompactionPct,
-  writePiCompactionPct,
-} from './maker-host/compaction-settings-store.js';
-import {
-  readSubagentModelSettings,
-  readSubagentModelSettingsState,
-  resetSubagentModelSettings,
-  writeSubagentModelSettingsPatch,
-} from './maker-host/subagent-model-settings-store.js';
-import {
-  readVisionBridgeSettings,
-  readVisionBridgeSettingsState,
-  resetVisionBridgeSettings,
-  writeVisionBridgeSettings,
-} from './vision-bridge/vision-bridge-settings-store.js';
-import type { VisionBridgeSettings } from '../shared/visionBridgeSettings.js';
-import { readLspModeSettings, writeLspModeEnabled } from './maker-host/lsp-mode-store.js';
-import {
-  readChatEmbeddingSettings,
-  readChatEmbeddingSettingsState,
-  resetChatEmbeddingSettings,
-  writeChatEmbeddingEnabled,
-} from './maker-host/chat-embedding-settings-store.js';
-import {
-  isChatEmbeddingOwnerStampCurrent,
-  parseChatEmbeddingOwnerStamp,
-} from './maker-host/chat-embedding-owner-stamp.js';
-import { rethrowChatEmbeddingPersistError } from './maker-host/chat-embedding-persist-error.js';
-import { createChatEmbeddingSettingsWatcher } from './maker-host/chat-embedding-settings-watcher.js';
-import {
-  readGitSafetySettingsState,
-  resetGitSafetySettings,
-  writeGitSafetyAutoSnapshotEnabled,
-} from './maker-host/git-safety-settings-store.js';
-import {
-  CHAT_EMBED_MODEL_ID,
-  setupChatHistoryEmbedder,
-  setChatEmbeddingEnabled,
-  resetCacheForNewDb as resetChatEmbedderCache,
-} from './embedders/chat-history-embedder.js';
-import { registerWorkingStatusIpc } from './maker-ipc/workingStatus.js';
-import { registerMakerTitleIpc } from './maker-ipc/title.js';
-import { registerAuxiliaryModelSettingsIpc } from './maker-ipc/auxiliary-model-settings.js';
-import { registerContactsIpc } from './maker-ipc/contacts-ipc.js';
-import { disposeDesktopContactsManager } from './maker-host/maker-contacts-host.js';
-import { registerMakerHelpIpc } from './maker-ipc/help.js';
-import { registerHelpFeedbackIpc } from './maker-ipc/help-feedback.js';
-import { registerMyIssuesIpc } from './maker-ipc/my-issues.js';
-import { registerMakerPlanWriteIpc } from './maker-ipc/plan-write.js';
-import { registerMakerRewindIpc } from './maker-ipc/rewind.js';
-import { registerMakerForkIpc } from './maker-ipc/fork.js';
-import { registerMakerAuthIpc } from './maker-ipc/auth.js';
-import { registerMakerStatusIpc } from './maker-ipc/status.js';
-import {
-  registerMakerUsageIpc,
-  syncClaudeSubscriptionUsageForAuthChange,
-  syncXaiSubscriptionUsageForAuthChange,
-} from './maker-ipc/usage.js';
-import { prewarmModelPricing } from './usage/modelPricing.js';
-import { registerMakerBinaryVersionIpc } from './maker-ipc/binary-version.js';
-import { registerCrossAgentConvertIpc } from './cross-agent-convert/ipc.js';
-import { registerFileBrowserIpc } from './file-browser/index.js';
-import { disposeHtmlPreviews } from './file-browser/html-preview-ipc.js';
-import { disposeRemoteFileBrowser } from './file-browser/remote-deps.js';
-import { registerFileBrowserDeviceOp } from './file-browser/device-op.js';
-import { registerSearchIpc } from './file-browser/search/index.js';
-import { registerVoiceInputIpc } from './voice-input/index.js';
-import { installWindowHiddenBroadcast } from './windowHiddenBroadcast.js';
-import {
-  isSecondaryAppWindow,
-  openSessionInNewWindow,
-  openSessionInNewWindowIfDroppedOutside,
-} from './secondary-windows.js';
-import {
-  beginSessionDragPreview,
-  consumeNativeSessionDragOpenResult,
-  disposeSessionDragPreview,
-  endSessionDragPreview,
-  prewarmSessionDragReleaseHelper,
-} from './session-drag-preview.js';
-import {
-  parseSessionDragPreviewPalette,
-  truncateSessionDragPreviewLabel,
-} from './sessionDragPreviewHtml.js';
-import {
-  isGlobalVoiceInputOverlayVisible,
-  isGlobalVoiceInputOverlaySender,
-  releaseActiveGlobalVoiceInputShortcut,
-  registerGlobalVoiceInputIpc,
-} from './voice-input/global.js';
-import { ensureMainAppPresence } from './appPresence.js';
-import {
-  registerDeepLinkProtocol,
-  handleIncomingDeepLink,
-  handleIncomingOpenFolder,
-  handleIncomingShareFile,
-  findDeepLinkInArgv,
-  redactConsumedDeepLinkInArgv,
-  findOpenFolderInArgv,
-  findOpenShareFileInArgv,
-  setDeepLinkMainWindow,
-  takePendingDeepLink,
-} from './deepLink.js';
-import { registerFolderContextMenu } from './folderContextMenu.js';
-import { healWindowsShortcuts } from './windowsShortcutSelfHeal.js';
-import { CURRENT_APP_ID, CURRENT_CINDY_REGION } from '../shared/brandRegion.js';
-import {
-  readWindowBehaviorSettings,
-  writeLinuxCloseBehavior,
-  writeSwallowActivationClick,
-  writeWindowsCloseBehavior,
-} from './window-behavior-settings-store.js';
-import {
-  hideWindowToWindowsTray,
-  popUpWindowsTrayMenu,
-  requestWindowsTrayQuit,
-} from './windowsTrayLifecycle.js';
-import {
-  applyLinuxMainWindowCloseBehavior,
-  createCloseBehaviorPromptFallbackController,
-  requestMainWindowCloseBehavior,
-} from './mainWindowCloseBehavior.js';
-import {
-  isLinuxCloseBehavior,
-  isWindowsCloseBehavior,
-  WINDOW_BEHAVIOR_GET_LINUX_CLOSE_BEHAVIOR_CHANNEL,
-  WINDOW_BEHAVIOR_GET_WINDOWS_CLOSE_BEHAVIOR_CHANNEL,
-  WINDOW_BEHAVIOR_LINUX_CLOSE_BEHAVIOR_REQUESTED_CHANNEL,
-  WINDOW_BEHAVIOR_LINUX_CLOSE_BEHAVIOR_SHOWN_CHANNEL,
-  WINDOW_BEHAVIOR_SET_LINUX_CLOSE_BEHAVIOR_CHANNEL,
-  WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL,
-  WINDOW_BEHAVIOR_SET_WINDOWS_CLOSE_BEHAVIOR_CHANNEL,
-  WINDOW_BEHAVIOR_WINDOWS_CLOSE_BEHAVIOR_REQUESTED_CHANNEL,
-  WINDOW_BEHAVIOR_WINDOWS_CLOSE_BEHAVIOR_SHOWN_CHANNEL,
-  type LinuxCloseBehavior,
-  type WindowsCloseBehavior,
-} from '../shared/windowBehavior.js';
-import { getDesktopCommandRegistry, registerBuiltinDesktopCommands } from './commands/index.js';
-import { registerRemoteCmdIpc } from './commands/remoteCmdIpc.js';
-import { resolvePreferredSystemLocale, resolveSystemLocale } from '../shared/locale.js';
-import {
-  isImDefaultSettingsChannel,
-  type ImDefaultSettingsChannel,
-} from '../shared/imDefaultSettings.js';
-import { parseImDefaultSettingsPatch } from './im/parseDefaultSettingsPatch.js';
-import {
-  SUBAGENT_MODEL_SETTINGS_DEFAULTS,
-  codexSpawnConfigChanged,
-  isValidSubagentModelIdInput,
-  normalizeSubagentModelId,
-  reconcileSubagentModelSettingsPatch,
-  type SubagentModelSettingsPatch,
-} from '../shared/subagentModelSettings.js';
-import { isBrowserOpenablePath } from '../shared/browserOpenableExts.js';
-import {
-  getClientEndpoint,
-  getClientEndpointForRealm,
-  initClientEndpoints,
-  registerClientEndpointsIpc,
-} from './clientEndpointsService.js';
-import {
-  applyAppearanceToWindow,
-  applyAppearanceToWindows,
-  getPersistedWindowZoom,
-  registerAppearanceSettingsIpc,
-  updatePersistedWindowZoom,
-} from './appearance-settings-ipc.js';
-import { registerBillingIpc } from './billing/index.js';
-import {
-  initModelAccess,
-  noteManualXdKeySaved,
-  noteManualXdKeyRemoved,
-  refreshXdGatewayModels,
-} from './model-access/index.js';
-import { effectiveXdGatewayBaseUrl } from './model-access/effectiveEndpoint.js';
-import { isLocalDbOwnerCurrent } from './appSessionPolicy.js';
-import { getAppCapabilities, requireAppCapability } from './appCapabilities.js';
-import {
-  activeOwnerScopeKey,
-  beginAppSessionBoundary,
-  getActiveAppSession,
-  getActiveDataOwnerPushStamp,
-  isAppSessionBoundaryPending,
-  ownerScopedUserDataPath,
-  setAppSessionCommitBoundaryHook,
-} from './appSessionState.js';
-import {
-  resolveNewMakerMenuCommand,
-  type ApplicationMenuCommand,
-} from '../shared/applicationMenuCommands.js';
-import {
-  comboToElectronAccelerator,
-  matchesElectronInput,
-  type AppShortcutId,
-} from '../shared/appShortcuts.js';
-import {
-  getAppShortcutStore,
-  isAppShortcutRecordingActive,
-  registerAppShortcutIpc,
-  subscribeAppShortcutRecording,
-} from './app-shortcuts/index.js';
-import { installNewMakerWindowShortcut } from './app-shortcuts/new-maker-window-shortcut.js';
-import { registerLayoutIpc } from './layout/index.js';
-import {
-  getGhostCindySlot,
-  getGhostManager,
-  getGhostSessionActivityTracker,
-  interruptGhostCallsForAccountBoundary,
-  isGhostAvailableForActiveSession,
-  reconcileGhostOauthAccountsForActiveOwner,
-  refreshGhostLocalization,
-  registerGhostIpc,
-  runStableOwnerPostCommitTask,
-  setGhostNodeRuntimeStartAttemptContextReader,
-  setGhostsChangedObserver,
-  suspendAllGhosts,
-  waitForGhostMutations,
-} from './cindy-brain/index.js';
-import { setCodexImageAuthBinding } from './cindy-brain/codexImageAuthBinding.js';
-import { listActiveClaudeBackgroundActivitySessions } from './maker-host/claude-session-background-activity.js';
-import { registerRelaunchBusyActivityIpc } from './relaunchBusyActivityIpc.js';
-import { getGhostSetupChangeBus } from './cindy-brain/ghostSetupChangeBus.js';
-import { getGhostSetupInteractionBridge } from './cindy-brain/ghostSetupInteractionBridge.js';
-import { registerPluginMarketIpc, syncDefaultMarketPlugins } from './plugin-market/registerIpc.js';
-import { registerPluginPublisherIpc } from './plugin-publisher/registerIpc.js';
-import { findCindyFileInArgv } from './cindy-brain/argv.js';
-import { handleIncomingCindyFile } from './cindy-brain/openFileInstall.js';
-import { registerCindyFileAssociation } from './cindy-brain/fileAssociation.js';
-import { runPluginStorageSmoke } from './smoke/pluginStorageSmoke.js';
-import { runComputerUseSmokeIfRequested } from './smoke/computerUseSmoke.js';
-import { setMainLocale, t } from './i18n.js';
-import { requireObject, throwIpcError } from './utils/ipcValidate.js';
-import { pickNativeAtResource } from './nativeAtResourcePicker.js';
-// Scheduler (Phase 3) â€” å¯åŠ¨å•ä¾‹éœ€è¦ maker / localDb / mainWindow éƒ½ readyï¼Œä½†
-// splash check-environment / user login (è§¦å‘ ensureReady) è°å…ˆåˆ°ä¸å›ºå®šã€‚
-// é€šè¿‡ attemptStartScheduler åœ¨ä¸¤ä¸ªå°±ç»ªäº‹ä»¶æºå„è°ƒä¸€æ¬¡å¹‚ç­‰ startSchedulerï¼Œæœ€åŽåˆ°çš„
-// é‚£æ¬¡çœŸæ­£å¯åŠ¨ï¼›å‰é¢çš„å¤±è´¥ä¼šè¢« try/catch åžæŽ‰åªè®° logã€‚
-import {
-  startScheduler,
-  resetScheduler,
-  getSchedulerIfInitialized,
-  getScheduleStorage,
-  getScheduleStorageIfInitialized,
-  getProjectAutomationLoader,
-} from './scheduler-host/index.js';
-import { configureRoutineHost } from './routines/service.js';
-import { getBotRemoteResourceSource } from './localDb/ipc/bots.js';
-import {
-  registerScheduleHandlers,
-  attachSchedulerEventListeners,
-  resetSchedulerReady,
-} from './maker-ipc/schedule.js';
-import { registerProjectAutomationIpc } from './maker-ipc/project-automation.js';
-import {
-  startGoalController,
-  getGoalController,
-  resetGoalController,
-  getGoalTeardownGeneration,
-} from './goal-host/index.js';
-import { startLearnHost, getLearnController, resetLearnController } from './learn-host/index.js';
-import { fetchHubSkillReference } from './learn-host/hubReference.js';
-import { registerLearnIpc, broadcastLearnEvent } from './learn-host/registerIpc.js';
-import { registerGoalHandlers, broadcastGoalStatus } from './maker-ipc/goal.js';
-import { createLogger as createSchedulerLogger } from './logger.js';
-
-let makerProviderRefreshConfigured = false;
-let startPendingAccountProviderReadiness: { ownerId: string; start: () => void } | null = null;
-
-function markMakerProviderRefreshConfigured(): void {
-  makerProviderRefreshConfigured = true;
-  const startPending = startPendingAccountProviderReadiness;
-  startPendingAccountProviderReadiness = null;
-  if (!startPending) return;
-  const decision = {
-    pendingOwnerId: startPending.ownerId,
-    currentOwnerId: getActiveAppSession().dataOwnerId,
-    boundaryPending: isAppSessionBoundaryPending(),
-  };
-  if (shouldFirePendingReadinessStart(decision)) {
-    startPending.start();
-    return;
-  }
-  // Same-owner Ghost repair holds the boundary while this one-shot callback
-  // fires. Put the pending start back so a later unchanged ensureReady / arm
-  // start can still launch discovery after the window closes.
-  if (shouldKeepPendingReadinessStart(decision)) {
-    startPendingAccountProviderReadiness = startPending;
-  }
-}
-
-async function waitForCurrentAccountProviderModelsReady(): Promise<void> {
-  const ready = await ensureCurrentAccountProviderReadiness();
-  if (!ready) {
-    throwIpcError(
-      'PRECONDITION_FAILED',
-      'Account provider models are not ready for this app session; retry.',
-    );
-  }
-}
-
-// Live getters preserve account/scheduler replacement without loading Main modules at dispatch time.
-configureRoutineHost({
-  getBot: getBotRemoteResourceSource,
-  getScheduler: getSchedulerIfInitialized,
-  getScheduleStorage,
-});
-
-/**
- * Phase 4: ä¸å†ç”¨ `_schedulerStarted` flag â€”â€” `startScheduler()` å†…éƒ¨ä»¥ `_scheduler`
- * å•ä¾‹ä¸ºæƒå¨ source of truthï¼ˆå·² set æ—¶ç›´æŽ¥è¿”å›žåŽŸå®žä¾‹ï¼‰ã€‚æœ¬å‡½æ•°åªè´Ÿè´£"ä¸¤ä¸ªå‰ç½®å°±ç»ª
- * éƒ½æ»¡è¶³æ—¶å°è¯•å¯åŠ¨"ï¼Œå¹‚ç­‰æ€§ç”± startScheduler è‡ªå·±ä¿è¯ï¼›åˆ‡è´¦å·åœºæ™¯ `resetScheduler()`
- * æŠŠ `_scheduler` ç½® nullï¼Œä¸‹æ¬¡è¿›æ¥è‡ªç„¶ä¼šé‡æ–°å¯åŠ¨ã€‚
- *
- * IPC æ³¨å†Œæ¨¡åž‹(é‡æž„):maker:schedule:* handler åœ¨ registerMakerIpcsAfterSplash å†…
- * é€šè¿‡ `registerScheduleHandlers()` æå‰ä¸€æ¬¡æ€§æ³¨å†Œ,**ä¸ä¾èµ– scheduler å®žä¾‹**;
- * æœ¬å‡½æ•°æ‹¿åˆ° scheduler åŽåªè°ƒ `attachSchedulerEventListeners(scheduler, storage)`
- * æŠŠ scheduler.on æŒ‚ä¸Š + setSchedulerReady å–‚å…¥å®žä¾‹ + broadcast 'ready'ã€‚
- *
- * é‡å¤ attempt åŽ»é‡:localDb onReady å¯å› é‡è¯•æˆ–åŒ scope å¤ç”¨å†æ¬¡è§¦å‘ï¼Œ
- * startScheduler è¿”å›žåŒä¸€å®žä¾‹ï¼ŒWeakSet é˜²æ­¢ scheduler.on é‡å¤æŒ‚ listenerã€‚åˆ‡è´¦å·åŽ
- * resetScheduler æŠŠ _scheduler ç½® nullï¼Œæ–°å®žä¾‹ä¸åœ¨ WeakSet é‡Œï¼Œä¼šé‡æ–° attach ä¸€æ¬¡ã€‚
- */
-// Provider/DB readiness can trigger this entry from several places. Serialize
-// complete account-host attempts, not only Scheduler construction: when an
-// account-boundary reset supersedes an older attempt, its cleanup must finish
-// before an abort recovery starts Scheduler, GoalController, and Learn again.
-let attemptStartSchedulerBarrier: Promise<void> = Promise.resolve();
-
-function attemptStartScheduler(): Promise<void> {
-  const attempt = attemptStartSchedulerBarrier.then(() => attemptStartSchedulerOnce());
-  attemptStartSchedulerBarrier = attempt.catch(() => undefined);
-  return attempt;
-}
-
-async function attemptStartSchedulerOnce(): Promise<void> {
-  // ä¸¤ä¸ªå‰ç½®æ¡ä»¶å¿…é¡»æ»¡è¶³æ‰èƒ½å¯åŠ¨ï¼š
-  //   1. maker å•ä¾‹å·²æž„é€  (splash check-environment å®Œæˆ â†’ registerMakerIpcsAfterSplash)
-  //   2. DbClient å·² smoke é€šè¿‡ (user login â†’ renderer è§¦å‘ 'local-db:ensure-ready' IPC)
-  // ä»»ä¸€æœªæ»¡è¶³æ—¶ getMakerCore() / getDbClient() æŠ›é”™ï¼Œæ•´ä½“ try/catch å…œä½ï¼Œç­‰ä¸‹æ¬¡è§¦å‘ã€‚
-  let maker: Maker;
-  try {
-    maker = getMakerCore();
-  } catch (err) {
-    console.log(
-      '[bootstrap-electron] attemptStartScheduler: maker not ready yet, will retry on next trigger:',
-      err instanceof Error ? err.message : String(err),
-    );
-    return;
-  }
-  try {
-    getDbClient();
-  } catch (err) {
-    console.log(
-      '[bootstrap-electron] attemptStartScheduler: DbClient not ready yet, will retry on next trigger:',
-      err instanceof Error ? err.message : String(err),
-    );
-    return;
-  }
-  // è‹¥æœ¬è°ƒç”¨æ˜¯ getMakerCore() çš„é¦–æ¬¡è°ƒç”¨ï¼ˆonReady åœ¨ registerMakerIpcsAfterSplash ä¹‹å‰
-  // è§¦å‘æ—¶å¯èƒ½å‘ç”Ÿï¼‰ï¼Œ_initialCustomMcpRefresh åˆšå¯åŠ¨ä½†å°šæœªè½åœ°ï¼›åœ¨ startScheduler å‰
-  // awaitï¼Œç¡®ä¿ç¬¬ä¸€ä¸ª scheduler tick èƒ½çœ‹åˆ°ç”¨æˆ·å·²ä¿å­˜çš„è‡ªå®šä¹‰ MCP é…ç½®ã€‚
-  // è‹¥ Maker å·²è¢« registerMakerIpcsAfterSplash æž„é€ è¿‡ï¼Œpromise æ—©å·² resolveï¼Œno-opã€‚
-  const goalGenBefore = getGoalTeardownGeneration();
-  await waitForInitialCustomMcpRefresh();
-  // If a teardown raced the await, bail out â€” the next account's activation
-  // pass will re-trigger attemptStartScheduler with fresh state.
-  if (getGoalTeardownGeneration() !== goalGenBefore) {
-    console.log('[bootstrap-electron] attemptStartScheduler: teardown raced await, aborting');
-    return;
-  }
-  const automationGitBaselineHooks = createAutomationUserTurnGitBaselineHooks();
-  try {
-    const scheduler = await startScheduler({
-      maker,
-      getDb: () => getDbClient().drizzle,
-      getMainWindow: () => mainWindowRef,
-      feishuIm,
-      logger: createSchedulerLogger('scheduler-host'),
-      ...automationGitBaselineHooks,
-    });
-    // startScheduler fences resets while its async startup is in flight. Keep
-    // the boundary check immediately before listener publication as a second
-    // guard so a stale generation can never make readiness visible.
-    if (getGoalTeardownGeneration() !== goalGenBefore) {
-      console.log(
-        '[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting stale scheduler attach',
-      );
-      await resetScheduler();
-      return;
-    }
-    // scheduler çœŸæ­£ ready åŽæŒ‚ listener + å–‚å…¥ readiness holderã€‚WeakSet æŒ‰å®žä¾‹
-    // åŽ»é‡:localDb onReady é‡è¯•å¯èƒ½å†æ¬¡æ‹¿åˆ°åŒå®žä¾‹ï¼Œæ­¤æ—¶ no-opï¼›
-    // åˆ‡è´¦å·åŽæ–°å®žä¾‹ä¸åœ¨ set é‡Œï¼Œä¼šé‡æ–° attachã€‚
-    // æ³¨æ„:schedule:* IPC handler ä¸åœ¨è¿™é‡Œæ³¨å†Œ â€” å®ƒä»¬åœ¨ registerMakerIpcsAfterSplash
-    // å†…é€šè¿‡ registerScheduleHandlers() æå‰æŒ‚å¥½,handler å†…éƒ¨ awaitReady ç­‰æœ¬è¡Œ
-    // setSchedulerReady è°ƒç”¨ã€‚
-    if (!_scheduleIpcRegistered.has(scheduler)) {
-      attachSchedulerEventListeners(scheduler, getScheduleStorage());
-      registerProjectAutomationIpc(getProjectAutomationLoader());
-      _scheduleIpcRegistered.add(scheduler);
-    }
-  } catch (err) {
-    console.error('[bootstrap-electron] startScheduler failed (non-fatal):', err);
-  }
-  // A superseded startup is reported as a non-fatal error by the catch above;
-  // keep the old post-await fence as well so it cannot continue into
-  // GoalController/learn-host startup with the stale maker.
-  if (getGoalTeardownGeneration() !== goalGenBefore) {
-    console.log(
-      '[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting stale account startup',
-    );
-    return;
-  }
-  // GoalController ä¸Ž scheduler åŒå°±ç»ªç‚¹å¯åŠ¨(maker + localDb å‡ ready):å†…éƒ¨å¹‚ç­‰
-  // (_controller å·²å­˜åœ¨åˆ™ç›´æŽ¥è¿”å›ž),å¯åŠ¨æ—¶ resume æ‰€æœ‰ active goalã€‚å¤±è´¥éžè‡´å‘½ã€‚
-  try {
-    startGoalController({
-      maker,
-      getDb: () => getDbClient().drizzle,
-      broadcastStatus: broadcastGoalStatus,
-      ...automationGitBaselineHooks,
-    });
-  } catch (err) {
-    console.error('[bootstrap-electron] startGoalController failed (non-fatal):', err);
-  }
-  // LearnController åŒå°±ç»ªç‚¹å¯åŠ¨(maker + localDb å‡ ready):å†…éƒ¨å¹‚ç­‰,
-  // å¯åŠ¨æ—¶ resume ä¸­æ–­ run / æ¸…ç†å­¤å„¿ stagingã€‚å¤±è´¥éžè‡´å‘½ã€‚
-  try {
-    // hub æº(/learn hub:<slug> ä¸Ž skill hubã€Œå­¦ä¹ æ­¤æŠ€èƒ½ã€å…±ç”¨):main å†…ç›´è°ƒ
-    // market service æ‹‰ skill å…ƒæ•°æ® + å…¨éƒ¨å·²å‘å¸ƒæ–‡ä»¶(scripts/references/...)
-    // ä½œä¸ºè’¸é¦å‚è€ƒææ–™ â€”â€” learn-host ä¼šæŠŠå®ƒä»¬å†™å…¥ staging/_reference/<slug>/
-    // ä¾›è’¸é¦ agent å¤åˆ¶,äº§ç‰©è‹¥ä¾èµ–ä¸Šæ¸¸è„šæœ¬å´åªæœ‰ SKILL.md å¯è¯»,è£…å®Œå¼•ç”¨å¿…æ‚¬ç©ºã€‚
-    // ä¸Šé™:40 ä¸ªæ–‡ä»¶ã€å•æ–‡ä»¶ â‰¤512KBã€è·³è¿‡ server æ ‡è®° truncated çš„;
-    // æ‹‰å–å¤±è´¥é€ä¸ªé™çº§(å‚è€ƒææ–™å°½åŠ›è€Œä¸º,ä¸é˜»æ–­)ã€‚
-    const learnMarketService = new SkillhubMarketService();
-    startLearnHost({
-      maker,
-      broadcast: broadcastLearnEvent,
-      fetchHubSkill: (slug, catalogScope) =>
-        fetchHubSkillReference(learnMarketService, slug, catalogScope),
-      ...automationGitBaselineHooks,
-    });
-  } catch (err) {
-    console.error('[bootstrap-electron] startLearnHost failed (non-fatal):', err);
-  }
-}
-
-const _scheduleIpcRegistered = new WeakSet<object>();
-
-/**
- * embedding-host (Phase 1.1/1.2): localDb ensureReady å®ŒæˆåŽæŒ‰éœ€å¯åŠ¨ã€‚
- *
- * **host å¯åœç”±ã€Œæœ‰æ²¡æœ‰ consumer è¦ç”¨ã€å†³å®š, ä¸å½’å±žä»»ä½•å•ä¸ªå¼€å…³** (PR #1707 review)ã€‚
- * çŽ°æœ‰ä¸¤ä¸ª consumer:
- *   - chat (èŠå¤©åµŒå…¥è®¾ç½®): ON æ‰æ³¨å†Œ chat-history-embedder + setEnabled(true) å†™ cutoff
- *   - æ’ä»¶å‘é‡ (embed.text): æŒ‰éœ€ â€”â€” é¦–æ¬¡è¯·æ±‚æ—¶ ensureEmbeddingServiceForPluginVector()
- *     æ‰“æ ‡å¹¶å›žè°ƒæœ¬å‡½æ•°æ‡’å¯åŠ¨
- * ä¸¤ä¸ªéƒ½ä¸è¦ç”¨ â†’ å®Œå…¨ä¸å¯åŠ¨ (æ²¡ Worker setInterval, æ²¡ Provider æ³¨å†Œ, æ²¡ hook å‰¯ä½œç”¨),
- * ç”¨æˆ·æ„Ÿå—ä¸åˆ°ä»»ä½•åŽå°è½®è¯¢; è¿™æ¡æ‰¿è¯ºåœ¨"å…³æŽ‰èŠå¤©åµŒå…¥ä¸”æ’ä»¶ä»Žæ²¡ç”¨è¿‡å‘é‡"æ—¶ä¾ç„¶æˆç«‹ã€‚
- *
- * å¹‚ç­‰ä¸”å¯é‡å…¥: host å·²èµ·æ—¶å¤ç”¨çŽ°æœ‰ service, åªè¡¥ chat consumer çš„æ³¨å†Œ â€”â€” å…³é”®åœ¨äºŽ
- * æ’ä»¶å…ˆæŠŠ host æ‹‰èµ·ã€ç”¨æˆ·ä¹‹åŽæ‰æ‰“å¼€èŠå¤©åµŒå…¥çš„é¡ºåºä¸‹, chat provider / cutoff ä¹Ÿå¿…é¡»
- * è¡¥é½ (å¦åˆ™ setChatEmbeddingEnabled æ’ž _deps=null, èŠå¤©åµŒå…¥é™é»˜ä¸å·¥ä½œ)ã€‚
- * sqlite-vec ä¸å¯ç”¨æ—¶ä»å¯åŠ¨ (å¯åŠ¨åŽ Worker è‡ªå·± idle ä¸åµŒ), ä¸é˜»å¡ž appã€‚
- */
-function isChatEmbeddingAvailable(): boolean {
-  try {
-    return isCindyEmbeddingModelAvailable(getDesktopSelectableCatalog(), CHAT_EMBED_MODEL_ID);
-  } catch {
-    return false;
-  }
-}
-
-function chatEmbeddingDefaultContext() {
-  const state = authManager.getAuthState();
-  return {
-    mode: state.mode,
-    isAuthenticated: state.isAuthenticated,
-    userId: state.user?.id ?? null,
-    membershipKind: state.user?.membershipKind ?? null,
-  };
-}
-
-function assertChatEmbeddingMutationOwner(raw: unknown): void {
-  const expected = parseChatEmbeddingOwnerStamp(raw);
-  if (!expected) {
-    throwIpcError('INVALID_PARAMS', 'chat embedding owner stamp required');
-  }
-  if (
-    !isChatEmbeddingOwnerStampCurrent(
-      expected,
-      getActiveDataOwnerPushStamp(),
-      isAppSessionBoundaryPending(),
-    )
-  ) {
-    throwIpcError(
-      'PRECONDITION_FAILED',
-      'Chat embedding setting belongs to a stale account session.',
-    );
-  }
-}
-
-function assertCompactionMutationOwner(raw: unknown): void {
-  const expected = parseChatEmbeddingOwnerStamp(raw);
-  if (!expected) {
-    throwIpcError('INVALID_PARAMS', 'compaction owner stamp required');
-  }
-  if (
-    !isChatEmbeddingOwnerStampCurrent(
-      expected,
-      getActiveDataOwnerPushStamp(),
-      isAppSessionBoundaryPending(),
-    )
-  ) {
-    throwIpcError('PRECONDITION_FAILED', 'Compaction setting belongs to a stale account session.');
-  }
-}
-
-function attemptStartEmbeddingHost(): void {
-  // è°éƒ½ä¸è¦ç”¨å°±åˆ«å¯:æ’ä»¶ consumer çš„æ ‡è®°ç”± ensureEmbeddingServiceForPluginVector
-  // åœ¨å›žè°ƒæœ¬å‡½æ•°ä¹‹å‰æ‰“ä¸Š,æ‰€ä»¥è¿™é‡Œè¯»åˆ°çš„æ˜¯"å«æœ¬æ¬¡è¯·æ±‚"çš„æœ€æ–°æ„å‘ã€‚
-  const chatAvailable = isChatEmbeddingAvailable();
-  setEmbeddingSourceSuspended('chat', !chatAvailable);
-  const chatEnabled =
-    chatAvailable && readChatEmbeddingSettings(chatEmbeddingDefaultContext()).enabled;
-  if (!chatEnabled && !isPluginVectorConsumerActive()) {
-    console.log(
-      '[bootstrap-electron] no embedding consumer active (chat off, no plugin vector); embeddingHost not started',
-    );
-    return;
-  }
-  let service: EmbeddingService;
-  if (isEmbeddingHostStarted()) {
-    service = getEmbeddingService();
-  } else {
-    try {
-      getDbClient();
-    } catch (err) {
-      console.log(
-        '[bootstrap-electron] attemptStartEmbeddingHost: DbClient not ready yet:',
-        err instanceof Error ? err.message : String(err),
-      );
-      return;
-    }
-    try {
-      service = startEmbeddingHost({
-        getDbClient: () => getDbClient(),
-        isVecAvailable: () => {
-          try {
-            return getDbClient().vecAvailable;
-          } catch {
-            return false;
-          }
-        },
-        // XD Gateway /v1/embeddings èµ° Bearer ANTHROPIC_API_KEY (ä¸Ž art / claude åŒæº)
-        getApiKey: () => readClaudeApiKey(),
-        // å‡½æ•°å½¢æ€:model-access ä¸‹å‘åˆ‡æ¢ endpoint åŽ,å¸¸é©»çš„ embedding host æ— éœ€é‡å¯ã€‚
-        gatewayBaseUrl: () => effectiveXdGatewayBaseUrl(),
-        // /v1/embeddings ä¹Ÿè¦åƒç³»ç»Ÿä»£ç†:è£¸å…¨å±€ fetch åœ¨ã€Œç³»ç»Ÿä»£ç†ã€æ¨¡å¼ä¸‹è£¸ç›´è¿žå‡ºç½‘
-        // (è§ maker-host/outbound-fetch.ts)ã€‚
-        fetchImpl: outboundFetch,
-        log: createSchedulerLogger('embeddingHost'),
-      });
-    } catch (err) {
-      console.error('[bootstrap-electron] startEmbeddingHost failed (non-fatal):', err);
-      return;
-    }
-  }
-  // chat consumer åªåœ¨è®¾ç½® ON æ—¶æŒ‚è½½ã€‚æ’ä»¶ç‹¬è‡ªæŠŠ host æ‹‰èµ·æ¥çš„åœºæ™¯ä¸‹è¿™é‡Œä¸æ‰§è¡Œ â€”â€”
-  // æ²¡æœ‰ chat providerã€æ²¡æœ‰ cutoffã€hook å®ˆå«ä»æ˜¯ false, èŠå¤©æ•°æ®ä¸€æ¡éƒ½ä¸ä¼šè¢«åµŒã€‚
-  if (chatEnabled) {
-    // setupChatHistoryEmbedder å¹‚ç­‰ (Map.set è¦†ç›–), setChatEmbeddingEnabled(true)
-    // é‡å¤è°ƒä¸ä¼šé‡ç½® cutoff, æ‰€ä»¥è¡¥æŒ‚æ˜¯å®‰å…¨çš„ã€‚
-    try {
-      setupChatHistoryEmbedder({
-        service,
-        getDbClient: () => getDbClient(),
-        log: createSchedulerLogger('chatHistoryEmbedder'),
-      });
-      setChatEmbeddingEnabled(true);
-    } catch (err) {
-      console.error('[bootstrap-electron] setupChatHistoryEmbedder failed (non-fatal):', err);
-    }
-  }
-}
-
-// æ’ä»¶å‘é‡ consumer çš„æ‡’å¯åŠ¨æŽ¥çº¿:cindy-brain çš„ embed.text èµ°
-// ensureEmbeddingServiceForPluginVector(), ç”±å®ƒå›žè°ƒè¿™é‡Œå®ŒæˆçœŸæ­£çš„å¯åŠ¨ (å¯åŠ¨éœ€è¦
-// DbClient / api key / gateway url è¿™äº›åªæœ‰ bootstrap æœ‰çš„ä¾èµ–)ã€‚
-registerEmbeddingHostLazyStart(attemptStartEmbeddingHost);
-
-let chatEmbeddingRuntimeReconcile: Promise<void> = Promise.resolve();
-
-function scheduleChatEmbeddingRuntimeReconcile(): Promise<void> {
-  // Stop new enqueue work before an async host shutdown can run. The queued
-  // reconciliation re-reads the latest account, preference and catalog so rapid refreshes are
-  // last-write-wins across both provider and auth boundaries.
-  const chatAvailable = isChatEmbeddingAvailable();
-  const chatEnabled =
-    chatAvailable && readChatEmbeddingSettings(chatEmbeddingDefaultContext()).enabled;
-  setEmbeddingSourceSuspended('chat', !chatAvailable);
-  if (!chatEnabled) setChatEmbeddingEnabled(false);
-  chatEmbeddingRuntimeReconcile = chatEmbeddingRuntimeReconcile
-    .then(async () => {
-      if (
-        isChatEmbeddingAvailable() &&
-        readChatEmbeddingSettings(chatEmbeddingDefaultContext()).enabled
-      ) {
-        attemptStartEmbeddingHost();
-      } else {
-        await shutdownChatEmbeddingConsumer();
-      }
-    })
-    .catch((err: unknown) => {
-      createSchedulerLogger('chat-embedding-runtime').error('reconcile failed', {
-        error: String(err),
-      });
-    });
-  return chatEmbeddingRuntimeReconcile;
-}
-
-setProviderAccessRuntimeRefreshListener(scheduleChatEmbeddingRuntimeReconcile);
-
-function broadcastChatEmbeddingSettingsChanged(): void {
-  const stamp = getActiveDataOwnerPushStamp();
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
-      win.webContents.send(MAKER_PUSH.CHAT_EMBEDDING_CHANGED, stamp);
-    }
-  }
-}
-
-const chatEmbeddingSettingsWatcher = createChatEmbeddingSettingsWatcher(() => {
-  void scheduleChatEmbeddingRuntimeReconcile().finally(() => {
-    broadcastChatEmbeddingSettingsChanged();
-  });
-});
-
-function rebindChatEmbeddingSettingsWatcher(): void {
-  chatEmbeddingSettingsWatcher.rebind(ownerScopedUserDataPath('chat-embedding-settings.json'));
-}
-
-app.once('will-quit', () => chatEmbeddingSettingsWatcher.dispose());
-
-/**
- * ã€ŒèŠå¤©åµŒå…¥ã€å…³é—­æ—¶çš„æ”¶å°¾: æ€»æ˜¯è®© chat çš„ enqueue å®ˆå«ç«‹å³å¤±æ•ˆ; ä½†åªæœ‰åœ¨æ²¡æœ‰æ’ä»¶
- * å‘é‡ consumer æ—¶æ‰åœ host â€”â€” å¦åˆ™ä¼šæŠŠå¦ä¸€ä¸ª consumer çš„èƒ½åŠ›ä¸€èµ·å…³æŽ‰ (æ’ä»¶çš„
- * embed_text å…¨å˜ INTERNAL)ã€‚
- *
- * ç”¨æˆ·æ‰‹åŠ¨å…³é—­æ—¶,å·²å…¥é˜Ÿçš„æ—§ job ä»å¯åšå®Œ;provider access ä¸¢å¤±æ—¶ runtime reconcile
- * ä¼šå¦å¤–æš‚åœ chat source,æ—§ job ä¿æŒ pending,æ¢å¤å¯ç”¨åŽå†ç»­è·‘ã€‚
- */
-async function shutdownChatEmbeddingConsumer(): Promise<void> {
-  setChatEmbeddingEnabled(false);
-  if (!(await stopEmbeddingHostIfNoPluginVectorConsumer())) {
-    console.log(
-      '[bootstrap-electron] chat embedding off; embeddingHost kept alive for plugin vector consumer',
-    );
-    return;
-  }
-  resetChatEmbedderCache();
-}
-
-// Codex / Claude / Pi binary ä¸‹è½½ + çŠ¶æ€æŸ¥è¯¢ å…¨éƒ¨èµ° agent-binaries (æŒ‰ kind åˆ†æ´¾)ã€‚
-// vendor/{claude,codex}/binaryProvisioner.ts å·²é€€å½¹ã€‚
-
-// â”€â”€ Unified logger init â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// å¿…é¡»åœ¨ä»»ä½• createLogger() è°ƒç”¨ä¹‹å‰ã€‚æ²¡åˆå§‹åŒ–çš„è¯ emit() é»˜è®¤ isDevMode=false
-// èµ° packaged åˆ†æ”¯,ä½† logStream è¿˜æ˜¯ null â€”â€” æ‰€æœ‰æ—¥å¿—éƒ½ä¼šè¢«é™é»˜åžæŽ‰ã€‚
-// dev: ç›´æŽ¥ console;packaged: å†™ userData/logs/main.logã€‚
-import {
-  initLogger,
-  writeFromRenderer,
-  setLogLevel,
-  getLogLevel,
-  keepRecentSync,
-  keepRecentSessionCcDebugSync,
-  createLogger,
-  writeCcDebugLine,
-  type LogLevel,
-} from './logger.js';
-initLogger();
-const dbClientLog = createLogger('DbClient');
-const authBoundaryLog = createLogger('auth-boundary');
-// é•œåƒç¼“å­˜æ¸…ç†å¤±è´¥ä¼šæŠŠ MirrorCachePurgeError çš„ root/remaining æœ¬åœ°ç¼“å­˜è·¯å¾„å†™è¿›æ—¥å¿—,å•ç‹¬ä¸€ä¸ª
-// å­ scope,å¥½è®©æ—¥å¿—ä¸ŠæŠ¥çš„æ¥æºç™½åå•æŠŠå®ƒæŽ’é™¤æŽ‰(auth-boundary æ ¹åªç•™ä¸å¸¦è·¯å¾„çš„æœåŠ¡åœæ­¢è¯Šæ–­)ã€‚
-const authBoundaryPurgeLog = createLogger('auth-boundary:mirror-cache-purge');
-// ä¸»çª— renderer åŠ è½½å¤±è´¥å¯è§‚æµ‹æ€§ + dev å¯åŠ¨çœ‹é—¨ç‹—(è§ renderer-boot-guard.ts é¡¶éƒ¨æ³¨é‡Š)ã€‚
-const rendererGuardLog = createLogger('renderer-guard');
-const safeStorageReadLog = createLogger('safe-storage:read');
-// æ¸²æŸ“è¿›ç¨‹ console è½¬å‘**å•ç‹¬ä¸€ä¸ª scope**:å†…å®¹æ˜¯æ¸²æŸ“è¿›ç¨‹çš„ä»»æ„ console æ­£æ–‡,å¯èƒ½å¸¦ç”¨æˆ·
-// å†…å®¹,å› æ­¤ä¸è¿›æ—¥å¿—ä¸ŠæŠ¥çš„æ¥æºç™½åå•;è€Œ renderer-guard çš„åŠ è½½å¤±è´¥ä¿¡å·æ— ç”¨æˆ·å†…å®¹ã€ç™½å±æŽ’æŸ¥
-// å¿…éœ€,æ˜¯æ”¾è¡Œçš„ã€‚ä¸¤è€…ä¸èƒ½å…±ç”¨ scope,è¯¦è§ console-message ç›‘å¬å¤„çš„æ³¨é‡Šã€‚
-const rendererConsoleLog = createLogger('renderer-console');
-const updatePresentationLog = createLogger('update-presentation');
-const voicePowerBroadcastLog = createLogger('voice-input-power');
-const sessionDragPreviewLog = createLogger('session-drag-preview');
-const piSubagentLog = createLogger('pi-subagent');
-let rendererBootGuard: RendererBootGuard | null = null;
-
-const lifecycleDbClientManager = createLifecycleDbClientManager({
-  getCurrentDbPath: localDbGetCurrentDbPath,
-  createWorkerClient: createDbClient,
-  createInprocClient: () => createInprocDbClient(),
-  setCurrentDbClient,
-  clearCurrentDbClient,
-  log: dbClientLog,
-});
-
-async function ensureLifecycleDbClient(userId: string) {
-  return lifecycleDbClientManager.ensure(userId, {
-    drizzleDir: getDrizzleDir(),
-    sqliteVecExtPath: resolveSqliteVecExtPath(),
-    nativeBinding: resolveBetterSqliteNativeBinding() ?? undefined,
-    // file worker / inline å›žæ»šå£éƒ½ä½¿ç”¨ä¸»è¿›ç¨‹è§£æžå¥½çš„å…¥å£ï¼Œé¿å… packaged ä¸‹
-    // worker è‡ªè¡Œè£¸ require('better-sqlite3') è§£æžåˆ°é”™è¯¯ç›®å½•ã€‚
-    betterSqliteModulePath: resolveBetterSqliteModuleEntry(),
-  });
-}
-
-const AUTH_BOUNDARY_WAIT_TIMEOUT_MS = 10_000;
-
-async function withAuthBoundaryTimeout<T>(label: string, task: () => Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  try {
-    return await Promise.race([
-      task(),
-      new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(`${label} timed out after ${AUTH_BOUNDARY_WAIT_TIMEOUT_MS}ms`));
-        }, AUTH_BOUNDARY_WAIT_TIMEOUT_MS);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-async function teardownGhostProjectionBoundary(reason: string): Promise<void> {
-  const failures: unknown[] = [];
-  const run = async (label: string, task: () => Promise<void>): Promise<void> => {
-    try {
-      await task();
-    } catch (error) {
-      failures.push(error);
-      authBoundaryLog.error(`${label} on ${reason} failed`, error);
-    }
-  };
-
-  await run('interruptGhostCallsForAccountBoundary', () =>
-    withAuthBoundaryTimeout('interrupt Ghost calls', interruptGhostCallsForAccountBoundary),
-  );
-  await run('waitForGhostMutations', () =>
-    withAuthBoundaryTimeout('wait for Ghost mutations', waitForGhostMutations),
-  );
-  await run('suspendAllGhosts', suspendAllGhosts);
-
-  if (failures.length > 0) {
-    throw new AggregateError(failures, `Ghost projection teardown on ${reason} was incomplete`);
-  }
-}
-
-/**
- * Raised when the account boundary cannot prove the outgoing account's durable
- * Subagent runners are stopped. Distinct class because every *other* failure in
- * that block is deliberately non-fatal; this one must abort the handover.
- */
-class PiSubagentAccountBoundaryError extends Error {
-  constructor(
-    reason: string,
-    override readonly cause?: unknown,
-    detail = 'PI Subagent runners could not be confirmed stopped',
-  ) {
-    super(
-      `${detail} on ${reason}; ` +
-        "account switch aborted so the outgoing account's credentials are not left in use",
-    );
-    this.name = 'PiSubagentAccountBoundaryError';
-  }
-}
-
-/**
- * Did an account handover abort after it had already taken services apart?
- *
- * The abort keeps the user on the old account, but by the time it can happen
- * the custom provider catalog has been cleared and IM, the scheduler, embedding,
- * the Ghost projection and Learn have been stopped. Their construction duals all
- * hang off the login / DB-ready sequence (`localDb` onReady and the
- * `app:ready-for-bot` handler), which nothing re-runs on this path â€” so the old
- * account keeps working for anything already in memory and silently does not for
- * everything that was torn down.
- *
- * This records the fact and says so once, plainly. It is deliberately not a
- * partial re-init: of the six, only IM, hook control and the scheduler have an
- * entry point that is idempotent and reachable from here; the provider catalog â€”
- * the one that decides which routes an agent may take â€” is repopulated by a
- * readiness arm published from the startup closure, and calling half the list
- * would leave the account looking recovered while its routing stayed empty.
- *
- * User-visible "restart required" is a product decision and is not smuggled
- * in here. The abort is recorded and logged; it does not open a dialog.
- */
-let accountBoundaryAbortedMidTeardown: string | null = null;
-
-function markAccountBoundaryAbortedMidTeardown(reason: string): void {
-  if (accountBoundaryAbortedMidTeardown !== null) return;
-  accountBoundaryAbortedMidTeardown = reason;
-  authBoundaryLog.error(
-    `account handover on ${reason} was aborted after teardown had already run â€” this ` +
-      'account keeps its custom provider catalog cleared and its IM, scheduler, ' +
-      'embedding, Ghost projection and Learn services stopped until the app is ' +
-      'restarted or a later handover succeeds',
-  );
-}
-
-/** Test seam: which reason aborted mid-teardown, or null if none has. */
-export function __accountBoundaryAbortedMidTeardownForTests(): string | null {
-  return accountBoundaryAbortedMidTeardown;
-}
-
-/**
- * Cleared by a handover that completes.
- *
- * A successful switch replaces the runtime the abort had left half dismantled,
- * so the blocking state stops being true and the next abort â€” if there ever is
- * one â€” has to be able to say so again.
- */
-function clearAccountBoundaryAbortMark(): void {
-  accountBoundaryAbortedMidTeardown = null;
-}
-
-async function teardownAuthAccountBoundary(reason: string): Promise<void> {
-  remoteDesktopViewerWindows.reset();
-  const blockingFailures: unknown[] = [];
-  // Goal timers can dispatch through the outgoing Maker while launch-fence
-  // acquisition waits behind queued filesystem work. Invalidate them before
-  // the first await; resetGoalController() synchronously disposes the current
-  // controller and cancels continuation / usage-resume timers.
-  // Start disposal synchronously, then drain it before waiting on the
-  // cross-process launch fence. This closes the Goal boundary immediately;
-  // disposal itself only settles owner-scoped persistence and cannot launch a
-  // new durable runner after the controller has been fenced.
-  const goalDispose = resetGoalController();
-  // Raise the durable-run fence before the remaining destructive teardown:
-  // input device slots are suspended, the custom provider catalog is cleared,
-  // and IM, scheduler, embedding and Ghost projection are stopped. Failing to
-  // raise it still aborts the handover before those services are taken apart.
-  //
-  // Holding it for the whole teardown rather than only the shutdown+sweep is
-  // the intended widening: a durable launch is exactly what must not start
-  // while an account boundary is in progress.
-  // Declared out here because the fence's try/finally now spans the whole
-  // teardown, and the DB-close finally below still has to reach it.
-  let agentIslandService: ReturnType<typeof getAgentIslandService> | undefined;
-  let releaseBoundaryLaunchFence: (() => Promise<void>) | null = null;
-  try {
-    releaseBoundaryLaunchFence = await acquirePiSubagentLaunchFence(
-      path.join(app.getPath('userData'), 'pi-agent-home'),
-    );
-  } catch (err) {
-    try {
-      await goalDispose;
-    } catch (disposeErr) {
-      authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, disposeErr);
-    }
-    // The handover is aborting before the owner commit, so the outgoing Maker
-    // and DB remain authoritative. Recreate the controller disposed above;
-    // otherwise a transient fence failure leaves the still-active account with
-    // no goal IPC/runtime until the whole app restarts.
-    try {
-      const maker = getMakerCore();
-      const automationGitBaselineHooks = createAutomationUserTurnGitBaselineHooks();
-      startGoalController({
-        maker,
-        getDb: () => getDbClient().drizzle,
-        broadcastStatus: broadcastGoalStatus,
-        ...automationGitBaselineHooks,
-      });
-      // A startup already in flight before resetGoalController() will exit on
-      // its generation fence (and may stop a scheduler it just constructed).
-      // Queue a fresh full account-host attempt behind that cleanup so the
-      // still-active account also regains Scheduler and Learn. Do not await it:
-      // the original fence error must remain the handover result.
-      void attemptStartScheduler();
-    } catch (restoreErr) {
-      authBoundaryLog.error(
-        `restore GoalController after launch-fence failure on ${reason} failed:`,
-        restoreErr,
-      );
-    }
-    // Fail closed, unlike quit and the relaunch. Those two are allowed to
-    // continue without a fence because the process is about to disappear
-    // (quit) or the operation is cancelled outright (relaunch). Here the
-    // process keeps running and hands its runtime to a different owner, so
-    // the window the fence exists to close is precisely the one still open â€”
-    // degrading to "warn and continue" would silently reintroduce it. A
-    // logout that fails can be retried, and at this point there is nothing
-    // to undo.
-    throw new PiSubagentAccountBoundaryError(
-      reason,
-      err,
-      'the PI Subagent launch fence could not be raised',
-    );
-  }
-  try {
-    await goalDispose;
-  } catch (err) {
-    authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
-  }
-  try {
-    // Hardware must stop before the long async drain. Otherwise a held stick or
-    // microphone keeps acting on the outgoing account while caches and IM stop.
-    suspendInputDeviceTaskSlots();
-    // The boundary is already marked pending by every caller. New actions now
-    // fail closed; drain an action that crossed the boundary before closing its DB.
-    try {
-      await withAuthBoundaryTimeout(
-        'wait for turn change-set actions',
-        waitForTurnChangeSetActions,
-      );
-    } catch (error) {
-      blockingFailures.push(error);
-      authBoundaryLog.error(`waitForTurnChangeSetActions on ${reason} failed`, error);
-    }
-    skillhubAutoSyncService.cancelInFlight();
-    // Custom provider routes are owner-scoped but the active catalog is process-global.
-    // Clear synchronously at the boundary; the next owner's tracked readiness reloads them
-    // before any Agent route can start. A failed DB read therefore stays fail-closed (empty)
-    // instead of retaining the previous owner's endpoint or model entries.
-    setCustomProviders([]);
-    accountProviderReadinessArm.clear();
-    startPendingAccountProviderReadiness = null;
-    accountProviderReadinessBarrier.invalidateAdoption();
-    clearModelVisibilityMirror();
-    // è¿œç¨‹ä¼šè¯çš„é•œåƒå†·ç¼“å­˜é‡Œæ˜¯åˆ«çš„è®¾å¤‡çš„èŠå¤©å†…å®¹ã€‚owner å‘½åç©ºé—´å·²ç»ä¿è¯ä¸‹ä¸€ä¸ªè´¦å·è¯»ä¸åˆ°
-    // å®ƒ,ä½†ç™»å‡ºåŽä¸è¯¥åœ¨ç›˜ä¸Šç•™ç€ â€”â€” è¿™é‡Œ owner è¿˜æŒ‡å‘**æ—§è´¦å·**(commitActiveAppSession åœ¨
-    // teardown ä¹‹åŽæ‰åˆ‡),æ­£æ˜¯å”¯ä¸€èƒ½æ¸…å‡†çš„æ—¶æœºã€‚
-    //
-    // åˆ ä¸æŽ‰æ—¶(Windows æ–‡ä»¶é” / æƒé™ / å¹¶å‘å†™)**ä¸é˜»æ–­ç™»å‡º** â€”â€” å¡ä½ç™»å‡ºæ¯”ç¼“å­˜æ®‹ç•™æ›´ç³Ÿ â€”â€”
-    // ä½†ä¹Ÿä¸èƒ½åªè®°ä¸€è¡Œæ—¥å¿—äº†äº‹:æŠŠå¾…æ¸…ç›®å½•æŒä¹…åŒ–è¿›é‡è¯•é˜Ÿåˆ—,ä¸‹æ¬¡å¯åŠ¨ä¸Žä¸‹æ¬¡è´¦å·è¾¹ç•Œå„æ¶ˆåŒ–
-    // ä¸€æ¬¡,ç›´åˆ°çœŸæ­£åˆ æŽ‰(review: codex P1)ã€‚é¡ºæ‰‹å…ˆæ¶ˆåŒ–ä¸€æ¬¡åŽ†å²é—ç•™ã€‚
-    try {
-      await drainPurgeQueue();
-    } catch (err) {
-      authBoundaryPurgeLog.warn(`drain mirror cache purge queue on ${reason} failed:`, err);
-    }
-    try {
-      await getMirrorCache().clearAll();
-    } catch (err) {
-      authBoundaryPurgeLog.error(`clear device-link mirror cache on ${reason} failed:`, err);
-      if (err instanceof MirrorCachePurgeError) {
-        // remaining / barriers / tombstones ä¸‰æ ·éƒ½è¦å¸¦ä¸Š(åŒ IPC ä¾§çš„ queuePurgeRetry):
-        // åªä¼  root çš„è¯,è¡¥åˆ æˆåŠŸåŽé˜Ÿåˆ—æ—¢ä¸çŸ¥é“è¯¥è¡¥è‡ªå¢žå“ªä¸ªä½œåºŸè®¡æ•°,ä¹Ÿä¸ä¼šé€€å½¹ `_account`
-        // å¢“ç¢‘ â€”â€” å¢“ç¢‘ä¸€ç›´æŒ‚ç€å°±ç­‰äºŽè¿™ä¸ª owner çš„ç¼“å­˜è¯»è¢«æ°¸ä¹…åŽ‹ä½(review: codex P1)ã€‚
-        await enqueuePurge(err.root, err.remaining, err.barriers, err.tombstones).catch(
-          (enqueueErr: unknown) => {
-            authBoundaryPurgeLog.error('failed to enqueue mirror cache purge retry:', enqueueErr);
-          },
-        );
-      }
-    }
-    // Cindy relay owns long-lived transports plus account-scoped task/binding
-    // state. Drain ingress before discarding the owner-scoped store; otherwise a
-    // late Telegram/Slack callback could write through the next account boundary.
-    try {
-      await stopHookControlAccount();
-    } catch (err) {
-      authBoundaryLog.error(`stopHookControlAccount on ${reason} failed (non-fatal):`, err);
-    } finally {
-      // Auth/runtime boundaries keep durable group cursors for a later relogin;
-      // only explicit account deletion is a data-removal boundary.
-      resetHookControlOwnerBoundary({ clearPersisted: reason === 'account-deletion' });
-    }
-    // Every Ghost sandbox can retain live OAuth, subscription, or in-memory
-    // state. Stop them before changing owners; resident Ghosts are recreated by
-    // the auth-change activation pass after the new boundary is committed.
-    try {
-      await teardownGhostProjectionBoundary(reason);
-    } catch (error) {
-      blockingFailures.push(error);
-    }
-    // Personal IM channels have the same DB boundary. Relogin restarts them from
-    // the next owner DB-ready callback; app:ready-for-bot remains a compatibility
-    // retry after the new DbClient is ready.
-    try {
-      await stopImConnection(reason);
-    } catch (err) {
-      authBoundaryLog.error(`stopImConnection on ${reason} failed (non-fatal):`, err);
-    }
-    // Phase 4 åˆ‡è´¦å·:teardown é¡ºåºå¾ˆå…³é”®,åˆ†ä¸¤æ­¥ â‘  readiness holder â†’ â‘¡ schedulerã€‚
-    // â‘  å…ˆæ¸… readiness holder,**å¿…é¡»åœ¨ await resetScheduler() ä¹‹å‰**ã€‚
-    // resetScheduler() å†…éƒ¨ await _scheduler.stop() æ˜¯å¼‚æ­¥çš„;è‹¥å…ˆ await å®ƒ,åœ¨
-    // stop è¿›è¡Œä¸­çš„é‚£æ®µçª—å£é‡Œ _current ä»æŒ‡å‘æ­£åœ¨åœçš„æ—§å®žä¾‹,æœŸé—´ä»»ä½•æ–°çš„
-    // withScheduler è°ƒç”¨ä¼š awaitReady â†’ ç«‹å³ resolve åˆ°è¿™ä¸ª stopping å®žä¾‹ â†’ ä¸šåŠ¡
-    // cb åœ¨å·²åœ scheduler ä¸Šè·‘ã€‚å…ˆåŒæ­¥æ¸…æŽ‰ _current,è®©çª—å£å†…çš„æ–°è°ƒç”¨è½¬ä¸º pending,
-    // ç­‰ relogin åŽçš„ setSchedulerReady å–‚å…¥**æ–°å®žä¾‹**(ä¸Ž worker bug #1 çš„ relogin
-    // è·¯å¾„åŒæž„,è¿™é‡Œå…³æŽ‰ teardown è·¯å¾„çš„å¯¹å¶çª—å£)ã€‚
-    // ä¸ reject _pending â€” è®©åœ¨é€”è¯·æ±‚ç»§ç»­ç­‰ä¸‹æ¬¡ setSchedulerReady,30s è¶…æ—¶å…œåº•ã€‚
-    resetSchedulerReady();
-    agentIslandService = getAgentIslandService();
-    agentIslandService?.resetRuntimeState();
-    // â‘¡ å†åœæ—§ schedulerã€‚scheduler æŒæœ‰æ—§ user çš„ storage drizzle å¼•ç”¨,å¿…é¡»åœ¨
-    // closeLocalDb ä¹‹å‰å…ˆ stop;å¦åˆ™ä¸‹ä¸€ç§’ tick ä¼šæ’ž 'localDb not ready'ã€‚
-    // resetScheduler æŠŠ scheduler-host çš„ _scheduler å•ä¾‹ç½® null,ä¸‹ä¸€æ¬¡
-    // attemptStartScheduler(onReady è§¦å‘)ä¼šç”¨æ–° user çš„ drizzle é‡æ–°å¯åŠ¨ã€‚
-    // è§ Phase 3 changelog Â«scheduler ä¸ç›‘å¬ localDb.closeDb(åˆ‡è´¦å·)Â» é—ç•™ã€‚
-    try {
-      await resetScheduler();
-    } catch (err) {
-      authBoundaryLog.error(`resetScheduler on ${reason} failed (non-fatal):`, err);
-    }
-    // attemptStartScheduler çš„ WeakSet ä¹Ÿè¦ç»™æ–° scheduler å®žä¾‹ç•™ä½ç½® â€” è€å®žä¾‹è¢«
-    // resetScheduler ç½® null åŽä¼šè¢« GC,WeakSet è‡ªåŠ¨æ¸…ç†;æ–°å®žä¾‹ä»Žæœª add è¿‡,
-    // attempt æ—¶ä¼šé‡æ–° attachã€‚è¿™é‡Œæ— éœ€æ‰‹åŠ¨æ“ä½œ WeakSetã€‚
-    // embedding-host ä¹ŸæŒæœ‰æ—§ user çš„ db å¼•ç”¨, åˆ‡è´¦å·å‰å…ˆ stop, ä¸‹æ¬¡ ensureReady
-    // è§¦å‘çš„ onReady ä¼šç”¨æ–° db é‡æ–°å¯åŠ¨ (attemptStartEmbeddingHost å•ä¾‹å¹‚ç­‰)ã€‚
-    try {
-      await stopEmbeddingHost();
-    } catch (err) {
-      authBoundaryLog.error(`stopEmbeddingHost on ${reason} failed (non-fatal):`, err);
-    }
-    // chat-history-embedder æ¨¡å—çº§ state (cutoff cache / enabled / deps) ä¹Ÿè·Ÿæ—§ user
-    // çš„ DB ç»‘å®š; é‡ç½®åŽä¸‹ä¸€æ¬¡ attemptStartEmbeddingHost â†’ setupChatHistoryEmbedder
-    // ä¼šæŒ‰æ–° user çš„ DB é‡æ–°åˆå§‹åŒ–, åˆ‡è´¦å·æ— ä¸²åº“é£Žé™©ã€‚
-    try {
-      resetChatEmbedderCache();
-    } catch (err) {
-      authBoundaryLog.error(
-        `[bootstrap-electron] resetChatEmbedderCache on ${reason} failed (non-fatal):`,
-        err,
-      );
-    }
-    // learn-host å•ä¾‹æŒæœ‰æ—§ user çš„ maker/db æ³¨å…¥ä¾èµ–ä¸Žå†…å­˜ run store;ä¸é‡ç½®çš„è¯
-    // relogin åŽ startLearnHost å¹‚ç­‰æ—©é€€,æ–°è´¦å·ä¼šç»§ç»­ç”¨æ—§ä¾èµ–ã€çœ‹åˆ°æ—§è´¦å·çš„
-    // in-memory run(Codex review)ã€‚dispose ä¸­æ­¢æ´»è·ƒè’¸é¦ã€è§£ç»‘ watcher,ä¸‹æ¬¡
-    // å°±ç»ªç‚¹ç”¨æ–°ä¾èµ–é‡å»ºã€‚
-    try {
-      await resetLearnController();
-    } catch (err) {
-      authBoundaryLog.error(`resetLearnController on ${reason} failed (non-fatal):`, err);
-    }
-    try {
-      disposeDesktopContactsManager();
-    } catch (err) {
-      authBoundaryLog.error(`dispose contacts manager on ${reason} failed (non-fatal):`, err);
-    }
-    // Maker session storage resolves the current DbClient lazily. A late callback
-    // from the previous owner must not survive long enough to write into the next
-    // owner's database, so shut down and discard the entire runtime before DB swap.
-    // å…ˆä¸¢å¼ƒæ—§ owner çš„å»¶è¿Ÿ Codex é‡å¯ç™»è®° â€”â€” holder éšè¿›ç¨‹å­˜æ´»,ä¸æ¸…ä¼šåœ¨æ–° owner
-    // çš„ Maker ä¸Šå…‘çŽ°æ—§ owner çš„è®°å¿†è®¾ç½®é‡å¯(shutdown è§¦å‘çš„ä¼šè¯å…³é—­äº‹ä»¶ä¹Ÿä¼š
-    // æ’žä¸Šå®ƒ,å…ˆæ¸…å†å…³)ã€‚
-    clearDeferredCodexRestartForOwnerBoundary();
-    clearWorkingDirectoryRecoveryForOwnerBoundary();
-    // interrupted-turn-resume:shutdown æ‰¹é‡ close ä¼šè¯ä¼šè§¦å‘ close teardown çš„
-    // markSessionTurnEnded,æŠŠ"è¾¹ç•Œæ—¶è¿˜åœ¨é£žçš„ turn"ä¼ªè£…æˆæ­£å¸¸æ”¶å°¾ â€”â€” è¢«åˆ‡æ¢æ‰“æ–­çš„
-    // ä»»åŠ¡ä»Žæ­¤æ—¢æ— ä¸­æ–­æ¨ªå¹…ä¹Ÿæ— çº¢ç‚¹,å‘ˆçŽ°ä¸º"å¡ä½ä¸”æ— æŠ¥é”™"(ä¸Ž âŒ˜Q çš„ quit freeze åŒæ¬¾
-    // é—®é¢˜,quit freeze åªä¿æŠ¤é€€å‡ºç¼–æŽ’,ä¸è¦†ç›–è¿™é‡Œ)ã€‚shutdown åˆ° DB dispose æœŸé—´æŠ‘åˆ¶
-    // ended å†™,ä¿ä½ startedAt > endedAt çš„ä¸­æ–­ç—•è¿¹;ä¸è¦†ç›– teardown å‰æ®µ,è¾¹ç•Œæ—©æ®µ
-    // è‡ªç„¶å®Œæˆçš„ turn ç…§å¸¸æ”¶å°¾ã€‚é‡Šæ”¾æ”¾ finally:æŠ‘åˆ¶å™¨æ˜¯è¿›ç¨‹çº§è®¡æ•°,æ³„æ¼ä¸€æ¬¡å°±æŠŠ
-    // åŽç»­ owner çš„æ­£å¸¸æ”¶å°¾å†™å…¨éƒ¨åžæŽ‰,ä¸­æ–­æ¨ªå¹…ä¼šåœ¨æ¯ä¸ªæ­£å¸¸å®Œæˆçš„ä»»åŠ¡ä¸Šè¯¯å¼¹ã€‚
-    const releaseEndedSuppression = beginSessionTurnEndedSuppression();
-    try {
-      // GoalController captures the Maker and owner DB at construction time.
-      // Dispose it before replacing the Maker so a relogin cannot dispatch
-      // goals through a shutting-down runtime from the previous account.
-      try {
-        await resetGoalController();
-      } catch (err) {
-        authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
-      }
-      // Same fence, same ordering argument, as quit and the update relaunch: raised
-      // before `maker.shutdown` so it covers the shutdown *and* the sweep below.
-      // `Maker.shutdown` reports per-session detach failures rather than throwing,
-      // so a parent Pi can survive it â€” and a survivor could publish a fresh run
-      // after the one-shot sweep had already scanned, handing the next owner a
-      // runner holding the previous account's credentials.
-      //
-      // Unlike quit, this must come down on *every* path. An account boundary swaps
-      // the owner inside a live process: a fence left standing would refuse the
-      // incoming owner's own durable launches for the rest of this process's life.
-      // Raised inside the suppression `try` so that finally releases both.
-      // Did the Maker singleton get poisoned, and is it still holding anything?
-      //
-      // `Maker.shutdown` sets `shutdownStarted` on entry and never clears it, so
-      // once it has run every later `createSession` is refused with "Maker is
-      // shutting down". That is fine when the handover completes â€” the Maker is
-      // replaced â€” but an aborted handover leaves the user on the old account
-      // with a singleton that can no longer start a task until the app restarts.
-      let shutdownRan = false;
-      let retainedPiSessions = 0;
-      try {
-        const maker = getMakerIfReady();
-        // Logout / account switch: the owner DbClient is disposed a few lines
-        // below and the gateway credentials behind every proxy token are being
-        // replaced. Adapters that keep parent-independent children alive across an
-        // ordinary close (PI durable Subagents) must stop them here instead.
-        // Marked before the await: `shutdownStarted` is set on entry, so the
-        // singleton is poisoned even if this rejects.
-        if (maker) shutdownRan = true;
-        const shutdownReport = maker
-          ? await maker.shutdown({ reason: 'account-boundary' })
-          : undefined;
-        // A PI session whose detach threw may still have a live process, and that
-        // process owns durable children holding BYOM credentials this account
-        // cannot revoke. Recorded now, acted on after the sweep â€” the sweep is
-        // still worth running, but it cannot make this failure disappear.
-        //
-        // Only PI is escalated. Other agents' detach failures stay logged and
-        // non-fatal exactly as before: their children die with the parent, so a
-        // failed teardown does not leave revocation-proof credentials in use.
-        const piSessionFailures = (shutdownReport?.sessionFailures ?? []).filter(
-          (failure) => failure.agentKind === 'pi',
-        );
-        // A session whose detach failed is *kept*: `Session.detach` leaves it in
-        // `error`, not `closed`, so the Maker keeps its status listener and its
-        // active-session slot deliberately, and a later `shutdown()` retries it.
-        // That makes this Maker the only remaining supervision surface for a PI
-        // process that may still be alive â€” which decides whether the abort path
-        // below may discard it.
-        retainedPiSessions = piSessionFailures.length;
-        for (const failure of piSessionFailures) {
-          authBoundaryLog.error(
-            `PI session ${failure.sessionId} failed to detach on ${reason}:`,
-            failure.error,
-          );
-        }
-        // maker.shutdown only reaches tasks that still have a live handle. A
-        // detached PI Subagent whose parent task was closed earlier has no handle
-        // left, but it is still holding a transferred proxy lease and still
-        // writing the workspace â€” sweep the whole agent home so no child of the
-        // outgoing owner survives into the next one. Same call the quit path uses;
-        // idempotent with the per-handle stop above.
-        // This one is *not* non-fatal. Everything below hands the runtime to the
-        // next owner: the Maker is discarded, the outgoing database is disposed
-        // and the app session is committed to a new account. A runner we could
-        // not confirm as stopped keeps running against direct BYOM credentials
-        // from the outgoing account â€” credentials no token revocation can reach â€”
-        // so completing the handover would leave the previous account paying for,
-        // and the previous workspace being edited by, a process nobody is left to
-        // supervise. Abort instead and let the logout / switch fail and be
-        // retried. Scope is unchanged: only runs attributable to this runtime are
-        // waited on or killed, so another instance's runners never block us.
-        const stopped = await stopAllPiSubagentRunsForExit(
-          path.join(app.getPath('userData'), 'pi-agent-home'),
-          undefined,
-          // A runner that never consumes its mailbox still holds direct BYOM
-          // credentials from the outgoing account, and those cannot be revoked
-          // the way the proxy token can. Escalate to a verified kill rather than
-          // logging and handing the account over.
-          { hostPid: process.pid, killUnresponsiveRunners: true },
-        ).catch((err: unknown) => {
-          throw new PiSubagentAccountBoundaryError(reason, err);
-        });
-        if (!stopped) throw new PiSubagentAccountBoundaryError(reason);
-        if (piSessionFailures.length > 0) {
-          throw new PiSubagentAccountBoundaryError(
-            reason,
-            piSessionFailures[0]?.error,
-            `${piSessionFailures.length} PI session(s) could not be torn down`,
-          );
-        }
-        resetMaker();
-      } catch (err) {
-        // The abort above must not be laundered into "non-fatal": it is the one
-        // failure in this block that has to stop the handover.
-        if (err instanceof PiSubagentAccountBoundaryError) {
-          authBoundaryLog.error(`${err.message} (cause:`, err.cause, ')');
-          // The handover is aborted and the user stays on the old account â€” with
-          // a Maker that has already been shut down and now refuses every new
-          // task. Replace it, exactly as the non-fatal path below does, so the
-          // account the user is still on remains usable and a retried logout
-          // starts from a clean instance.
-          //
-          // Only when nothing is still attached to it. Survivors of a *sweep*
-          // failure are detached runners: their ownership lives in durable files,
-          // their pid, and the `runtimeOwnerId` stamped into their status â€” none
-          // of it on this object, and the retried logout sweeps the whole agent
-          // home again. A session whose *detach* failed is the opposite: the
-          // Maker is holding its handle on purpose so the next `shutdown()` can
-          // retry it, and discarding the instance would orphan a live PI process
-          // still spending this account's credentials. Staying poisoned is the
-          // lesser harm there, and the log above is what says so.
-          if (shutdownRan && retainedPiSessions === 0) resetMaker();
-          markAccountBoundaryAbortedMidTeardown(reason);
-          throw err;
-        }
-        authBoundaryLog.error(`maker shutdown on ${reason} failed (non-fatal):`, err);
-        resetMaker();
-      }
-      // device-link å•æŒæœ‰è€…ä»²è£:å¿…é¡»åœ¨ dispose DbClient **ä¹‹å‰**é‡Šæ”¾æŒæœ‰æƒè¡Œ
-      // (dispose åŒæ­¥ clearCurrentDbClient,ä¹‹åŽ store ä¸å¯ç”¨,åªèƒ½ç­‰ 15s+ å¿ƒè·³
-      // è¿‡æœŸ,åŒæœºå¹¸å­˜å®žä¾‹æŽ¥ç®¡å˜æ…¢)ã€‚å†…éƒ¨å¸¦ 1.5s è¶…æ—¶,ä¸ä¼šå¡ä½ç™»å‡ºã€‚
-      try {
-        await releaseDeviceLinkOwnershipBeforeLogout();
-      } catch (err) {
-        authBoundaryLog.error(
-          `[bootstrap-electron] release device-link ownership on ${reason} failed (non-fatal):`,
-          err,
-        );
-      }
-      await lifecycleDbClientManager.dispose(reason);
-    } finally {
-      releaseEndedSuppression();
-    }
-  } finally {
-    // Both outcomes release it: the handover completed (the incoming owner
-    // must be able to launch), or it was aborted (this owner stays and must
-    // be able to launch). Either way the window this fence covers is over,
-    // and every exit from the body above â€” including the abort â€” lands here.
-    const releaseFence = releaseBoundaryLaunchFence;
-    releaseBoundaryLaunchFence = null;
-    await releaseFence?.().catch(() => undefined);
-  }
-  // device-link å•æŒæœ‰è€…ä»²è£:å¿…é¡»åœ¨ dispose DbClient **ä¹‹å‰**é‡Šæ”¾æŒæœ‰æƒè¡Œ
-  // (dispose åŒæ­¥ clearCurrentDbClient,ä¹‹åŽ store ä¸å¯ç”¨,åªèƒ½ç­‰ 15s+ å¿ƒè·³
-  // è¿‡æœŸ,åŒæœºå¹¸å­˜å®žä¾‹æŽ¥ç®¡å˜æ…¢)ã€‚å†…éƒ¨å¸¦ 1.5s è¶…æ—¶,ä¸ä¼šå¡ä½ç™»å‡ºã€‚
-  try {
-    await releaseDeviceLinkOwnershipBeforeLogout();
-  } catch (err) {
-    authBoundaryLog.error(
-      `[bootstrap-electron] release device-link ownership on ${reason} failed (non-fatal):`,
-      err,
-    );
-  }
-  try {
-    await lifecycleDbClientManager.dispose(reason);
-  } finally {
-    try {
-      localDbCloseDb();
-    } catch (error) {
-      blockingFailures.push(error);
-      authBoundaryLog.error(`close local DB on ${reason} failed`, error);
-    }
-    agentIslandService?.resetRuntimeState();
-  }
-
-  if (blockingFailures.length > 0) {
-    throw new AggregateError(
-      blockingFailures,
-      `account boundary teardown on ${reason} was incomplete`,
-    );
-  }
-  // Reached only when the handover ran all the way through, which is exactly
-  // when a previous abort's blocking state stops being true.
-  clearAccountBoundaryAbortMark();
-}
-
-authManager.setAccountSwitchTeardown(async () => {
-  await teardownAuthAccountBoundary('runtime-replacement-account-switch');
-});
-authManager.setAuthSessionTeardown(teardownAuthAccountBoundary);
-authManager.setProjectionRepairTeardown(teardownGhostProjectionBoundary);
-
-// A launch fence left by the host we just replaced (or by one that crashed
-// mid-relaunch) would otherwise refuse this instance's Subagent launches for as
-// long as the file sits there. Only fences whose owner is gone are dropped, so a
-// concurrent instance genuinely mid-relaunch keeps its own.
-void clearStalePiSubagentLaunchFence(path.join(app.getPath('userData'), 'pi-agent-home')).catch(
-  (err: unknown) => {
-    piSubagentLog.warn('stale Subagent launch fence cleanup failed (non-fatal):', err);
-  },
-);
-
-try {
-  reapClaudeOrphansSync();
-} catch (err) {
-  // Defensive: reapClaudeOrphansSync already catches its own scan/kill errors
-  // and logs to debug. This only fires on truly unexpected throws (e.g. module
-  // load failure) and must never abort bootstrap.
-  createLogger('claude-orphan-reaper').warn('initial reap threw', { error: String(err) });
-}
-
-// â”€â”€ agent è¿›ç¨‹ä¼˜å…ˆçº§é™æ¡£ watcher(agent èµ„æºå ç”¨æ²»ç†)â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// è®¾ç½®(processPriority)ä¸º normal ä¸”æ— æ¬ æ¢å¤è¿›ç¨‹æ—¶,æ¯ tick é›¶æˆæœ¬(ä¸æ‰«è¿›ç¨‹è¡¨);
-// interval å·² unref,è¿›ç¨‹é€€å‡ºä¸è¢«å®ƒæ‹–ä½ã€‚æ‰€æœ‰å¤±è´¥ best-effort,ä¸å½±å“å¯åŠ¨ã€‚
-try {
-  startAgentProcessPriorityWatcher();
-} catch (err) {
-  createLogger('agent-process-priority').warn('watcher start threw', { error: String(err) });
-}
-
-// â”€â”€ å¯åŠ¨è¯Šæ–­ (issue #758) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// ä¸Šæ¬¡å¼‚å¸¸é€€å‡ºå°¸æ£€ (run marker) + Crashpad æœ¬åœ° minidump + crash dump æ‰«æã€‚
-// å¿…é¡»åœ¨ app ready å‰ (crashReporter.start çº¦æŸ)ã€userData å®šåž‹åŽ (index.ts çš„
-// devFlags override å·²ç”Ÿæ•ˆ) è°ƒç”¨ â€”â€” æ­¤å¤„é¡¶å±‚æ»¡è¶³ä¸¤è€…ã€‚å†…éƒ¨å…¨å…œåº•,æ°¸ä¸é˜»æ–­å¯åŠ¨ã€‚
-initStartupDiagnostics();
-
-// â”€â”€ Dev-only: Chrome DevTools Protocol remote debugging port â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// ä»… dev æ¨¡å¼å¼€æ”¾ã€‚å¼€äº†ä¹‹åŽ main è¿›ç¨‹ä¼šåœ¨ 127.0.0.1:9222 ä¸Šæä¾› /json/list
-// åˆ—å‡ºæ‰€æœ‰ renderer/utility çš„ webSocketDebuggerUrl, ç”¨ CDP æŠ“ heap snapshot
-// (HeapProfiler.takeHeapSnapshot) ä¸å†ä¾èµ–äººå·¥å¼€ DevToolsã€‚
-//
-// é…å¥—è„šæœ¬: apps/desktop/scripts/take-heap-snapshot.mjs
-//   node apps/desktop/scripts/take-heap-snapshot.mjs --out ./apps/desktop/logs/
-//
-// packaged ä¸‹ç»ä¸å¼€ â€” ä»»ä½•å¸¦ 9222 ç«¯å£çš„ Chromium è¿›ç¨‹éƒ½èƒ½è¢«æœ¬æœºå…¶ä»–ç¨‹åº
-// æ³¨å…¥ JS, æ˜¯è¿œç¨‹ä»£ç æ‰§è¡Œå£å­ã€‚dev æœºå™¨è‡ªç„¶ä¸åœ¨ attack surface å†…ã€‚
-//
-// ç«¯å£å¯ç”¨ XDT_CDP_PORT è¦†å†™(ä»…æ•°å­—ç”Ÿæ•ˆ):å¹¶è¡Œå¤šå¼€æ²™ç®±æ—¶ 9222 åªæœ‰å…ˆèµ·çš„
-// å®žä¾‹èƒ½ç»‘ä¸Š, åŽèµ·å®žä¾‹è¦ä¿ä½ CDP è°ƒè¯•é¢å°±æ¢ä¸ªç«¯å£ã€‚
-
-if (!app.isPackaged) {
-  const cdpPortOverride = process.env.XDT_CDP_PORT;
-  const cdpPort = cdpPortOverride && /^\d{2,5}$/.test(cdpPortOverride) ? cdpPortOverride : '9222';
-  app.commandLine.appendSwitch('remote-debugging-port', cdpPort);
-}
-
-// â”€â”€ Webview hardener (RSB Phase 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// å¿…é¡»åœ¨ app ready ä¹‹å‰ install:Electron çš„ `web-contents-created` listener åœ¨
-// ready å‰æ³¨å†Œä¹Ÿæœ‰æ•ˆ,å†…éƒ¨ç¼“å†²åˆ° fire æ—¶æ‰æŠ•é€’,ç¡®ä¿ä¸»çª— / ä»»ä½• webContents
-// é¦–æ¬¡ attach webview éƒ½èµ° hardenerã€‚è¯¦è§ webview-security.tsã€‚
-installWebviewHardener();
-
-// ç™»å½• captcha webview çš„ auth origin ç™½åå•:hardener é™„åŠ /å¯¼èˆªé—¸æ®æ­¤æ ¡éªŒ
-// æŒ‘æˆ˜é¡µåœ°å€ã€‚æƒ°æ€§è§£æž(attach æ—¶åˆ»å–å½“å‰ç«¯ç‚¹æ¸…å•),ä¸¤ realm éƒ½æ”¶â€”â€”
-// é‚®ç®±å‘ç å›ºå®šèµ°æž„å»ºåŒºåŸŸ,ä½†æ¸…å•åœ¨ dev/è¿œç¨‹å›žå¡«å½¢æ€ä¸‹åœ°å€å¯èƒ½å˜åŒ–ã€‚
-setLoginCaptchaOriginResolver(() => {
-  const origins = new Set<string>();
-  for (const realm of ['cn', 'global'] as const) {
-    try {
-      origins.add(new URL(getClientEndpointForRealm(realm, 'authApiBaseUrl')).origin);
-    } catch {
-      // è¯¥ realm æ¸…å•ä¸å¯ç”¨(å¯åŠ¨æ—©æœŸ/å¼‚å¸¸)æ—¶ä¸åŠ å…¥ â€”â€” fail-closedã€‚
-    }
-  }
-  return [...origins];
-});
-
-// â”€â”€ RSB browser bridge (browser-backend Phase 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Renderer â†’ main æ¡¥,æŠŠ RSB `<webview>` æ³¨å†Œåˆ° main ç«¯ TabRegistry,future
-// æµè§ˆå™¨è‡ªåŠ¨åŒ– backend(Phase 3+)æ¶ˆè´¹ webContents å¥æŸ„ã€‚
-// é¡¶å±‚æ³¨å†Œ:IPC handler æ˜¯ ipcMain.handle,åœ¨ app ready å‰æ³¨å†Œä¹Ÿæœ‰æ•ˆ;pin/unpin
-// é€šçŸ¥ç”¨çš„ host webContents é€šè¿‡ mainWindowRef lazy å–,ä¸»çª—æœªå°±ç»ªæ—¶é™é»˜è·³è¿‡
-// (pin çŠ¶æ€ç”± main ç«¯ registry ä¿æƒå¨,renderer ç«¯ä¼šé€šè¿‡ reconciliation è·Ÿä¸Š)ã€‚
-// â”€â”€ å³ä¾§æ ç‹¬ç«‹å­çª—å£(RSB window)â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// å³ä¾§æ å½“å‰è¿›ç¨‹å†…çš„åˆ†ç¦»çŠ¶æ€ + å­çª—å£ç”Ÿå‘½å‘¨æœŸçŠ¶æ€æœºã€‚detached ä¸”çª—å£å¼€ç€æ—¶,
-// RSB host(pin/unpin é€šçŸ¥ã€tab-op dispatch çš„ç›®æ ‡ renderer)æ˜¯å­çª—å£è€Œéžä¸»çª—,
-// ä¸‹æ–¹ä¸‰å¤„ RSB bridge wiring ç»Ÿä¸€ç» controller.getHostWebContents() è§£æžã€‚
-// deps å…¨éƒ¨æ˜¯ lazy é—­åŒ…(mainWindowRef / isQuitting åœ¨æ–‡ä»¶æ›´é åŽå£°æ˜Ž+èµ‹å€¼,
-// è°ƒç”¨æ—¶æœºè¿œæ™šäºŽæ­¤å¤„æž„é€ ),çŠ¶æ€æœºæœ¬ä½“è§ right-sidebar-window/controller.tsã€‚
-resetRsbWindowSettingsForStartup();
-const rsbWindowController = new RsbWindowController({
-  settings: { read: readRsbWindowSettings, writePatch: writeRsbWindowSettingsPatch },
-  createWindow: () => {
-    const window = createRightSidebarWindow();
-    const mainTarget =
-      mainWindowRef && !mainWindowRef.isDestroyed() && !mainWindowRef.webContents.isDestroyed()
-        ? mainWindowRef.webContents
-        : null;
-    if (mainTarget) {
-      inheritIOSSimulatorRendererSessionAccess(mainTarget, window.webContents);
-      // This renderer is still hidden for prewarm. Keep its Viewer buckets,
-      // but pause the inherited active mutation grant until it is shown.
-      syncIOSSimulatorRendererAccessForSessionChange(window.webContents, null);
-    }
-    return window;
-  },
-  getMainWindow: () => mainWindowRef,
-  broadcastState: (state) => {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      try {
-        win.webContents.send(MAKER_PUSH.RSB_WINDOW_STATE_CHANGED, state);
-      } catch {
-        // window torn down mid-broadcast â€” ignore
-      }
-    }
-  },
-  sendToWindow: (win, channel, payload) => {
-    try {
-      win.webContents.send(channel, payload);
-    } catch {
-      // window torn down mid-send â€” ignore
-    }
-  },
-  onWindowWillShow: (window) => {
-    const mainTarget =
-      mainWindowRef && !mainWindowRef.isDestroyed() && !mainWindowRef.webContents.isDestroyed()
-        ? mainWindowRef.webContents
-        : null;
-    const inherited = mainTarget
-      ? inheritIOSSimulatorRendererSessionAccess(mainTarget, window.webContents)
-      : false;
-    if (!inherited) {
-      // No authoritative Main snapshot is available. Never leave a cached
-      // sidebar's previous active mutation grant usable when it becomes visible.
-      syncIOSSimulatorRendererAccessForSessionChange(window.webContents, null);
-    }
-  },
-  onWindowHidden: (window) => {
-    syncIOSSimulatorRendererAccessForSessionChange(window.webContents, null);
-  },
-  contextChannel: MAKER_PUSH.RSB_WINDOW_CONTEXT_CHANGED,
-  commandChannel: MAKER_PUSH.RSB_WINDOW_COMMAND,
-  tabHandoffChannel: MAKER_PUSH.RSB_WINDOW_TAB_HANDOFF,
-  isQuitting: () => isQuitting,
-  canCloseWindow: () => !hasActiveRsbNativePopupSurfaces(),
-  resolveHostContext: resolveRsbHostContextFromSession,
-  log: createLogger('right-sidebar-window-controller'),
-});
-
-function isIOSSimulatorPluginActive(ghosts = getGhostManager().list()): boolean {
-  return ghosts.some(
-    (ghost) =>
-      ghost.enabled === true &&
-      ghost.manifest.iosSimulator === true &&
-      isGhostAvailableForActiveSession(ghost.manifest.id),
-  );
-}
-
-function resolveIOSSimulatorRendererWindow(
-  target: Parameters<typeof BrowserWindow.fromWebContents>[0],
-): BrowserWindow | null {
-  const owner = BrowserWindow.fromWebContents(target);
-  if (!owner || !isTrustedAppRendererWindow(owner)) return null;
-  const sidebarTarget = rsbWindowController.getVisibleSidebarWebContents();
-  const isSidebar = sidebarTarget === target;
-  if (!isSidebar && !isMainShellWindowUrl(owner.webContents.getURL())) return null;
-  return owner;
-}
-
-configureIOSSimulatorRendererTargets((preferredTarget) => {
-  if (!isIOSSimulatorPluginActive()) return null;
-  const mainTarget =
-    mainWindowRef && !mainWindowRef.isDestroyed() && !mainWindowRef.webContents.isDestroyed()
-      ? mainWindowRef.webContents
-      : null;
-  const sidebarTarget = rsbWindowController.getVisibleSidebarWebContents();
-  const belongsToMainFamily =
-    !preferredTarget || preferredTarget === mainTarget || preferredTarget === sidebarTarget;
-  if (!belongsToMainFamily) {
-    if (!preferredTarget || !resolveIOSSimulatorRendererWindow(preferredTarget as WebContents)) {
-      return null;
-    }
-    return {
-      grantTargets: [preferredTarget],
-      focusTarget: preferredTarget,
-    };
-  }
-  const grantTargets = [mainTarget, sidebarTarget].filter(
-    (target): target is NonNullable<typeof target> => Boolean(target),
-  );
-  const focusTarget = rsbWindowController.getHostWebContents() ?? preferredTarget ?? mainTarget;
-  return focusTarget ? { grantTargets, focusTarget } : null;
-});
-configureIOSSimulatorRendererAccessConfirmation(async (target, sessionId) => {
-  if (!isIOSSimulatorPluginActive()) return false;
-  const owner = resolveIOSSimulatorRendererWindow(target as WebContents);
-  if (!owner) return false;
-  const row = await getSessionRowSnapshot(sessionId);
-  if (!row || row.status !== 'active' || row.remoteHostId) return false;
-
-  const taskLabel =
-    sanitizeGhostNoticeText(row.title ?? '')
-      .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
-      .replace(/\s+/g, ' ')
-      .slice(0, 120) || t('rightSidebar.iosSimulator.accessDialogUntitledTask');
-  const result = await dialog.showMessageBox(owner, {
-    type: 'question',
-    title: t('rightSidebar.iosSimulator.accessDialogTitle'),
-    message: t('rightSidebar.iosSimulator.accessDialogMessage').replaceAll('{{task}}', taskLabel),
-    detail: t('rightSidebar.iosSimulator.accessDialogDetail'),
-    buttons: [
-      t('rightSidebar.iosSimulator.accessDialogAllow'),
-      t('rightSidebar.iosSimulator.accessDialogCancel'),
-    ],
-    defaultId: 1,
-    cancelId: 1,
-    noLink: true,
-  });
-  if (result.response !== 0 || owner.isDestroyed() || target.isDestroyed()) return false;
-  const current = await getSessionRowSnapshot(sessionId);
-  return Boolean(
-    current && current.status === 'active' && !current.remoteHostId && isIOSSimulatorPluginActive(),
-  );
-});
-configureIOSSimulatorAgentControlConfirmation(async (target, sessionId, instanceId) => {
-  if (!isIOSSimulatorPluginActive()) return false;
-  const owner = resolveIOSSimulatorRendererWindow(target as WebContents);
-  if (!owner) return false;
-  const row = await getSessionRowSnapshot(sessionId);
-  if (!row || row.status !== 'active' || row.remoteHostId) return false;
-  const status = await getIOSSimulatorSessionStatus(sessionId);
-  const instance = status.ok
-    ? status.instances.find((candidate) => candidate.instanceId === instanceId)
-    : undefined;
-  if (!instance) return false;
-
-  const taskLabel =
-    sanitizeGhostNoticeText(row.title ?? '')
-      .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
-      .replace(/\s+/g, ' ')
-      .slice(0, 120) || t('rightSidebar.iosSimulator.accessDialogUntitledTask');
-  const simulatorLabel = sanitizeGhostNoticeText(instance.simulatorName)
-    .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
-    .replace(/\s+/g, ' ')
-    .slice(0, 120);
-  const result = await dialog.showMessageBox(owner, {
-    type: 'warning',
-    title: t('rightSidebar.iosSimulator.agentControlDialogTitle'),
-    message: t('rightSidebar.iosSimulator.agentControlDialogMessage').replaceAll(
-      '{{simulator}}',
-      simulatorLabel,
-    ),
-    detail: t('rightSidebar.iosSimulator.agentControlDialogDetail').replaceAll(
-      '{{task}}',
-      taskLabel,
-    ),
-    buttons: [
-      t('rightSidebar.iosSimulator.agentControlDialogAllow'),
-      t('rightSidebar.iosSimulator.agentControlDialogCancel'),
-    ],
-    defaultId: 1,
-    cancelId: 1,
-    noLink: true,
-  });
-  if (result.response !== 0 || owner.isDestroyed() || target.isDestroyed()) return false;
-  const current = await getSessionRowSnapshot(sessionId);
-  return Boolean(
-    current && current.status === 'active' && !current.remoteHostId && isIOSSimulatorPluginActive(),
-  );
-});
-registerRsbWindowIpc({
-  controller: rsbWindowController,
-  getMainWindow: () => mainWindowRef,
-});
-
-// â”€â”€ æ’ä»¶åœé é¢æ¿ç‹¬ç«‹çª—å£(ghost panel window)â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// æ¯ ghostId ä¸€æ‰‡çª—:PanelChromeã€Œç‹¬ç«‹çª—å£ã€æŒ‰é’® â†’ setDetached(id, true) å¼€çª—,
-// ä¸»çª—å¸ƒå±€æ ‘é‡Œè¯¥ pane åœæ­¢æ¸²æŸ“(æ ‘ä¸åŠ¨);å…³çª—/åˆå¹¶å³å›žåœé ã€‚è£…/å¸/å¯åœå¹¿æ’­
-// ç» setGhostsChangedObserver å–‚ reconcile,å¤±åŽ»èµ„æ ¼çš„çª—å£å³æ—¶æ”¶æŽ‰ã€‚
-// deps åŒæ ·å…¨ lazy(isQuitting å£°æ˜Žåœ¨åŽ),çŠ¶æ€æœºè§ ghost-panel-window/controller.tsã€‚
-resetGhostPanelWindowSettingsForStartup();
-const ghostPanelWindowsController = new GhostPanelWindowsController({
-  settings: {
-    read: readGhostPanelWindowsSettings,
-    patchEntry: patchGhostPanelWindowEntry,
-    removeEntry: removeGhostPanelWindowEntry,
-  },
-  createWindow: (ghostId) => {
-    const ghost = getGhostManager()
-      .list()
-      .find((g) => g.manifest.id === ghostId);
-    const title = ghost?.manifest.panel?.title ?? ghost?.manifest.name ?? ghostId;
-    return createGhostPanelWindow(ghostId, title);
-  },
-  isGhostDetachable: (ghostId) => {
-    const ghost = getGhostManager()
-      .list()
-      .find((g) => g.manifest.id === ghostId);
-    return (
-      ghost !== undefined &&
-      ghost.enabled !== false &&
-      ghost.manifest.panel !== undefined &&
-      ghost.manifest.panel.position !== 'tab' &&
-      isGhostAvailableForActiveSession(ghostId)
-    );
-  },
-  broadcastState: (state) => {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      try {
-        win.webContents.send(MAKER_PUSH.GHOST_PANEL_WINDOW_STATE_CHANGED, state);
-      } catch {
-        // window torn down mid-broadcast â€” ignore
-      }
-    }
-  },
-  sendToWindow: (win, channel, payload) => {
-    try {
-      win.webContents.send(channel, payload);
-    } catch {
-      /* ignore */
-    }
-  },
-  isQuitting: () => isQuitting,
-  log: createLogger('ghost-panel-window-controller'),
-});
-registerGhostPanelWindowIpc(ghostPanelWindowsController);
-
-// â”€â”€ èµ„æºç›‘è§†å™¨è¾…åŠ©çª—å£ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// å•å®žä¾‹è½»é‡è¾…åŠ©çª—å£:é¡¶éƒ¨èœå•ã€Œèµ„æºç›‘è§†å™¨ã€â†’ open()ã€‚ä¸éœ€è¦ detach/attach åå¥½ã€
-// ä¸éœ€è¦ session ä¸Šä¸‹æ–‡è½¬å‘ã€‚åŽå°é¢„çƒ­åŽå¸¸é©»å¤ç”¨ï¼Œæ™®é€šå…³çª—åªéšè—ã€‚
-// macOS ä½¿ç”¨ç‹¬ç«‹é¡¶å±‚çª—å£ï¼Œæ‰“å¼€æ—¶ä¿ç•™ç³»ç»ŸåŽŸç”Ÿ Space / å…¨å±å‘ˆçŽ°ï¼Œä¸å†ç”± controller
-// ä¸»åŠ¨é•œåƒ ownerï¼›Windows / Linux ä¿æŒ parent å…³ç³»ã€‚owner æœ€å°åŒ–æˆ–å…³åˆ°æ‰˜ç›˜æ—¶ä»ä¸€èµ·æ”¶èµ·ã€‚
-const resourceUsageWindowController = new ResourceUsageWindowController({
-  createWindow: () => {
-    const owner = mainWindowRef;
-    return createResourceUsageWindow(owner && !owner.isDestroyed() ? owner : undefined);
-  },
-  isOpenSender: (sender) =>
-    isResourceUsageOpenSender({
-      sender,
-      mainWindow: mainWindowRef,
-      senderWindow: BrowserWindow.fromWebContents(sender),
-      isSecondaryAppWindow,
-    }),
-  getOwnerWindow: (sender) => {
-    const senderWindow = BrowserWindow.fromWebContents(sender);
-    if (senderWindow && !senderWindow.isDestroyed()) return senderWindow;
-    const owner = mainWindowRef;
-    if (!owner || owner.isDestroyed()) return null;
-    return owner;
-  },
-});
-registerResourceUsageWindowIpc({ controller: resourceUsageWindowController });
-const remoteDesktopViewerWindows = new RemoteDesktopViewerWindows((sender) =>
-  isResourceUsageOpenSender({
-    sender,
-    mainWindow: mainWindowRef,
-    senderWindow: BrowserWindow.fromWebContents(sender),
-    isSecondaryAppWindow,
-  }),
-);
-remoteDesktopViewerWindows.register();
-
-setGhostsChangedObserver((ghosts) => {
-  ghostPanelWindowsController.reconcile(ghosts);
-  if (!isIOSSimulatorPluginActive(ghosts)) clearIOSSimulatorRendererAccess();
-});
-
-const rsbBrowserRegistry = getRsbBrowserBridge();
-registerRsbNativePopupSurfaceIpc(rsbBrowserRegistry);
-registerRsbBrowserBridgeIpc({
-  registry: rsbBrowserRegistry,
-  getHostWebContents: () => rsbWindowController.getHostWebContents(),
-  getNativePopupOwnerWebContents: getRsbNativePopupOwnerWebContents,
-  logger: createLogger('rsb-browser-bridge-bootstrap'),
-});
-// popup opener åæŸ¥:webview-security çš„ popup è·¯ç”±æ®æ­¤æŠŠ window.open çš„ç›®æ ‡
-// tab å½’å±žåˆ°å‘èµ·æ–¹ tab çš„ session(è€Œä¸æ˜¯ç”¨æˆ·æ­£åœ¨çœ‹çš„ session)ã€‚
-setRsbPopupOpenerResolver((webContentsId) => {
-  const record = getRsbBrowserBridge().findByWebContentsId(webContentsId);
-  return record ? { tabId: record.tabId, sessionId: record.sessionId } : null;
-});
-// report åˆ°è¾¾äº‹ä»¶è®¢é˜…:å½’å±žç­‰å¾…ä»Žå›ºå®šè½®è¯¢çª—å£å‡çº§ä¸ºäº‹ä»¶é©±åŠ¨ â€”â€” report è½åœ°çš„
-// çž¬é—´å®ŒæˆåæŸ¥,è¶…æ—¶åªå…œ"report æ°¸ä¸æ¥"çš„æžç«¯åœºæ™¯ã€‚
-setRsbPopupOpenerReportSubscriber((listener) =>
-  getRsbBrowserBridge().onReport((record) => listener(record.webContentsId)),
-);
-// popup è·¯ç”±ç›®æ ‡ host åŠ¨æ€è§£æž:å¼‚æ­¥ç­‰å¾…(å½’å±žåæŸ¥ / deferred URL æ•èŽ·)æœŸé—´ç”¨æˆ·
-// detach ä¾§è¾¹æ æˆ–åˆ‡è§†å›¾åŽ,æ•èŽ·æ—¶çš„ hostContents å·²è¿‡æ—¶ â€”â€” å‘é€æ—¶åˆ»æŒ‰å½“å‰å®¿ä¸»
-// å½¢æ€è§£æž(ä¸Ž tab-op bridge åŒä¸€æ¥æº),æ¶ˆæ¯æ‰èƒ½è½åˆ°æ´»ç€çš„è®¢é˜…è€…ã€‚
-setRsbPopupHostResolver(() => rsbWindowController.getHostWebContents());
-// Tab-op result handler for the main â†’ renderer request/response bridge â€”
-// RsbWebviewBackend (Phase 3) uses this to drive `open` / `focus` / `close`
-// against the renderer's RSB store.
-registerTabOpResultHandler({
-  getHostWebContents: () => rsbWindowController.getHostWebContents(),
-  logger: createLogger('rsb-browser-bridge-renderer-bridge'),
-});
-
-// Phase 5: wire the host accessor into the backend module so the
-// RsbWebviewBackend's renderer-bridge can reach the host renderer for
-// tab-op dispatch, then register the Settings-driven backend toggle IPC.
-// The accessor resolves through the RSB window controller: detached + open â†’
-// sidebar window renderer, otherwise the main window (lazy closure over
-// `mainWindowRef`, assigned later in `createMainWindow`). `ensureHost` lets
-// an automation tab-op pop the sidebar window first when the user prefers
-// detached mode but has the window closed.
-setMainWindowAccessorForBackend(() => rsbWindowController.getHostWebContents());
-setEnsureHostForBackend((sessionId) => rsbWindowController.ensureOpenForAutomation({ sessionId }));
-setIsDetachedForBackend(() => readRsbWindowSettings().detached);
-setBrowserSessionUploadRootResolver(async (sessionId) => {
-  try {
-    const meta = await getMakerCore().getSessionMeta(sessionId);
-    if (!meta?.workDir || meta.remoteHostId) return [];
-    return [meta.workDir];
-  } catch {
-    return [];
-  }
-});
-registerBrowserBackendIpc();
-
-// â”€â”€ åº”ç”¨çº§å¿«æ·é”® override å­˜å‚¨ IPC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// renderer å¯åŠ¨åŒæ­¥æ‹‰ overridesã€è®¾ç½®é¡µå†™è·¯å¾„ã€changed å¹¿æ’­ã€‚é¡¶å±‚æ³¨å†Œ,
-// ipcMain.handle åœ¨ app ready å‰æ³¨å†Œä¹Ÿæœ‰æ•ˆã€‚
-registerAppShortcutIpc();
-registerAppearanceSettingsIpc();
-registerLoginItemIpc();
-
-// â”€â”€ èµ„æºç”¨é‡é¢æ¿ IPC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// è®¢é˜…é©±åŠ¨é‡‡æ ·(é¢æ¿ä¸å¼€ä¸é‡‡æ ·),interval å·² unref ä¸æ‹–é€€å‡º;terminate åªè®¤
-// æœ¬äº§å“ spawn çš„ agent æ ¹è¿›ç¨‹ã€‚è§ main/process-monitor/ã€‚
-registerProcessMonitorIpc({
-  allowsSampling: (sender) => resourceUsageWindowController.allowsProcessMonitorSampling(sender),
-});
-
-// â”€â”€ ä¸»ç•Œé¢å¸ƒå±€æ ‘å­˜å‚¨ IPCâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// renderer é¦–å¸§ sendSync æ‹‰å¸ƒå±€(è§„åˆ™ 7 æ— è·³å˜)ã€set/reset å†™è·¯å¾„ã€changed
-// å¹¿æ’­ã€‚æ³¨å†Œæ—¶é¡ºå¸¦ ensurePersisted:userData è½ layout.v1.json + æŸåè‡ªæ„ˆã€‚
-registerLayoutIpc();
-
-// â”€â”€ æ„è¯†ä»“åº“ IPCâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// renderer é¦–å¸§ sendSync æ‹‰å·²è£…æ„è¯†æ¸…å•(æ„è¯†é¢æ¿ä¸Žå†…ç½®é¢æ¿åŒå¸§æ³¨å†Œ,è§„åˆ™ 7
-// æ— è·³å˜)ã€install/uninstall å†™è·¯å¾„ã€changed å¹¿æ’­ã€‚è§ main/cindy-brain/ã€‚
-// å›¾ç‰‡é€šé“çš„ ChatGPT é‰´æƒå¿…é¡»ç”± Main é™æ€è£…é…ï¼›ç¦æ­¢åœ¨è¯·æ±‚æ—¶ import maker-host
-// ç”Ÿæˆå»¶è¿Ÿ chunkï¼ˆMain bundle åå‘ require ä¼šé‡å¤æ‰§è¡Œå¯åŠ¨å‰¯ä½œç”¨ï¼‰ã€‚
-setCodexImageAuthBinding({
-  hasAuth: (providerId) => codexAccountState(providerId).authenticated,
-  getAuth: getChatgptBridgeAuth,
-  onAuthFailure: invalidateChatgptBridgeAuth,
-});
-registerGhostIpc();
-registerPluginMarketIpc();
-registerPluginPublisherIpc();
-setAppSessionCommitBoundaryHook(() => {
-  clearAllSessionAttention();
-  remoteDesktopViewerWindows.reset();
-  ghostPanelWindowsController.closeForOwnerChange();
-  clearAllSessionProviders();
-  clearAllSessionRuntimeAxes();
-  clearAllSessionRuntimeControlStates();
-});
-authManager.setStableOwnerPostCommitTask(async ({ reason, scopeKey, dataOwnerId }) => {
-  const builtinOutcome = await runStableOwnerPostCommitTask(reason, { scopeKey, dataOwnerId });
-  if (builtinOutcome === 'deferred') return builtinOutcome;
-
-  let needsRetry = builtinOutcome === 'retry-pending' || builtinOutcome === 'failed';
-  // Signed-out is a real stable scope for account-free bundled provisioning.
-  // Market and OAuth are owner-private follow-ups and stay behind this gate.
-  if (dataOwnerId === null) return needsRetry ? 'failed' : 'completed';
-  let deferred = false;
-  const marketOutcome = await syncDefaultMarketPlugins();
-  if (marketOutcome === 'failed') needsRetry = true;
-  if (marketOutcome === 'deferred') deferred = true;
-
-  try {
-    const oauthCompleted = await reconcileGhostOauthAccountsForActiveOwner();
-    if (!oauthCompleted) deferred = true;
-  } catch (error) {
-    createLogger('ghost-oauth-owner-reconcile').warn(
-      'OAuth account reconciliation for active owner failed',
-      { error: error instanceof Error ? error.message : String(error) },
-    );
-    needsRetry = true;
-  }
-
-  return needsRetry ? 'failed' : deferred ? 'deferred' : 'completed';
-});
-
-// â”€â”€ Custom protocol registration (image-local-cache M2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// MUST run before app.whenReady(), and MUST be a SINGLE call:
-// registerSchemesAsPrivileged replaces the whole privileged-scheme list every
-// time it runs, so per-module calls silently wipe each other â€” only the last
-// caller's scheme keeps its privileges. That exact bug shipped once (xdt-model
-// lost supportFetchAPI when cindy-remote-media registered after it â†’ 3D preview
-// stuck on poster). Every protocol module therefore only EXPORTS its privilege
-// entry; this is the one place that registers them.
-//   xdt-image:        locally cached chat images (<img>)
-//   xdt-video:        locally cached videos; Range ç”± handler æ‰‹åŠ¨ 206 åˆ‡ç‰‡
-//                     (stream:false æ˜¯çŽ°çŠ¶è¯­ä¹‰,ä¸åœ¨æ­¤å¤„æ”¹)
-//   xdt-file:         arbitrary local file previews (extension whitelist)
-//   xdt-audio:        local audio files (<audio>, Range åŒ video æ‰‹åŠ¨å¤„ç†)
-//   xdt-model:        mivo 3D model cache â€” <model-viewer> ç”¨ fetch() æ‹‰æ¨¡åž‹,
-//                     supportFetchAPI ä¸¢å¤±å³é™é»˜ç™½å±,å‹¿åŠ¨
-//   cindy-remote-media: device-link å…¥æ–¹å‘åª’ä½“(è¢«æŽ§ç«¯å­—èŠ‚ç» OSS ä¸­è½¬)
-//   cindy-ghost:      æ„è¯†æ²™ç®±æ–‡ä»¶ä¾›ç‰‡(handler æŒ‚åœ¨æ¯æ„è¯†ä¸“å±ž session åˆ†åŒº,
-//                     åªè®¤è‡ªå·±å®‰è£…ç›®å½•;docs/dev-rules/plugin-security-and-authoring.md)
-//   cindy-media:      åª’ä½“æ€»ä»“å­—èŠ‚ä»“å–ä»¶çª—å£(å†…å®¹å¯»å€ blob;æ–°å†™å…¥åª’ä½“çš„
-//                     ç»Ÿä¸€åè®®,åŽ†å² xdt-* åè®®åªè¯»å…¼å®¹)
-protocol.registerSchemesAsPrivileged([
-  {
-    scheme: 'cindy-desktop-capture',
-    privileges: { standard: true, secure: true, supportFetchAPI: true },
-  },
-  imageSchemePrivilege,
-  videoSchemePrivilege,
-  localFileSchemePrivilege,
-  audioFileSchemePrivilege,
-  modelSchemePrivilege,
-  remoteMediaSchemePrivilege,
-  cindyGhostSchemePrivilege,
-  cindyMediaSchemePrivilege,
-]);
-
-import started from 'electron-squirrel-startup';
-
-import { APPLICATION_MENU_LABELS, type ApplicationMenuLocale } from './applicationMenuLabels.js';
-import { installCindyCliCommand, CLI_COMMAND_NAME } from './installCliCommand.js';
-
-if (started) {
-  app.quit();
-}
-
-// (Removed: one-shot mivo retirement migration. Mivo MCP was reactivated
-// in this branch â€” see packages/lizi-mcps/src/mivo/. The cleanup migration
-// was deleting the freshly-saved mivo_api_key.enc on every startup, gating
-// the LiziMcpProvider off so LLM never saw mivo tools. The migration is no
-// longer wanted; if a user genuinely never used mivo, the absent file
-// remains absent and nothing happens â€” no migration needed.)
-
-// â”€â”€ Wait for in-flight update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// The update script creates a .updating lock file while robocopy replaces
-// app files. If we launch during that window, the exe/DLLs may be half-
-// written â†’ crash. Block here (synchronously) until the lock disappears.
-{
-  const lockPath = getUpdateLockPath();
-  // Windows / mac çƒ­æ›´çª—å£å¾ˆçŸ­ã€‚Linux pkexec è¦ç”¨æˆ·è¾“å…¥å¯†ç ï¼Œæ›´æ–°è„šæœ¬ä¼š
-  // å¿ƒè·³åˆ·æ–°è¿™æŠŠé”å¹¶æŠŠè‡ªå·±çš„ PID å†™è¿›é”å†…å®¹ï¼›åªè¦ PID è¿˜æ´»ç€ä¸”å¿ƒè·³æ–°é²œï¼Œ
-  // å°±ä¸èƒ½æ¸…æŽ‰è¿™æŠŠé”â€”â€”å¦åˆ™æ—§è¿›ç¨‹ä¼šåœ¨å®‰è£…ä¸­é€”å¯åŠ¨ï¼Œè¢« root æ›¿æ¢æ–‡ä»¶ã€‚
-  const maxWaitMs = process.platform === 'linux' ? 30 * 60 * 1000 : 30_000;
-  const staleAfterMs = process.platform === 'linux' ? 20_000 : 30_000;
-  const pollMs = 500;
-  const start = Date.now();
-  // å¯åŠ¨é˜¶æ®µè¿˜æ²¡æœ‰ UIï¼Œå¿…é¡»åŒæ­¥ç­‰é”ã€‚Atomics.wait ä¼šè®©å‡º CPUï¼Œ
-  // é¿å…åŽŸæ¥çš„ç©ºè½¬åœ¨ Linux è¾“å¯†ç æœŸé—´å æ»¡ä¸€æ ¸ã€‚
-  const lockWait = new Int32Array(new SharedArrayBuffer(4));
-  const readLockPid = (): number | null => {
-    try {
-      const raw = fs.readFileSync(lockPath, 'utf8');
-      const pid = Number(raw.trim().split(/\s+/).pop());
-      return Number.isInteger(pid) && pid > 0 ? pid : null;
-    } catch {
-      return null;
-    }
-  };
-  const pidAlive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  // ä¸»è¿›ç¨‹åœ¨ spawn å‰é¢„å»ºé”(æŒæœ‰è€… = ä¸»è¿›ç¨‹ PID),spawn äº‹ä»¶åŽé€€å‡º;
-  // æ›´æ–°è„šæœ¬æŽ¥ç®¡åŽå†æŠŠè‡ªå·±çš„ PID å†™è¿›åŽ»ã€‚è¿™ä¸­é—´æœ‰æ¯«ç§’çº§çš„äº¤æŽ¥çª—å£:
-  // é”é‡Œçš„ä¸»è¿›ç¨‹ PID å·²æ­»ä½† mtime æžæ–°,ä¸èƒ½å½“æ­»é”æ¸…æŽ‰â€”â€”ç»™ 5s äº¤æŽ¥
-  // å®½é™,æœŸé—´ç»§ç»­ç­‰è„šæœ¬æŽ¥ç®¡ã€‚
-  const handoffGraceMs = 5_000;
-  // å­¤å„¿å¿ƒè·³å…œåº•:å¦‚æžœæŒæœ‰è€… PID å·²æ­»ã€å¿ƒè·³å´æŒç»­åˆ·æ–°é”(æ›´æ–°è„šæœ¬è¢«
-  // å•ç‹¬ killã€å¿ƒè·³å­è¿›ç¨‹è¿˜æ´»ç€),ä¸èƒ½æ— é™ç­‰ã€‚å¿ƒè·³æ¯æ¬¡ 5s åˆ·æ–°,è¿žç»­
-  // 3 ä¸ªå¿ƒè·³å‘¨æœŸéƒ½çœ‹åˆ°ã€ŒPID æ­» + mtime æ–°ã€å°±åˆ¤å®šä¸ºå­¤å„¿,æ¸…é”ç»§ç»­å¯åŠ¨ã€‚
-  const orphanGraceMs = staleAfterMs * 2 + 5_000;
-  let deadButFreshSinceMs: number | null = null;
-  // è®°å½•æ˜¯å¦åœ¨é”ä¸Šç­‰è¿‡,ä¾›ç­‰é”å®žä¾‹é†’æ¥åŽ exec è‡ªå·±(è§å¾ªçŽ¯ä¸‹æ–¹)ã€‚
-  let waitedForUpdateLock = false;
-  while (fs.existsSync(lockPath)) {
-    waitedForUpdateLock = true;
-    if (process.platform === 'linux') {
-      const holderPid = readLockPid();
-      // å¸¦ PID çš„æ–°é”:æ´»é” = å¿ƒè·³æ–°é²œ ä¸”(æŒæœ‰è€…å­˜æ´» æˆ– å¤„äºŽäº¤æŽ¥å®½é™)ã€‚
-      if (holderPid !== null) {
-        const mtimeMs = (() => {
-          try {
-            return fs.statSync(lockPath).mtimeMs;
-          } catch {
-            return null;
-          }
-        })();
-        if (mtimeMs === null) break;
-        const ageMs = Date.now() - mtimeMs;
-        const fresh = ageMs <= staleAfterMs;
-        const inHandoff = ageMs <= handoffGraceMs;
-        const holderAlive = pidAlive(holderPid);
-        if (fresh && (holderAlive || inHandoff)) {
-          Atomics.wait(lockWait, 0, 0, pollMs);
-          continue;
-        }
-        // å¿ƒè·³æ–°é²œä½†æŒæœ‰è€…å·²æ­»:è¶…è¿‡äº¤æŽ¥å®½é™å°±å¼€å§‹è®¡å­¤å„¿æ—¶é•¿ã€‚
-        if (fresh && !holderAlive) {
-          if (deadButFreshSinceMs === null) deadButFreshSinceMs = Date.now();
-          if (Date.now() - deadButFreshSinceMs < orphanGraceMs) {
-            Atomics.wait(lockWait, 0, 0, pollMs);
-            continue;
-          }
-          break;
-        }
-        break;
-      }
-      // è€æ ¼å¼é”(æ²¡æœ‰ PID):é€€å›žåŽŸæ¥çš„æ€»æ—¶é•¿ä¸Šé™ã€‚
-      if (Date.now() - start >= maxWaitMs) break;
-      Atomics.wait(lockWait, 0, 0, pollMs);
-      continue;
-    }
-    const holderPid = readLockPid();
-    const holderAlive = holderPid !== null && pidAlive(holderPid);
-    const elapsedMs = Date.now() - start;
-    if (
-      shouldKeepWaitingForWindowsUpdateLock({
-        lockExists: true,
-        elapsedMs,
-        maxWaitMs,
-        holderPid,
-        holderAlive,
-        unlinkFailed: false,
-        sharingViolation: false,
-      })
-    ) {
-      Atomics.wait(lockWait, 0, 0, pollMs);
-      continue;
-    }
-    let unlinkFailed = false;
-    let sharingViolation = false;
-    try {
-      fs.unlinkSync(lockPath);
-    } catch (error) {
-      unlinkFailed = fs.existsSync(lockPath);
-      sharingViolation = unlinkFailed && isWindowsUpdateLockSharingViolation(error);
-    }
-    if (
-      shouldKeepWaitingForWindowsUpdateLock({
-        lockExists: fs.existsSync(lockPath),
-        elapsedMs,
-        maxWaitMs,
-        holderPid,
-        holderAlive,
-        unlinkFailed,
-        sharingViolation,
-      })
-    ) {
-      Atomics.wait(lockWait, 0, 0, pollMs);
-      continue;
-    }
-    break;
-  }
-  // If still locked after the wait, proceed anyway (stale lock).
-  // é”å·²ä¸å­˜åœ¨(æ›´æ–°è„šæœ¬æ­£å¸¸æ¸…æŽ‰)åŒæ ·ç®—å·²æ¸…â€”â€”ç­‰é”å®žä¾‹å¿…é¡»èµ°
-  // ã€Œæ‹‰èµ·æ–°è¿›ç¨‹é€€å‡ºã€è·¯å¾„,å¦åˆ™æ—§ä»£ç ç»§ç»­è·‘ã€‚
-  let lockCleared = !fs.existsSync(lockPath);
-  try {
-    fs.unlinkSync(lockPath);
-    lockCleared = true;
-  } catch {
-    lockCleared = !fs.existsSync(lockPath);
-  }
-
-  // Linux:è¿™ä¸ªå®žä¾‹åœ¨é”ä¸Šç­‰è¿‡(è¯´æ˜Žä¸€æ¬¡åº”ç”¨å†…æ›´æ–°åˆšåˆšå®Œæˆ)ã€‚å®ƒåŠ è½½çš„
-  // æ˜¯å®‰è£…å‰çš„æ—§ä»£ç ,ç›´æŽ¥ç»§ç»­ä¼šä¸Žæ›´æ–°è„šæœ¬åˆšæ‹‰èµ·çš„æ–°å®žä¾‹æŠ¢å•å®žä¾‹é”,
-  // æŠ¢èµ¢çš„è¯æ—§ä»£ç ä¼šå¸¦ç€æ–°èµ„æºæ··è·‘ã€‚ç­‰é”çš„å®žä¾‹é†’æ¥åŽæ‹‰ä¸€ä¸ªæ–°è¿›ç¨‹
-  // (åŠ è½½ç£ç›˜ä¸Šçš„æ–°äºŒè¿›åˆ¶)å¹¶ç«‹å³é€€å‡º,å•å®žä¾‹é”ä¸¤è¾¹éƒ½å·²æ˜¯æ–°ä»£ç ã€‚
-  // åªæœ‰é”ç¡®å®žåˆ æŽ‰äº†æ‰èµ°è¿™æ¡è·¯:åˆ ä¸æŽ‰(ç›®å½•åªè¯»/æƒé™è¢«æ”¹)è¯´æ˜Žæ›´æ–°
-  // è„šæœ¬æˆ–çŽ¯å¢ƒä»è®¤ä¸ºæ›´æ–°åœ¨è¿›è¡Œ,ç»§ç»­æŒ‰åŽŸç­–ç•¥æ”¾è¡Œä¼šè®©è‡ªå·±é™·å…¥ã€Œæ‹‰èµ·
-  // æ–°è¿›ç¨‹ â†’ æ–°è¿›ç¨‹åˆè§é”ç­‰å¾… â†’ å†æ‹‰èµ·ã€çš„é‡å¯å¾ªçŽ¯ã€‚
-  if (process.platform === 'linux' && waitedForUpdateLock && lockCleared) {
-    try {
-      const exe = process.execPath;
-      // Imports are deliberately not carried across an update restart. The user
-      // can click the original link again; never copy its credentials to a child.
-      redactConsumedDeepLinkInArgv(process.argv);
-      const args = process.argv.slice(1);
-      spawn(exe, args, { stdio: 'inherit', detached: true }).unref();
-    } catch {
-      /* ignore */
-    }
-    process.exit(0);
-  }
-}
-
-// â”€â”€ File-attachment path policy (F-FI-7 å®‰å…¨) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Shared by `read-file-for-attachment`, `peek-file-header`,
-// `text-file:read-preview` and `shell:open-path`. Blocks access to OS
-// system directories that an attachment pipeline has no legitimate reason
-// to touch â€” defence in depth on top of the absolute-path check.
-//
-// The blocklist + containment check now live in `filePathPolicy.ts` so the
-// auto-loaded `xdt-file://` media protocol can reuse the same model (with a
-// stricter, credential-aware superset). Behavior for the callers here is
-// unchanged: same system dirs, same resolve/normalize + case-insensitive-on-
-// win32 comparison with separator-boundary safety.
-const SYSTEM_PATH_BLOCKLIST: string[] = buildSystemPathBlocklist();
-
-// ApplicationMenuCommand ä»Ž ../shared/applicationMenuCommands å•ç‚¹å¯¼å…¥ã€‚
-// åº”ç”¨èœå•å››è¯­æ ‡ç­¾æŠ½åˆ° ./applicationMenuLabels,ä½¿æœ¯è¯­é—¨ç¦èƒ½ç›´æŽ¥ import æ‰«æ(è§è¯¥æ–‡ä»¶æ³¨é‡Š)ã€‚
-
-function resolveApplicationMenuLocale(raw: string | null | undefined): ApplicationMenuLocale {
-  return resolveSystemLocale(raw);
-}
-
-function getPreferredApplicationLocale(): ApplicationMenuLocale {
-  const langs = app.getPreferredSystemLanguages();
-  return resolvePreferredSystemLocale(langs.length > 0 ? langs : [app.getLocale()]);
-}
-
-function dispatchApplicationMenuCommand(
-  menuWindow: BrowserWindow,
-  command: ApplicationMenuCommand,
-  options: { activateWindow?: boolean } = {},
-): void {
-  const mainWindow = mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef : menuWindow;
-  if (mainWindow.isDestroyed()) return;
-  const activateWindow = options.activateWindow ?? true;
-  if (activateWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-  }
-
-  const sendCommand = () => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('app-menu:command', command);
-    }
-  };
-
-  if (mainWindow.webContents.isLoading()) {
-    mainWindow.webContents.once('did-finish-load', sendCommand);
-  } else {
-    sendCommand();
-  }
-}
-
-/**
- * èœå• accelerator ä»Ž app-shortcuts store å–ç”Ÿæ•ˆå€¼ (é»˜è®¤ + ç”¨æˆ· override)ã€‚
- * ç»„åˆæ— æ³•è¡¨è¾¾ä¸º Electron accelerator æ—¶è¿”å›ž undefined â€”â€” èœå•é¡¹ä¸å¸¦
- * accelerator (ç‚¹å‡»ä»å¯ç”¨), å®žé™…æŒ‰é”®ç”± renderer / before-input-event åŒ¹é…è·¯å¾„ç”Ÿæ•ˆã€‚
- */
-function menuAcceleratorFor(id: AppShortcutId): string | undefined {
-  const first = getAppShortcutStore().getEffectiveCombos(id)[0];
-  if (!first) return undefined;
-  return comboToElectronAccelerator(first, process.platform) ?? undefined;
-}
-
-function nativeMenuRoleLabel(role: 'resetZoom' | 'zoomIn' | 'zoomOut'): string {
-  try {
-    return Menu.buildFromTemplate([{ role }]).items[0]?.label ?? role;
-  } catch {
-    return role;
-  }
-}
-
-function persistedZoomMenuItem(
-  role: 'resetZoom' | 'zoomIn' | 'zoomOut',
-  delta: number | null,
-  registerAccelerator: boolean,
-): Electron.MenuItemConstructorOptions {
-  const accelerator =
-    role === 'resetZoom'
-      ? 'CommandOrControl+0'
-      : role === 'zoomIn'
-        ? 'CommandOrControl+Plus'
-        : 'CommandOrControl+-';
-  return {
-    label: nativeMenuRoleLabel(role),
-    accelerator,
-    registerAccelerator,
-    click: () => {
-      void updatePersistedWindowZoom(delta).catch((error: unknown) => {
-        createLogger('appearance-settings-menu').error('persisted page zoom update failed', {
-          role,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-    },
-  };
-}
-
-function persistedZoomMenuItems(
-  role: 'resetZoom' | 'zoomIn' | 'zoomOut',
-  delta: number | null,
-  registerAccelerator: boolean,
-): Electron.MenuItemConstructorOptions[] {
-  const item = persistedZoomMenuItem(role, delta, registerAccelerator);
-  if (process.platform !== 'darwin' || role !== 'zoomIn') return [item];
-
-  // macOS treats âŒ˜= (unshifted Equal) and â‡§âŒ˜= (Plus) as separate accelerator
-  // paths. Keep the second path registered while leaving one visible menu item.
-  return [
-    item,
-    {
-      ...item,
-      id: 'persisted-page-zoom-in-unshifted',
-      accelerator: 'CommandOrControl+=',
-      visible: false,
-      acceleratorWorksWhenHidden: true,
-    },
-  ];
-}
-
-function installApplicationMenu(
-  mainWindow: BrowserWindow,
-  locale: ApplicationMenuLocale = getPreferredApplicationLocale(),
-): void {
-  if (process.platform !== 'darwin') {
-    Menu.setApplicationMenu(null);
-    return;
-  }
-
-  const labels = APPLICATION_MENU_LABELS[locale];
-  // Toggle Sidebar: ç”¨ registerAccelerator: false â€”â€” èœå•æ˜¾ç¤º âŒ˜B æ ‡ç­¾ä¸”å¯ç‚¹å‡»,
-  // ä½†ä¸å‘ OS æ³¨å†Œçƒ­é”®ã€‚çœŸæ­£æŒ‰é”®ç”± MainLayout é‡Œçš„ renderer keydown å¤„ç† (é‚£æ®µ
-  // ä¼šè·³è¿‡éž Tiptap çš„ contenteditable, ä¿ç•™å¯Œæ–‡æœ¬ç¼–è¾‘å™¨è‡ªå·±çš„ Bold èƒ½åŠ›)ã€‚
-  const toggleSidebarItem: Electron.MenuItemConstructorOptions = {
-    label: labels.toggleSidebar,
-    accelerator: menuAcceleratorFor('toggle-sidebar'),
-    registerAccelerator: false,
-    click: () => dispatchApplicationMenuCommand(mainWindow, 'toggle-sidebar'),
-  };
-  // Release åŒ…å‰”é™¤ reload / forceReload / toggleDevTools â€” è¿™ä¸‰é¡¹é»˜è®¤ accelerator
-  // (Cmd+R / Shift+Cmd+R / Alt+Cmd+I) ä¼šæŠŠ renderer æ•´é¡µåˆ·æŽ‰,ä¸¢æŽ‰ streaming ä¸­çš„
-  // agent turnã€composer è‰ç¨¿ç­‰å†…å­˜æ€ã€‚dev æ¨¡å¼ä¸‹å±•å¼€é»˜è®¤ viewMenu çš„é¡¹, æŠŠ
-  // Toggle Sidebar æ’åˆ°é¡¶éƒ¨ (role: 'viewMenu' ä¸å…è®¸åœ¨é‡Œé¢è¿½åŠ è‡ªå®šä¹‰é¡¹)ã€‚
-  // è®¾ç½®é¡µå½•åˆ¶å¿«æ·é”®æœŸé—´ä¸å‘ç³»ç»Ÿæ³¨å†Œèœå• accelerator (æ ‡ç­¾ä»æ˜¾ç¤º), å¦åˆ™å½•åˆ¶
-  // âŒ˜N / âŒ˜R / âŒ˜0 ç­‰ä¼šè¢«èœå•å…ˆåƒæŽ‰ç›´æŽ¥è§¦å‘å‘½ä»¤, ç ´åå½•åˆ¶æ€äº’æ–¥ã€‚å½•åˆ¶ç»“æŸç”±
-  // subscribeAppShortcutRecording å›žè°ƒé‡å»ºèœå•æ¢å¤æ³¨å†Œã€‚
-  const registerMenuAccelerators = !isAppShortcutRecordingActive();
-  const viewMenu: Electron.MenuItemConstructorOptions = app.isPackaged
-    ? {
-        label: labels.viewMenu,
-        submenu: [
-          toggleSidebarItem,
-          { type: 'separator' },
-          ...persistedZoomMenuItems('resetZoom', null, registerMenuAccelerators),
-          ...persistedZoomMenuItems('zoomIn', PAGE_ZOOM_FACTOR_STEP, registerMenuAccelerators),
-          ...persistedZoomMenuItems('zoomOut', -PAGE_ZOOM_FACTOR_STEP, registerMenuAccelerators),
-          { type: 'separator' },
-          { role: 'togglefullscreen', registerAccelerator: registerMenuAccelerators },
-        ],
-      }
-    : {
-        label: labels.viewMenu,
-        submenu: [
-          toggleSidebarItem,
-          { type: 'separator' },
-          { role: 'reload', registerAccelerator: registerMenuAccelerators },
-          { role: 'forceReload', registerAccelerator: registerMenuAccelerators },
-          { role: 'toggleDevTools', registerAccelerator: registerMenuAccelerators },
-          { type: 'separator' },
-          ...persistedZoomMenuItems('resetZoom', null, registerMenuAccelerators),
-          ...persistedZoomMenuItems('zoomIn', PAGE_ZOOM_FACTOR_STEP, registerMenuAccelerators),
-          ...persistedZoomMenuItems('zoomOut', -PAGE_ZOOM_FACTOR_STEP, registerMenuAccelerators),
-          { type: 'separator' },
-          { role: 'togglefullscreen', registerAccelerator: registerMenuAccelerators },
-        ],
-      };
-
-  // åº”ç”¨åç›¸å…³æ–‡æ¡ˆä¸€å¾‹èµ° BRAND_NAME(å±•ç¤ºå),ä¸ç”¨ app.getName():åŽè€…è¿”å›ž
-  // package.json productName(è¿‡æ¸¡æœŸä»æ˜¯ xdt-maker,æœºå™¨èº«ä»½ä¸è®¸è·Ÿéšæ”¹å,
-  // è§ maker-shared/branding.ts é¡¶æ³¨)ã€‚hide/quit role çš„é»˜è®¤æ ‡ç­¾ä¹Ÿåƒ app.name,
-  // æ‰€ä»¥æ˜¾å¼ç»™ labelã€‚macOS èœå•æ ç¬¬ä¸€é¡¹çš„ç²—ä½“æ ‡é¢˜ä¸åƒè¿™é‡Œçš„ label(ç³»ç»Ÿå–è‡ª
-  // å¯æ‰§è¡Œ bundle çš„ Info.plist CFBundleName),dev ä¸‹æ’ä¸º "Electron",æ— æ³•è¿è¡Œæ—¶ä¿®æ”¹ã€‚
-  const template: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: BRAND_NAME,
-      submenu: [
-        {
-          label: labels.about.replace('{{appName}}', BRAND_NAME),
-          click: () => dispatchApplicationMenuCommand(mainWindow, 'open-about'),
-        },
-        { type: 'separator' },
-        {
-          label: labels.settings,
-          accelerator: menuAcceleratorFor('open-settings'),
-          registerAccelerator: registerMenuAccelerators,
-          click: () => dispatchApplicationMenuCommand(mainWindow, 'open-settings'),
-        },
-        {
-          label: labels.checkForUpdates,
-          click: () =>
-            dispatchApplicationMenuCommand(mainWindow, 'check-for-updates', {
-              activateWindow: false,
-            }),
-        },
-        { type: 'separator' },
-        { role: 'services' },
-        { type: 'separator' },
-        // hide/hideOthers/quit/minimize åŒæ ·åƒå½•åˆ¶ gate: å¦åˆ™å½•åˆ¶ä¸­æŒ‰
-        // âŒ˜Q/âŒ˜H/âŒ˜M ä¼šå…ˆè§¦å‘åŽŸç”Ÿ role, ç”¨æˆ·çœ‹ä¸åˆ°"ç³»ç»Ÿä¿ç•™"æ ¡éªŒæç¤ºå°±æŠŠ
-        // åº”ç”¨é€€å‡º/éšè—äº†ã€‚(close å·²æ”¹ä¸ºæ°¸ä¸æ³¨å†Œ accelerator, ä¸åœ¨æ­¤åˆ—,
-        // è§ä¸‹æ–¹ Window èœå•æ³¨é‡Šã€‚)
-        {
-          role: 'hide',
-          label: labels.hide.replace('{{appName}}', BRAND_NAME),
-          registerAccelerator: registerMenuAccelerators,
-        },
-        { role: 'hideOthers', registerAccelerator: registerMenuAccelerators },
-        { role: 'unhide' },
-        { type: 'separator' },
-        {
-          role: 'quit',
-          label: labels.quit.replace('{{appName}}', BRAND_NAME),
-          registerAccelerator: registerMenuAccelerators,
-        },
-      ],
-    },
-    {
-      label: labels.fileMenu,
-      submenu: [
-        {
-          label: labels.newMaker,
-          accelerator: menuAcceleratorFor('new-maker'),
-          registerAccelerator: registerMenuAccelerators,
-          click: (_item, _window, event) =>
-            dispatchApplicationMenuCommand(
-              mainWindow,
-              resolveNewMakerMenuCommand(event.triggeredByAccelerator),
-            ),
-        },
-      ],
-    },
-    { role: 'editMenu' },
-    viewMenu,
-    {
-      label: labels.windowMenu,
-      role: 'window',
-      submenu: [
-        { role: 'minimize', registerAccelerator: registerMenuAccelerators },
-        { role: 'zoom' },
-        { type: 'separator' },
-        // Close ä¸Ž Toggle Sidebar åŒæ¬¾ registerAccelerator: false â€”â€” èœå•æ˜¾ç¤º
-        // âŒ˜W æ ‡ç­¾ä¸”ç‚¹å‡»ä»å…³é—­èšç„¦çª—å£, ä½†ä¸å‘ç³»ç»Ÿæ³¨å†Œçƒ­é”®, è®©æŒ‰é”®æµåˆ° renderer:
-        // ç„¦ç‚¹åœ¨å³ä¾§æ  (ç»ˆç«¯ / æ–‡ä»¶æµè§ˆå™¨ç­‰) å†…æ—¶å…ˆå…³æ¿€æ´» tab, å¦åˆ™èµ°
-        // window-close-self å…³(éšè—)çª—å£ (è§ appShortcuts 'close-tab-or-window'
-        // ä¸Ž MainLayout / SidebarWindowLayout çš„æ¶ˆè´¹ç‚¹)ã€‚æ°¸ä¸æ³¨å†Œ, ä¹Ÿå°±æ— éœ€åƒ
-        // å½•åˆ¶ gateã€‚
-        { role: 'close', registerAccelerator: false },
-      ],
-    },
-    {
-      label: labels.helpMenu,
-      submenu: [
-        {
-          label: labels.help,
-          click: () => dispatchApplicationMenuCommand(mainWindow, 'open-help'),
-        },
-        {
-          label: labels.releaseNotes,
-          click: () => dispatchApplicationMenuCommand(mainWindow, 'open-release-notes'),
-        },
-        {
-          label: labels.issues,
-          click: () => dispatchApplicationMenuCommand(mainWindow, 'open-issues'),
-        },
-        { type: 'separator' },
-        {
-          // å‘½ä»¤åéš edition å“ç‰Œ(installCli æ–‡æ¡ˆé‡Œçš„ {{cmd}} å ä½ç¬¦)ã€‚
-          label: labels.installCli.replaceAll('{{cmd}}', CLI_COMMAND_NAME),
-          // ç‰¹æƒåŠ¨ä½œ(å†™ PATH ç›®å½• / å¯èƒ½å¼¹ç®¡ç†å‘˜æŽˆæƒ)æ•´æ®µåœ¨ main æ‰§è¡Œ,
-          // ä¸ç» renderer,ä¹Ÿä¸æ–°å¢ž IPC é¢ã€‚è§ installCliCommand.tsã€‚
-          click: () => {
-            void installCindyCliCommand(mainWindow, locale);
-          },
-        },
-      ],
-    },
-  ];
-
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
-}
-
-let currentApplicationMenuLocale: ApplicationMenuLocale | null = null;
-
-// å¿«æ·é”®æ”¹ç»‘ç”Ÿæ•ˆ: overrides å˜åŒ–æ—¶ç”¨å½“å‰ locale å…¨é‡é‡å»ºèœå• (ä¸Ž locale å˜æ›´
-// åŒä¸€è·¯å¾„)ã€‚ä»…ç”¨æˆ·åœ¨è®¾ç½®é¡µä¿å­˜æ”¹ç»‘æ—¶è§¦å‘, é‡å»ºçž¬é—´æ‰“å¼€ç€çš„èœå•ä¼šæ”¶èµ·, å¯æŽ¥å—ã€‚
-// å½•åˆ¶æ€åˆ‡æ¢åŒç†é‡å»º â€”â€” å½•åˆ¶ä¸­èœå•ä¸æ³¨å†Œ accelerator (è§ installApplicationMenu)ã€‚
-function reinstallApplicationMenuIfPresent(): void {
-  const mainWindow = mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef : null;
-  if (mainWindow) {
-    installApplicationMenu(
-      mainWindow,
-      currentApplicationMenuLocale ?? getPreferredApplicationLocale(),
-    );
-  }
-}
-getAppShortcutStore().subscribe(reinstallApplicationMenuIfPresent);
-subscribeAppShortcutRecording(reinstallApplicationMenuIfPresent);
-
-ipcMain.on('app-locale:get-preferred-system-locale-sync', (event) => {
-  event.returnValue = getPreferredApplicationLocale();
-});
-
-// renderer ä¾§ MainLayout mount åŽä¸»åŠ¨æ‹‰ä¸€æ¬¡å†·å¯åŠ¨æœŸé—´ç¼“å­˜çš„ deep link /
-// --open-folder payloadã€‚pull-on-mount è·¯å¾„ä¸“ç”¨,take ä¸€æ¬¡æ¸…ç©º,é‡å¤è°ƒå®‰å…¨ã€‚
-// è¯¦è§ deepLink.ts çš„ pending buffer æ®µã€‚
-ipcMain.handle('deep-link:take-pending', () => {
-  return takePendingDeepLink();
-});
-
-ipcMain.handle('app-menu:set-locale', (_event, locale: unknown): { ok: true } => {
-  currentApplicationMenuLocale = resolveApplicationMenuLocale(
-    typeof locale === 'string' ? locale : null,
-  );
-  setSelectionContextMenuLocale(currentApplicationMenuLocale);
-  setMainLocale(currentApplicationMenuLocale);
-  refreshWindowsAppBadge();
-  resourceUsageWindowController.setLocale(currentApplicationMenuLocale);
-  remoteDesktopViewerWindows.setLocale(currentApplicationMenuLocale);
-  rsbWindowController.setLocale(currentApplicationMenuLocale);
-  ghostPanelWindowsController.setLocale(currentApplicationMenuLocale);
-  refreshGhostLocalization();
-  const mainWindow = mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef : null;
-  if (mainWindow) {
-    installApplicationMenu(mainWindow, currentApplicationMenuLocale);
-  }
-  invalidateWindowsTrayMenu();
-  getAgentIslandService()?.refreshLocalization();
-  return { ok: true };
-});
-
-/**
- * Convert POSIX-style absolute paths emitted by Claude Code SDK on Windows
- * (e.g. `/e/AIWork/xdt-maker/...`) into native Win32 paths (`E:\AIWork\...`).
- *
- * On non-Windows platforms this is a no-op â€” Mac/Linux already use POSIX
- * paths natively and `fs` can read them as-is. On Windows the SDK frequently
- * emits `/x/...` style paths in tool args (Read/Write/Edit `file_path`); the
- * Node `fs` API on Windows treats those as ENOENT, surfacing in the
- * TextLightbox as "File not found".
- */
-function posixToWin32(p: string): string {
-  if (process.platform !== 'win32' || !p) return p;
-  // `/x/rest` â†’ `X:\rest`. Single drive letter only; deeper segments preserved.
-  const m = /^\/([a-zA-Z])\/(.*)$/.exec(p);
-  if (m) return `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, '\\')}`;
-  return p;
-}
-
-function isPathAllowed(filePath: string): boolean {
-  return isPathAllowedAgainst(filePath, SYSTEM_PATH_BLOCKLIST);
-}
-
-// ç”¨æˆ·åŒå‡»å›¾æ ‡ / äºŒæ¬¡å¯åŠ¨æ—¶,second-instance äº‹ä»¶è¦æŠŠä¸»çª—å£æ‹‰å›žå‰å°ã€‚
-// ä¸èƒ½ç”¨ BrowserWindow.getAllWindows()[0] â€”â€” ä¸´æ—¶æµ®çª—/Toast ä¹Ÿå±žäºŽ
-// BrowserWindowï¼Œ[0] æ‹¿åˆ°å®ƒå† .focus() ç­‰äºŽå•¥ä¹Ÿæ²¡å¹²ï¼Œç”¨æˆ·è§†è§‰ä¸Šä»¥ä¸º
-// "åŒå‡»å¯åŠ¨ä¸äº†"ã€‚
-let mainWindowRef: BrowserWindow | null = null;
-let mainWindowMaximizeRecoveryController: MainWindowMaximizeRecoveryController | null = null;
-// ç«¯ç‚¹æ¸…å•é˜»æ–­é—¨:ready æµç¨‹èµ°åˆ°æ­£å¸¸ createWindow() å‰ç½® trueã€‚åœ¨æ­¤ä¹‹å‰
-// second-instance / activate ä¸€å¾‹ä¸è®¸å»ºçª—â€”â€”é˜»æ–­å¾ªçŽ¯(é”™è¯¯æ¡†é‡è¯•)æœŸé—´ç”¨æˆ·
-// åŒå‡»å›¾æ ‡ / ç‚¹ Dock è‹¥èƒ½å»ºçª—,preload çš„æ¨¡å—çº§ sendSync ä¼šå›  handler æœªæ³¨å†Œ
-// è€Œç™½å±,ä¸”çª—å£ä¼šå¸¦ç€çƒ˜ç„™ç«¯ç‚¹ç»•è¿‡"æ‹‰ä¸åˆ°æ¸…å•ä¸æ”¾è¡Œ"çš„è¯­ä¹‰ã€‚
-let startupWindowCreationAllowed = false;
-let appFocusSyncTimer: ReturnType<typeof setTimeout> | null = null;
-const providerModelFocusRefreshTracker = createAppFocusAutoRefreshTracker({
-  now: Date.now,
-  onMeaningfulForeground: () => {
-    void requestProviderModelAutoRefresh('foreground');
-  },
-});
-let mainWindowBackgroundThrottlingAllowed = true;
-const isUpdateRelaunchCandidate =
-  process.platform === 'darwin' && isMacOSUpdateRelaunch(process.argv);
-let updatePresentationRecoveryInitialized = false;
-const PAGE_ZOOM_FACTOR_MIN = 0.5;
-const PAGE_ZOOM_FACTOR_MAX = 3;
-const PAGE_ZOOM_FACTOR_STEP = 0.1;
-
-const updatePresentationRecovery = isUpdateRelaunchCandidate
-  ? createUpdatePresentationRecoveryController({
-      readScreenState: () => {
-        try {
-          return powerMonitor.getSystemIdleState(1);
-        } catch (err) {
-          updatePresentationLog.warn('failed to read initial screen lock state', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return 'unknown';
-        }
-      },
-      readWindowState: () => {
-        const win = mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef : null;
-        return { exists: win !== null, focused: win?.isFocused() === true };
-      },
-      focusWindow: () => {
-        focusMainWindow();
-      },
-      schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-      cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-      onEvent: (event) => {
-        if (event === 'deferred-locked') {
-          updatePresentationLog.info('update window activation deferred until screen unlock');
-        } else if (event === 'focus-window') {
-          updatePresentationLog.info(
-            'restoring update-launched window after presentation became available',
-          );
-        } else if (event === 'paused-unknown') {
-          updatePresentationLog.warn(
-            'pausing update window recovery until an explicit screen event because state stayed unknown',
-          );
-        } else {
-          updatePresentationLog.warn(
-            'abandoning update window recovery after bounded focus attempts were denied',
-          );
-        }
-      },
-    })
-  : null;
-
-// macOS åŽŸç”Ÿ app è¡Œä¸º(Slack / VSCode / å¾®ä¿¡): å…³çª—åª hide ä¸é”€æ¯,ç‚¹ dock å›¾æ ‡
-// ç›´æŽ¥ show å›žæ¥,renderer ä¸é‡æ–°åŠ è½½ã€‚Cmd+Q / before-quit æ—¶æŠŠè¿™ä¸ªæ ‡å¿—ç½® true,
-// è®©çª—å£ close handler æ”¾è¡ŒçœŸæ­£çš„é”€æ¯ã€‚
-let isQuitting = false;
-const authCredentialRecoveryLog = createLogger('auth-credential-recovery');
-
-function readRelaunchActivitySources(): RelaunchBusyActivitySources {
-  return {
-    anySessionInTurn: () => {
-      const maker = getMakerIfReady();
-      return maker ? anySessionInTurn(maker) : false;
-    },
-    listClaudeBackgroundSessions: () => listActiveClaudeBackgroundActivitySessions(),
-    anyGhostSessionBusy: () => getGhostSessionActivityTracker().anySessionBusy(),
-    // run_in_background çš„ Bash ä¸è°ƒæ¨¡åž‹ã€ä¹Ÿä¸æŠ˜ç®— running,å‰ä¸¤ä¸ªæ¥æºéƒ½çœ‹ä¸åˆ°å®ƒã€‚
-    anyBackgroundBashRunning: () =>
-      getMakerIfReady()
-        ?.listActiveSessions()
-        .some((session) => session.listBackgroundTasks().length > 0) ?? false,
-    // Cindy slot çš„å…¨éƒ¨åœ¨é€”å·¥ä½œ:å¼‚æ­¥(mode:'submit' çš„å›¾ / è§†é¢‘)ä¸ŽåŒæ­¥ä»£åŠžå„è‡ªç‹¬ç«‹è®°è´¦,
-    // éƒ½å¯èƒ½ä¸ä¼´éšä»»ä½• turn æˆ– card-action,åªæŸ¥ä¸€åŠå°±æ¼ä¸€åŠã€‚
-    anyCindySlotJobRunning: () => getGhostCindySlot().anyInflightWork(),
-    // Scope to this process: `pi-agent-home` is shared with a concurrent
-    // dev/packaged/`--passive` instance, and its running Subagents are not
-    // a reason to hold up *our* quit.
-    anyPiSubagentRunning: () =>
-      hasActivePiSubagentRunsSync(path.join(app.getPath('userData'), 'pi-agent-home'), {
-        hostPid: process.pid,
-      }),
-    // script æ¨¡å¼ / pre-run hook é˜¶æ®µçš„ run ä¸åˆ›å»º session,å†…å­˜æ¥æºçœ‹ä¸åˆ°å®ƒä»¬ã€‚
-    anySchedulerRunRunning: () => readUpdateRelaunchScheduleBusy(getScheduleStorageIfInitialized()),
-  };
-}
-
-const authCredentialRecovery = createAuthCredentialRecovery({
-  enabled: process.platform === 'darwin' && app.isPackaged,
-  argv: process.argv.slice(1),
-  needsRecovery: () => authManager.needsCredentialProcessRecovery(),
-  readScreenState: () => powerMonitor.getSystemIdleState(1),
-  isQuitting: () => isQuitting,
-  isBusy: () =>
-    hasUpdateRelaunchBusyActivity({
-      readSynchronousBusy: () =>
-        isAppSessionBoundaryPending() ||
-        authManager.isAuthFlowBusy() ||
-        getUpdateRelaunchControllers().length > 0 ||
-        hasInFlightRemoteInvokes(),
-      readScheduleBusy: async () =>
-        (await evaluateRelaunchBusyActivity(readRelaunchActivitySources())).busy,
-    }),
-  relaunch: (args) => {
-    app.relaunch({ args });
-    app.quit(); // Normal lifecycle: flush storage and dispose background services.
-  },
-  schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-  onEvent: (event) => authCredentialRecoveryLog.info(event),
-});
-
-let windowsTray: Tray | null = null;
-// å½“å‰çš„æ‰˜ç›˜èœå•ã€‚è¯­è¨€åˆ‡æ¢æ—¶ç½® null,ä¸‹ä¸€æ¬¡å³é”®æŒ‰æ–°è¯­è¨€é‡å»ºã€‚
-let windowsTrayMenu: Menu | null = null;
-// å·²å¼¹å‡ºçš„èœå•åœ¨ native callback å‰å¿…é¡»ä¿ç•™,å³ä½¿è¯­è¨€åˆ‡æ¢æ¸…æŽ‰äº†å½“å‰ç¼“å­˜ã€‚
-const activeWindowsTrayMenus = new Set<Menu>();
-const windowsTrayLog = createLogger('windows-tray');
-const CLOSE_BEHAVIOR_PROMPT_FALLBACK_DELAY_MS = 2_000;
-
-function buildWindowsTrayMenu(): Menu {
-  return Menu.buildFromTemplate([
-    {
-      label: t('settings.windowBehavior.trayMenu.show'),
-      click: () => focusMainWindow(),
-    },
-    { type: 'separator' },
-    {
-      label: t('settings.windowBehavior.trayMenu.quit'),
-      click: () => quitFromWindowsTray(),
-    },
-  ]);
-}
-
-/** è¯­è¨€åˆ‡æ¢åŽä¸¢å¼ƒç¼“å­˜çš„èœå•,ä¸‹ä¸€æ¬¡å³é”®æŒ‰æ–°è¯­è¨€é‡å»ºã€‚ */
-function invalidateWindowsTrayMenu(): void {
-  windowsTrayMenu = null;
-}
-
-function openWindowsTrayMenu(): void {
-  // è¿™æ¡æ—¥å¿—æ˜¯é•¿æœŸè¯Šæ–­ç•™çš„,ä¸æ˜¯ä¸´æ—¶æŽ’æŸ¥: ä¸Šæ¸¸é‚£æ¡å¼¹ä¸å‡ºçš„ bug æ˜¯é™é»˜å¤±è´¥(ä¸æŠ›é”™),
-  // æ‰€ä»¥æ—¥å¿—é‡Œæœ‰æ²¡æœ‰è¿™ä¸€è¡Œ,æ˜¯åŒºåˆ† "å³é”®äº‹ä»¶æ²¡åˆ°" ä¸Ž "äº‹ä»¶åˆ°äº†ä½†èœå•æ²¡å¼¹" çš„å”¯ä¸€ä¾æ®ã€‚
-  // å†æœ‰ç”¨æˆ·æŠ¥ "å³é”®æ²¡ååº”" æ—¶,å…ˆè®©ä»–çœ‹è¿™è¡Œã€‚
-  // ç”¨ info è€Œä¸æ˜¯ debug: packaged çš„é»˜è®¤çº§åˆ«å°±æ˜¯ info (logger.ts çš„ level è§£æž),
-  // debug ä¼šè¢« shouldLog è¿‡æ»¤æŽ‰ â€”â€” é‚£æ ·å®ƒæ°å¥½åœ¨å”¯ä¸€éœ€è¦å®ƒçš„åœºæ™¯(ç”¨æˆ·æ‰‹ä¸Šçš„æ­£å¼åŒ…)
-  // é‡Œä¸ä¼šå‡ºçŽ°ã€‚é¢‘çŽ‡ä¸Šä¹Ÿä¸æ‹…å¿ƒåˆ·å±: åªæœ‰ç”¨æˆ·çœŸçš„å³é”®æ‰˜ç›˜å›¾æ ‡æ‰ä¼šèµ°åˆ°è¿™é‡Œã€‚
-  windowsTrayLog.info('tray right-click received, opening tray menu');
-  popUpWindowsTrayMenu<Menu>({
-    tray: windowsTray,
-    menu: windowsTrayMenu,
-    buildMenu: buildWindowsTrayMenu,
-    retainMenu: (menu) => {
-      windowsTrayMenu = menu;
-    },
-    retainActiveMenu: (menu) => {
-      activeWindowsTrayMenus.add(menu);
-    },
-    releaseActiveMenu: (menu) => {
-      activeWindowsTrayMenus.delete(menu);
-    },
-    onUnavailable: (reason) => {
-      windowsTrayLog.warn('tray menu requested without a live tray icon', { reason });
-    },
-    onError: (error) => {
-      windowsTrayLog.error('failed to open Windows tray menu', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    },
-  });
-}
-
-function quitFromWindowsTray(): void {
-  requestWindowsTrayQuit({
-    hasActiveTurn: () => {
-      try {
-        return anySessionInTurn(getMakerCore());
-      } catch {
-        // A failed busy probe must not turn the tray into an unguarded exit path.
-        return true;
-      }
-    },
-    confirmQuit: () =>
-      dialog.showMessageBoxSync({
-        type: 'warning',
-        title: t('titleBar.closeConfirm.title'),
-        message: t('titleBar.closeConfirm.title'),
-        detail: t('titleBar.closeConfirm.description'),
-        buttons: [t('titleBar.closeConfirm.cancel'), t('titleBar.closeConfirm.confirm')],
-        defaultId: 0,
-        cancelId: 0,
-        noLink: true,
-      }) === 1,
-    quit: () => app.quit(),
-  });
-}
-
-function destroyWindowsTray(): void {
-  windowsTray?.destroy();
-  windowsTray = null;
-  windowsTrayMenu = null;
-}
-
-function ensureWindowsTray(): boolean {
-  if (windowsTray && !windowsTray.isDestroyed()) return true;
-
-  let tray: Tray | null = null;
-  try {
-    const iconPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'icon.png')
-      : path.join(__dirname, '../../resources/icon.png');
-    const icon = nativeImage.createFromPath(iconPath);
-    if (icon.isEmpty()) throw new Error(`tray icon is empty: ${iconPath}`);
-    tray = new Tray(icon.resize({ width: 16, height: 16 }));
-    tray.setToolTip(BRAND_NAME);
-    tray.on('click', () => focusMainWindow());
-    tray.on('right-click', () => openWindowsTrayMenu());
-    windowsTray = tray;
-    windowsTrayMenu = null;
-    return true;
-  } catch (err) {
-    // å›¾æ ‡å¯èƒ½å·²ç»è¿›äº†é€šçŸ¥åŒºåŸŸ: åªç½® null ä¼šç•™ä¸‹ä¸€ä¸ªä»å“åº”å·¦é”®ã€å´å†ä¹Ÿå¼•ç”¨ä¸åˆ°çš„
-    // åƒµå°¸å›¾æ ‡(destroyWindowsTray æ‘¸ä¸åˆ°å®ƒ,å³é”®ä¹Ÿæ²¡æœ‰èœå•å¯å¼¹)ã€‚
-    try {
-      tray?.destroy();
-    } catch {
-      /* å·²ç»æ²¡äº†,å¿½ç•¥ */
-    }
-    windowsTrayLog.error('failed to create Windows tray icon', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    windowsTray = null;
-    windowsTrayMenu = null;
-    return false;
-  }
-}
-
-function hideMainWindowToWindowsTray(mainWindow: BrowserWindow): void {
-  if (ensureWindowsTray()) {
-    hideWindowToWindowsTray(mainWindow);
-    return;
-  }
-  dialog.showMessageBoxSync(mainWindow, {
-    type: 'error',
-    title: t('settings.windowBehavior.trayError.title'),
-    message: t('settings.windowBehavior.trayError.message'),
-  });
-}
-
-function applyWindowsCloseBehavior(
-  mainWindow: BrowserWindow,
-  behavior: WindowsCloseBehavior,
-): void {
-  if (behavior === 'tray') {
-    hideMainWindowToWindowsTray(mainWindow);
-  } else {
-    app.quit();
-  }
-}
-
-function showNativeWindowsCloseBehaviorPrompt(): WindowsCloseBehavior {
-  const options = {
-    type: 'question' as const,
-    title: t('settings.windowBehavior.closePrompt.title'),
-    message: t('settings.windowBehavior.closePrompt.message'),
-    detail: t('settings.windowBehavior.closePrompt.detail'),
-    buttons: [
-      t('settings.windowBehavior.closeBehavior.tray'),
-      t('settings.windowBehavior.closeBehavior.quit'),
-    ],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-  };
-  const mainWindow = mainWindowRef;
-  const choice =
-    mainWindow && !mainWindow.isDestroyed()
-      ? dialog.showMessageBoxSync(mainWindow, options)
-      : dialog.showMessageBoxSync(options);
-  return choice === 1 ? 'quit' : 'tray';
-}
-
-function showNativeLinuxCloseBehaviorPrompt(): LinuxCloseBehavior {
-  const options = {
-    type: 'question' as const,
-    title: t('settings.windowBehavior.closePrompt.title'),
-    message: t('settings.windowBehavior.closePrompt.message'),
-    detail: t('settings.windowBehavior.closePrompt.linuxDetail'),
-    buttons: [
-      t('settings.windowBehavior.closeBehavior.minimize'),
-      t('settings.windowBehavior.closeBehavior.quit'),
-    ],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-  };
-  const mainWindow = mainWindowRef;
-  const choice =
-    mainWindow && !mainWindow.isDestroyed()
-      ? dialog.showMessageBoxSync(mainWindow, options)
-      : dialog.showMessageBoxSync(options);
-  return choice === 1 ? 'quit' : 'minimize';
-}
-
-const windowsClosePromptFallback = createCloseBehaviorPromptFallbackController(
-  {
-    readBehavior: () => readWindowBehaviorSettings().windowsCloseBehavior,
-    showRendererPrompt: () => {
-      const mainWindow = mainWindowRef;
-      if (!mainWindow) return;
-      requestMainWindowCloseBehavior(
-        mainWindow,
-        WINDOW_BEHAVIOR_WINDOWS_CLOSE_BEHAVIOR_REQUESTED_CHANNEL,
-      );
-    },
-    showNativePrompt: showNativeWindowsCloseBehaviorPrompt,
-    persistBehavior: writeWindowsCloseBehavior,
-    applyBehavior: (behavior) => {
-      const mainWindow = mainWindowRef;
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        applyWindowsCloseBehavior(mainWindow, behavior);
-      } else {
-        app.quit();
-      }
-    },
-    schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-    cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-  },
-  CLOSE_BEHAVIOR_PROMPT_FALLBACK_DELAY_MS,
-);
-
-const linuxClosePromptFallback = createCloseBehaviorPromptFallbackController(
-  {
-    readBehavior: () => readWindowBehaviorSettings().linuxCloseBehavior,
-    showRendererPrompt: () => {
-      const mainWindow = mainWindowRef;
-      if (!mainWindow) return;
-      requestMainWindowCloseBehavior(
-        mainWindow,
-        WINDOW_BEHAVIOR_LINUX_CLOSE_BEHAVIOR_REQUESTED_CHANNEL,
-      );
-    },
-    showNativePrompt: showNativeLinuxCloseBehaviorPrompt,
-    persistBehavior: writeLinuxCloseBehavior,
-    applyBehavior: (behavior) => {
-      const mainWindow = mainWindowRef;
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        applyLinuxMainWindowCloseBehavior(mainWindow, behavior, () => app.quit());
-      } else {
-        app.quit();
-      }
-    },
-    schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-    cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-  },
-  CLOSE_BEHAVIOR_PROMPT_FALLBACK_DELAY_MS,
-);
-
-app.on('before-quit', () => {
-  isQuitting = true;
-  disposePiRuntimeRecovery?.();
-  retryPiRuntimeAfterNetworkRecovery = null;
-  disposePiRuntimeRecovery = null;
-  windowsClosePromptFallback.dispose();
-  linuxClosePromptFallback.dispose();
-  destroyWindowsTray();
-  disposeUpdatePresentationRecovery();
-  authCredentialRecovery.dispose();
-});
-
-function handleUpdatePresentationLock(): void {
-  updatePresentationRecovery?.onScreenLock();
-}
-
-function handleUpdatePresentationUnlock(): void {
-  updatePresentationRecovery?.onScreenUnlock();
-}
-
-function handleProviderModelSystemResume(): void {
-  void requestProviderModelAutoRefresh('system-resume');
-}
-
-function handleProviderModelScreenUnlock(): void {
-  void requestProviderModelAutoRefresh('screen-unlock');
-}
-
-function initializeUpdatePresentationRecovery(): void {
-  if (!updatePresentationRecovery || updatePresentationRecoveryInitialized) return;
-  updatePresentationRecoveryInitialized = true;
-  powerMonitor.on('lock-screen', handleUpdatePresentationLock);
-  powerMonitor.on('unlock-screen', handleUpdatePresentationUnlock);
-  updatePresentationRecovery.arm();
-  updatePresentationLog.info('armed one-shot update window recovery');
-}
-
-function disposeUpdatePresentationRecovery(): void {
-  if (!updatePresentationRecoveryInitialized) return;
-  powerMonitor.removeListener('lock-screen', handleUpdatePresentationLock);
-  powerMonitor.removeListener('unlock-screen', handleUpdatePresentationUnlock);
-  updatePresentationRecovery?.dispose();
-  updatePresentationRecoveryInitialized = false;
-}
-
-function hasFocusedAppWindow(): boolean {
-  return BrowserWindow.getAllWindows().some((win) => isFocusedAppContentWindow(win));
-}
-
-function syncAppFocusState(): void {
-  const appFocused = hasFocusedAppWindow();
-  providerModelFocusRefreshTracker.sync(appFocused);
-  getAgentIslandService()?.setAppFocused(appFocused);
-}
-
-function scheduleAppFocusSync(): void {
-  if (appFocusSyncTimer) clearTimeout(appFocusSyncTimer);
-  appFocusSyncTimer = setTimeout(() => {
-    appFocusSyncTimer = null;
-    syncAppFocusState();
-  }, 0);
-}
-
-app.on('browser-window-focus', (_event, win) => {
-  retryPiRuntimeAfterNetworkRecovery?.();
-  if (win === mainWindowRef) updatePresentationRecovery?.onWindowFocused();
-  if (appFocusSyncTimer) {
-    clearTimeout(appFocusSyncTimer);
-    appFocusSyncTimer = null;
-  }
-  const focusedAppContent = isAppContentWindow(win);
-  syncAppFocusState();
-  if (focusedAppContent) {
-    syncPluginMarketForActiveOwner(30_000);
-    // OAuth and system settings may complete outside Cindy. Focus is a
-    // metadata-only fallback wake-up: each pending plugin is re-assessed, but
-    // no stored value crosses the change bus.
-    const pendingGhostIds = new Set(
-      (getGhostSetupInteractionBridge()?.pendingSnapshots() ?? []).map(
-        ({ request }) => request.ghost.id,
-      ),
-    );
-    for (const ghostId of pendingGhostIds) {
-      getGhostSetupChangeBus().wake(ghostId, { source: 'focus' });
-    }
-  }
-});
-
-app.on('browser-window-blur', () => {
-  scheduleAppFocusSync();
-});
-
-// mac âŒ˜W å›žå½’å…œåº• (Codex review P2): Window > Close èœå•é¡¹ä¸å†æ³¨å†Œ accelerator
-// åŽ, âŒ˜W é  renderer çš„ 'close-tab-or-window' æ¶ˆè´¹, ä½† OAuth ç™»å½•å¼¹çª—ç­‰
-// éž app-content çª—å£ä¸æŒ‚ MainLayout / SidebarWindowLayout, èšç„¦å®ƒä»¬æ—¶ âŒ˜W ä¼š
-// å¤±æ•ˆã€‚è¿™é‡Œå¯¹è¿™ç±»çª—å£åœ¨ main ä¾§è¡¥ before-input-event å…œåº•, è¯­ä¹‰ = åŽŸç”Ÿ role
-// close (win.close())ã€‚app-content åˆ¤å®šæ”¾åœ¨æŒ‰é”®æ—¶åˆ»åš â€”â€” markAppContentWindow
-// åœ¨çª—å£æž„é€ å®ŒæˆåŽæ‰æ‰“æ ‡, browser-window-created åŒæ­¥ fire æ—¶è¿˜çœ‹ä¸åˆ°ã€‚
-// ä»… darwin: win/linux æœ¬å°±æ²¡æœ‰åº”ç”¨èœå•, Ctrl+W åœ¨è¿™äº›çª—å£ä¸ŠåŽ†å²è¡Œä¸ºå°±æ˜¯æ— æ“ä½œã€‚
-if (process.platform === 'darwin') {
-  app.on('browser-window-created', (_event, win) => {
-    win.webContents.on('before-input-event', (event, input) => {
-      if (input.type !== 'keyDown') return;
-      // æ³¨æ„ä¸è¦ç›´æŽ¥ if (isAppContentWindow(win)) return â€”â€” å®ƒæ˜¯ type guard,
-      // æå‰ return ä¼šæŠŠåŽç»­çš„ win æ”¶çª„æˆ neverã€‚
-      const isContent: boolean = isAppContentWindow(win);
-      if (isContent) return;
-      const combos = getAppShortcutStore().getEffectiveCombos('close-tab-or-window');
-      if (!combos.some((c) => matchesElectronInput(input, c))) return;
-      event.preventDefault();
-      if (!win.isDestroyed()) win.close();
-    });
-  });
-}
-
-function applyMainWindowBackgroundThrottling(): void {
-  const win = mainWindowRef;
-  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
-  win.webContents.setBackgroundThrottling(mainWindowBackgroundThrottlingAllowed);
-}
-
-function setMainWindowBackgroundThrottlingForActiveTurn(hasRunningTurn: boolean): void {
-  const nextAllowed = !hasRunningTurn;
-  if (mainWindowBackgroundThrottlingAllowed === nextAllowed) return;
-  mainWindowBackgroundThrottlingAllowed = nextAllowed;
-  applyMainWindowBackgroundThrottling();
-}
-
-function focusMainWindow(): boolean {
-  const win = mainWindowRef;
-  if (!win || win.isDestroyed()) return false;
-  if (!win.isVisible()) win.show();
-  if (win.isMinimized()) win.restore();
-  win.focus();
-  // macOS ä¸Šä»Žå…¶å®ƒå‰å°åº”ç”¨ (å¦‚ OAuth æŽˆæƒåŽçš„æµè§ˆå™¨) æ‰‹é‡Œæ‹¿å›žç„¦ç‚¹,å•é 
-  // win.focus() ä¸å¯é ;æ‰€æœ‰è°ƒç”¨æ–¹éƒ½æ˜¯ç”¨æˆ·æ˜¾å¼"è¦å›žåˆ° app"çš„åœºæ™¯,steal è¯­ä¹‰ä¸€è‡´ã€‚
-  if (process.platform === 'darwin') app.focus({ steal: true });
-  return true;
-}
-
-function roundPageZoomFactor(factor: number): number {
-  return Math.round(factor / PAGE_ZOOM_FACTOR_STEP) * PAGE_ZOOM_FACTOR_STEP;
-}
-
-function clampPageZoomFactor(factor: number): number {
-  return Math.min(
-    PAGE_ZOOM_FACTOR_MAX,
-    Math.max(PAGE_ZOOM_FACTOR_MIN, roundPageZoomFactor(factor)),
-  );
-}
-
-function applyPageZoomLevel(mainWindow: BrowserWindow, nextFactor: number): number {
-  const zoomFactor = clampPageZoomFactor(nextFactor);
-  applyAppearanceToWindow(mainWindow, { windowZoom: zoomFactor });
-  return zoomFactor;
-}
-
-// â”€â”€ Custom URL scheme (cindy://... + åŽ†å² xdt-maker://...) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// å¿…é¡»åœ¨ app.whenReady() ä¹‹å‰æ³¨å†Œ:
-//   - registerDeepLinkProtocol() è°ƒ setAsDefaultProtocolClient (Windows/Linux
-//     å†™æ³¨å†Œè¡¨ / .desktop entry; macOS èµ° Info.plist, æ­¤è°ƒç”¨æ˜¯å…œåº•)
-//   - app.on('open-url') æ˜¯ macOS-only äº‹ä»¶, å†·å¯åŠ¨æ—¶ä¹Ÿä¼šåœ¨ ready ä¹‹å‰ fire,
-//     æå‰ attach æ‰èƒ½æŽ¥ä½
-watchCindyVersionStartupResult();
-if (!isCindyPersonalRuntime()) registerDeepLinkProtocol();
-app.on('open-url', (event, url) => {
-  event.preventDefault();
-  handleIncomingDeepLink(url, 'open-url');
-});
-
-// macOS Finder "æ‰“å¼€æ–¹å¼ â†’ Cindy" å…¥å£:å£°æ˜Ž CFBundleDocumentTypes æŽ¥å—
-// public.folder åŽ,Finder æŠŠç›®å½•è·¯å¾„é€šè¿‡ open-file äº‹ä»¶æŽ¨è¿‡æ¥ (å†·å¯åŠ¨ / å·²è¿è¡Œ
-// éƒ½èµ°æ­¤è·¯å¾„)ã€‚äº‹ä»¶ä¹Ÿå¯èƒ½è¢«æ–‡ä»¶è§¦å‘:.cindy æ„è¯†èµ°åŒå‡»è£…å…¥,å…¶ä½™æ–‡ä»¶
-// é™é»˜å¿½ç•¥ã€‚
-//
-// å¿…é¡»åœ¨ app.whenReady() ä¹‹å‰ attach,ä¸Ž open-url åŒç† (å†·å¯åŠ¨æ—©äºŽ ready è§¦å‘)ã€‚
-//
-// Windows / Linux ä¸è§¦å‘æ­¤äº‹ä»¶,æ— éœ€å¹³å°åˆ†æ”¯ã€‚fs.statSync æ˜¯åŒæ­¥è°ƒç”¨,ä¸»è¿›ç¨‹
-// é˜»å¡ž < 10ms,åªåœ¨ç”¨æˆ·ä¸»åŠ¨ç‚¹ Finder æ—¶è§¦å‘,éžçƒ­è·¯å¾„,å¯æŽ¥å—ã€‚
-app.on('open-file', (event, filePath) => {
-  event.preventDefault();
-  // mac åŒå‡» .cindy(CFBundleDocumentTypes å…³è”):è£…å…¥ + åœé ,æ–‡ä»¶å­˜åœ¨æ€§
-  // æ ¡éªŒåœ¨å¤„ç†å™¨å†…éƒ¨å®Œæˆã€‚
-  if (filePath.toLowerCase().endsWith('.cindy')) {
-    void handleIncomingCindyFile(filePath, 'open-file');
-    return;
-  }
-  try {
-    if (!fs.statSync(filePath).isDirectory()) return;
-  } catch {
-    return; // è·¯å¾„ä¸å­˜åœ¨ / æƒé™ä¸è¶³ â†’ é™é»˜å¿½ç•¥
-  }
-  handleIncomingOpenFolder(filePath, 'open-file');
-});
-
-// â”€â”€ Single instance lock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// æ­£å¸¸ dev ä¸Ž packaged ä¸€å¾‹å¯ç”¨ã€‚è¿™æ˜¯æŠŠ OS å› æ·±é“¾(cindy://focus æŽˆæƒè¿”å›ž /
-// cindy://session ç­‰)/ å³é”® "é€šè¿‡ Cindy æ‰“å¼€" è€Œæ‹‰èµ·çš„ç¬¬äºŒä¸ªè¿›ç¨‹ redirect æˆ
-// "èšç„¦å·²è¿è¡Œçª—å£" çš„å”¯ä¸€æœºåˆ¶â€”â€”ä¸¤ä¸ªç‹¬ç«‹ Electron è¿›ç¨‹ä¹‹é—´æ²¡æœ‰åˆ«çš„é€šé“èƒ½äº¤æŽ¥ç„¦ç‚¹ã€‚
-//
-// é”æŒ‰ flavor åˆ†åŸŸ(resolveSingleInstanceLockUserDataDir):packaged é”çœŸå®ž
-// userData(release ä¹‹é—´å•å®žä¾‹);dev é” `<userData>/dev-single-instance-lock`
-// å­ç›®å½•(dev ä¹‹é—´å•å®žä¾‹ã€æ·±é“¾ redirect ä¿æŒæœ‰æ•ˆ)ã€‚å› æ­¤ dev ä¸Žæ­£å¼ç‰ˆå¯ä»¥å…±åº“
-// åŒå¼€â€”â€”è¿™æ˜¯æ˜Žç¡®æ”¯æŒçš„å·¥ä½œæµ,è·¨å®žä¾‹å¹¶å‘ç”± SQLite WAL + busy_timeoutã€scheduler
-// DB çº§åŽŸå­è®¤é¢†ã€auth replacement-retry ç­‰æ—¢æœ‰ä»²è£æ”¶æ•›(ä¸Ž --passive å…±åº“å¤šå¼€
-// åŒä¸€å¥—)ã€‚2026-07-19 æ›¾è®© dev ä¸Ž packaged æŠ¢åŒä¸€æŠŠé”(ä¿® dev æ·±é“¾å†·å¯åŠ¨é‡å¤
-// å®žä¾‹),è¯¯ä¼¤äº† dev + release åŒå¼€,2026-07-20 æŒ‰ flavor åˆ†åŸŸæ¢å¤,ä¸¤ä¸ªç›®æ ‡åŒæ—¶ä¿ä½ã€‚
-//
-// dev `--passive` ä»å®Œå…¨è·³è¿‡é”:å®ƒçš„å…¬å¼€å¥‘çº¦æ˜¯ä¸Ž primary å…±äº«æ•°æ®ä»»æ„å¤šå¼€,ä¸€ä¸ª
-// primary åŽå¯å¹¶è¡Œä»»æ„å¤šä¸ª previewã€‚æ­¤æ¨¡å¼æ²¡æœ‰ second-instance redirect,deep link
-// è½åˆ°å“ªä¸ªå®žä¾‹ç”±å½“å‰ OS åè®®æ³¨å†Œå½’å±žå†³å®šã€‚localDb é¦–æ¬¡å¼€åº“æ—¶ä¼šåªè¯»æ ¸å¯¹
-// schema_versionã€å®Œæ•´ migration history ä¸Ž SQL/companion TS runtime æŒ‡çº¹;
-// pending / è¶…å‰ / drift éƒ½æ‹’ç»å¯åŠ¨ã€‚passive è‡ªå·±ä¸è¿ç§»/repair schema,å¹¶ç”¨å¤š
-// reader lease é˜»æ­¢ä¹‹åŽçš„ primary æŠ¢è·‘ migrationã€‚
-// éš”ç¦»æ•°æ®å®žä¾‹èµ° `--isolated[=<åå­—>]`(ç‹¬ç«‹ userData â†’ ç‹¬ç«‹é”åŸŸ,è§ docs/dev-rules/desktop-development.md)ã€‚
-if (
-  getCindyVersionLockScope() !== null ||
-  shouldRequestSingleInstanceLock({
-    isPackaged: app.isPackaged,
-    schedulerPassive: process.env.XDT_SCHEDULER_PASSIVE === '1',
-  })
-) {
-  const realUserDataDir = app.getPath('userData');
-  const lockScopeDir =
-    getCindyVersionLockScope() === 'profile'
-      ? realUserDataDir
-      : getCindyVersionLockScope() === 'dev'
-        ? path.join(realUserDataDir, 'dev-single-instance-lock')
-        : resolveSingleInstanceLockUserDataDir({
-            isPackaged: app.isPackaged,
-            userDataDir: realUserDataDir,
-          });
-  let gotTheLock: boolean;
-  if (lockScopeDir === realUserDataDir) {
-    gotTheLock = app.requestSingleInstanceLock();
-  } else {
-    // Electron æ²¡æœ‰è‡ªå®šä¹‰é”ä½œç”¨åŸŸçš„ API:é”æ–‡ä»¶ / socket æŒ‰è°ƒç”¨æ—¶åˆ»çš„ userData
-    // è·¯å¾„ç”Ÿæˆã€‚è¿™é‡Œåœ¨åŒæ­¥çª—å£å†…ä¸´æ—¶åˆ‡æ¢ userData å†è¿˜åŽŸâ€”â€”ä¸»è¿›ç¨‹å•çº¿ç¨‹,ä¸­é—´
-    // ä¸ä¼šæœ‰å…¶å®ƒ JS è§‚å¯Ÿåˆ°ä¸´æ—¶å€¼;é”å»ºç«‹åŽå†…éƒ¨é€šé“ä¸Ž userData åŽç»­å–å€¼æ— å…³ã€‚
-    fs.mkdirSync(lockScopeDir, { recursive: true });
-    app.setPath('userData', lockScopeDir);
-    try {
-      gotTheLock = app.requestSingleInstanceLock();
-    } finally {
-      app.setPath('userData', realUserDataDir);
-    }
-  }
-  if (!gotTheLock) {
-    markDesktopDevStartupFailed(
-      'SINGLE_INSTANCE_OWNED',
-      'Another Cindy instance already owns this single-instance lock scope.',
-      { userDataDir: realUserDataDir, lockScopeDir },
-    );
-    app.quit();
-  } else {
-    recordCindyVersionActive();
-    app.on('second-instance', (_event, argv) => {
-      // Windows: ç”¨æˆ·ç‚¹ cindy://(æˆ–åŽ†å² xdt-maker://)é“¾æŽ¥ / å³é”® "é€šè¿‡ Cindy æ‰“å¼€" æ—¶,
-      // OS ä¼šå†èµ·ä¸€ä¸ªæœ¬ app å®žä¾‹; å•ä¾‹é”æŠŠå®ƒ redirect æˆ second-instance äº‹ä»¶,
-      // URL æˆ– --open-folder å‚æ•°éƒ½åœ¨ argv é‡Œã€‚macOS ä¸èµ°è¿™ä¸ªè·¯å¾„(èµ° open-url),
-      // Linux ç”± .desktop å†³å®šã€‚
-      //
-      // ä¸¤ç±»å…¥å£äº’æ–¥ (else if):argv åœ¨çŽ°å®žé‡Œåªä¼šæœ‰å…¶ä¸€,ä½†å¦‚æžœæ‰‹å·¥å‘½ä»¤è¡ŒåŒæ—¶
-      // ç»™äº†ä¸¤ç§,ä¼˜å…ˆ deep link URL (åŽ†å²è¯­ä¹‰å…ˆè¡Œ,xdt-maker:// æ¯” --open-folder
-      // æ—©ä¸€ä¸ªç‰ˆæœ¬ä¸Šçº¿),é¿å…åŒ dispatch / åŒ navigate è®© renderer çœ‹åˆ°ä¸€é—ªè€Œè¿‡
-      // çš„ä¸­é—´æ€ã€‚
-      const url = findDeepLinkInArgv(argv);
-      if (url) {
-        redactConsumedDeepLinkInArgv(argv, url);
-        handleIncomingDeepLink(url, 'second-instance');
-      } else {
-        const openFolder = findOpenFolderInArgv(argv);
-        if (openFolder) {
-          handleIncomingOpenFolder(openFolder, 'second-instance');
-        } else {
-          // åŒå‡»å·²å…³è”çš„ .cindy(Windows):è£…å…¥ + åœé ã€‚
-          const openShareFile = findOpenShareFileInArgv(argv);
-          if (openShareFile) {
-            handleIncomingShareFile(openShareFile, 'second-instance');
-          } else {
-            const cindyFile = findCindyFileInArgv(argv);
-            if (cindyFile) void handleIncomingCindyFile(cindyFile, 'second-instance');
-          }
-        }
-      }
-      // ç«¯ç‚¹æ¸…å•é˜»æ–­æœŸé—´(startupWindowCreationAllowed=false)ç¦æ­¢å»ºçª—:
-      // å¦åˆ™ preload çš„æ¨¡å—çº§ sendSync æ‰¾ä¸åˆ° handler ç›´æŽ¥ç™½å±,ä¸”çª—å£ä¼šå¸¦ç€
-      // çƒ˜ç„™ç«¯ç‚¹ç»•è¿‡"æ‹‰ä¸åˆ°æ¸…å•ä¸æ”¾è¡Œ"çš„é˜»æ–­è¯­ä¹‰ã€‚deep-link åˆ†å‘ä¸å—å½±å“
-      // (deepLink åªå‘å·²æœ‰çª—å£æŠ•é€’/æŽ’é˜Ÿ,ä¸å»ºçª—)ã€‚
-      if (startupWindowCreationAllowed && !focusMainWindow()) {
-        createWindow();
-      }
-    });
-  }
-}
-
-if (
-  app.hasSingleInstanceLock() ||
-  (getCindyVersionLockScope() === null &&
-    !shouldRequestSingleInstanceLock({
-      isPackaged: app.isPackaged,
-      schedulerPassive: process.env.XDT_SCHEDULER_PASSIVE === '1',
-    }))
-)
-  deliverCindyVersionOpenEvents();
-
-// å†·å¯åŠ¨ argv æ‰«æ â€” Windows ä¸Šé¦–æ¬¡ç‚¹é“¾æŽ¥ / å³é”® "é€šè¿‡ Cindy æ‰“å¼€" å¯åŠ¨ app
-// æ—¶, URL æˆ– --open-folder åœ¨ process.argv æœ«å°¾ã€‚macOS deep link èµ° open-url
-// (å·²åœ¨ä¸Šé¢ attach), è¿™é‡Œæ‰«åˆ°ä¹Ÿä¸ä¼šé‡å¤ dispatch; --open-folder æ˜¯ Windows-only
-// å…¥å£ (mac èµ° LSItemContentTypes / open-file äº‹ä»¶), ä¹Ÿä¸ä¼šåœ¨ mac argv å‡ºçŽ°ã€‚
-//
-// åŒ second-instance:ä¸¤ç±»å…¥å£äº’æ–¥, ä¼˜å…ˆ deep link URLã€‚
-if (process.platform !== 'darwin') {
-  const coldStartUrl = findDeepLinkInArgv(process.argv);
-  if (coldStartUrl) {
-    redactConsumedDeepLinkInArgv(process.argv, coldStartUrl);
-    handleIncomingDeepLink(coldStartUrl, 'cold-start-argv');
-  } else {
-    const coldStartOpenFolder = findOpenFolderInArgv(process.argv);
-    if (coldStartOpenFolder) {
-      handleIncomingOpenFolder(coldStartOpenFolder, 'cold-start-argv');
-    } else {
-      // åŒå‡»å·²å…³è”çš„ .cindy å†·å¯åŠ¨(Windows):è£…å…¥å‘ç”Ÿåœ¨çª—å£åˆ›å»ºå‰,é¦–å¸§
-      // listSync å³å«æ–°æ„è¯†,é¢æ¿ç¬¬ä¸€å¸§å°±ä½(è§„åˆ™ 7)ã€‚
-      const coldStartShareFile = findOpenShareFileInArgv(process.argv);
-      if (coldStartShareFile) {
-        handleIncomingShareFile(coldStartShareFile, 'cold-start-argv');
-      } else {
-        const coldStartCindy = findCindyFileInArgv(process.argv);
-        if (coldStartCindy) void handleIncomingCindyFile(coldStartCindy, 'cold-start-argv');
-      }
-    }
-  }
-}
-
-// å¯åŠ¨æ—¶å°è¯•è‡ªæ³¨å†Œ Windows å³é”®èœå•(æ˜¾ç¤ºæ–‡æ¡ˆèµ° BRAND_NAME)ã€‚fire-and-forget,
-// å®Œå…¨ä¸é˜»å¡žå¯åŠ¨æµç¨‹;å¤±è´¥ä»… warn logã€‚è¯¦è§ folderContextMenu.ts æ¨¡å—å¤´æ³¨é‡Šã€‚
-//
-// ä½ç½®åœ¨ single-instance é”ä¹‹åŽ,ä½† app.quit() ä¸ä¸­æ­¢é¡¶å±‚åŒæ­¥ä»£ç ,ç¬¬äºŒå®žä¾‹
-// (gotTheLock=false)ä»ä¼šæ‰§è¡Œåˆ°è¿™é‡Œâ€”â€”ä¸‰ä¸ªè‡ªæ„ˆéƒ½æ˜¯å¹‚ç­‰ + å…¨åžé”™,é‡å¤æ‰§è¡Œæ— å®³,
-// ä¸ä¸ºæ­¤åŠ é—¨æŽ§ã€‚
-if (app.isPackaged) {
-  void registerFolderContextMenu();
-  // Windows .cindy æ–‡ä»¶å…³è”è‡ªæ³¨å†Œ(åŒå‡»è£…å…¥æ„è¯†)ã€‚åŒæ¬¾ best-effort å£å¾„ã€‚
-  registerCindyFileAssociation();
-  // å“ç‰Œæ”¹åå¿«æ·æ–¹å¼è‡ªæ„ˆ(XDMaker.lnk â†’ Cindy.lnk;å·®é‡æ›´æ–°ä¸é‡è·‘å®‰è£…å™¨,
-  // å­˜é‡ç”¨æˆ·é è¿™é‡Œæ¢å)ã€‚åŒæ¬¾ best-effort å£å¾„,è¯¦è§æ¨¡å—å¤´æ³¨é‡Šã€‚
-  void healWindowsShortcuts();
-}
-
-const createWindow = () => {
-  let resourceUsagePrewarmTimer: ReturnType<typeof setTimeout> | null = null;
-  const platformOptions =
-    process.platform === 'darwin'
-      ? { titleBarStyle: 'hidden' as const, trafficLightPosition: { x: 12, y: 16 } }
-      : { frame: false };
-
-  // é¦–æ¬¡ç‚¹å‡»æ˜¯å¦é€ä¼ ç»™é¡µé¢ã€‚é»˜è®¤ true(swallow=ä¸é€ä¼ ),ç­‰ä»·äºŽ Electron macOS
-  // acceptFirstMouse é»˜è®¤å€¼;ç”¨æˆ·åœ¨ Settings â†’ çª—å£è¡Œä¸ºé‡Œå¯å…³æŽ‰ã€‚macOS ä¸Š
-  // acceptFirstMouse æ˜¯ Cocoa çº§å‚æ•°,åªåœ¨çª—å£åˆ›å»ºæ—¶è¯»ä¸€æ¬¡,æ‰€ä»¥ä»Ž userData
-  // è½ç›˜æ–‡ä»¶è¯»å–(renderer æ¯æ¬¡æ”¹åŠ¨éƒ½ä¼š IPC åŒæ­¥è½ç›˜),ç”¨æˆ·åˆ‡å®Œå¼€å…³éœ€è¦é‡å¯
-  // åº”ç”¨ macOS ä¾§æ‰ç”Ÿæ•ˆã€‚Windows ä¸Šæ­¤å‚æ•°æ˜¯ no-op(Chromium å¿½ç•¥),Windows ä¾§
-  // æ•ˆæžœç”± renderer çš„ swallowActivationClick DOM adapter æ‰¿æŽ¥,å³æ—¶ç”Ÿæ•ˆã€‚
-  const swallowActivationClick = readWindowBehaviorSettings().swallowActivationClick;
-
-  // Windows uses the renderer theme-mode mirror before the first BrowserWindow exists;
-  // missing/invalid mirrors and other platforms keep the native OS-theme fallback.
-  // mac:åˆ›å»ºæœŸå³é€æ˜Žåº•+sidebar æè´¨(Electron setBackgroundColor è¿è¡Œæ—¶æ”¹ alpha ä¸å¯é ,æ˜¯ vibrancy ä¸é€å£çº¸çš„æ ¹å› ;éž CINDY çš®è‚¤ body ä¸é€æ˜Žä¼šè‡ªç„¶ç›–ä½,è§†è§‰æ— å½±å“)
-  const persistedTheme = process.platform === 'win32' ? readWindowThemeSnapshot() : null;
-  const isDark =
-    process.platform === 'win32'
-      ? resolveAppThemeIsDark(
-          nativeTheme.shouldUseDarkColors,
-          persistedTheme?.mode,
-          persistedTheme?.resolvedIsDark,
-        )
-      : nativeTheme.shouldUseDarkColors;
-  const bgColor = process.platform === 'darwin' ? '#00000000' : isDark ? '#1f1f1e' : '#f8f8f6';
-  const winBackdropConfig = resolveVibrancyConfig(
-    persistedTheme?.familyId ?? 'cindy',
-    isDark,
-    process.platform,
-  );
-
-  // Window state persistence (F-WST-1): remembers position / size / maximized
-  // / fullscreen across launches. Falls back to the defaults below on first
-  // launch or if the saved state is off-screen (the lib clamps for us).
-  // Storage: <userData>/window-state.json
-  // æ”¹ç”¨é¡¶å±‚ import è€Œä¸æ˜¯è¿è¡Œæ—¶ require â€”â€” Vite æ‰èƒ½ bundle è¿› main äº§ç‰©ï¼Œ
-  // å¦åˆ™ packaged app å›  pnpm hoisted å¸ƒå±€ + electron-packager åªæ‰«
-  // apps/desktop/node_modules è€Œæ‹¿ä¸åˆ°è¿™ä¸ªåŒ…ï¼Œè¿è¡Œæ—¶æŠ¥ Cannot find moduleã€‚
-  const mainWindowStateFile = 'window-state.json';
-  // Read the flag before the keeper validates bounds: it discards `isMaximized`
-  // along with off-screen bounds, which is exactly the lid-closed / monitor-asleep
-  // relaunch case where we still want to come back maximized.
-  const persistedMaximized = readPersistedWindowMaximized(
-    path.join(app.getPath('userData'), mainWindowStateFile),
-  );
-  const mainWindowState = windowStateKeeper({
-    file: mainWindowStateFile,
-    defaultWidth: 1280,
-    defaultHeight: 800,
-    // Applying fullscreen while a hidden macOS window is still starting can
-    // leave the restored window without native traffic lights.
-    fullScreen: process.platform !== 'darwin',
-  });
-  const shouldRestoreMacFullscreen = process.platform === 'darwin' && mainWindowState.isFullScreen;
-  const shouldRestoreMaximized =
-    !shouldRestoreMacFullscreen && (persistedMaximized || Boolean(mainWindowState.isMaximized));
-
-  const mainWindow = new BrowserWindow({
-    x: mainWindowState.x,
-    y: mainWindowState.y,
-    width: mainWindowState.width,
-    height: mainWindowState.height,
-    minWidth: 800,
-    minHeight: 600,
-    title: BRAND_NAME,
-    icon: app.isPackaged
-      ? path.join(process.resourcesPath, 'icon.png')
-      : path.join(__dirname, '../../resources/icon.png'),
-    autoHideMenuBar: true,
-    show: false,
-    backgroundColor: bgColor,
-    ...(process.platform === 'win32' && winBackdropConfig.backgroundMaterial
-      ? {
-          backgroundMaterial: winBackdropConfig.backgroundMaterial,
-          backgroundColor: winBackdropConfig.backgroundColor,
-        }
-      : {}),
-    ...(process.platform === 'darwin' ? { vibrancy: 'hud' as const } : {}), // åˆ›å»ºæœŸæè´¨ä¸Žç¼ºçœå®šç¨¿ä¸€è‡´(hud);è¿è¡Œæ—¶æŒ‰ä¸»é¢˜æ—ç» applyWindowVibrancy ä¿®æ­£
-    acceptFirstMouse: !swallowActivationClick,
-    ...platformOptions,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      additionalArguments: [
-        createWindowBackdropMaterialArgument(winBackdropConfig.backgroundMaterial ?? 'none'),
-      ],
-      spellcheck: false,
-      // é»˜è®¤ä¿ç•™ Chromium åŽå°èŠ‚æµï¼›åªæœ‰ active turn æˆ– terminal grace æœŸé—´æ‰ç”±
-      // setMainWindowBackgroundThrottlingForActiveTurn ä¸´æ—¶å…³é—­ï¼Œé¿å…åŽå° idle å¸¸é©»è€—ç”µã€‚
-      backgroundThrottling: true,
-      // RSB Phase 4:å¼€å¯åµŒå¥— `<webview>` æ ‡ç­¾,ç»™ web-browser plugin ç”¨ã€‚
-      // å®‰å…¨ prefs å…¨éƒ¨åœ¨ will-attach-webview é˜¶æ®µè¢« hardener å¼ºåˆ¶è¦†ç›–
-      // (webview-security.ts),renderer ç«¯å†™çš„å±žæ€§ä¸ä¼šç ´å guest éš”ç¦»ã€‚
-      // Feishu OAuth èµ° will-navigate è‡ªå®šä¹‰ scheme + ä¸»çª—è‡ªèº« webContents,
-      // è·ŸåµŒå¥— webview æ˜¯ä¸¤æ¡ç‹¬ç«‹è·¯å¾„,ä¸å—å½±å“ã€‚
-      webviewTag: true,
-      // File drops are handled by renderer attachment/global-drop handlers.
-      // Do not let Chromium navigate the main window to a local dropped path
-      // when a platform-specific drag event misses a target.
-      navigateOnDragDrop: false,
-    },
-  });
-  markAppContentWindow(mainWindow);
-  installSelectionContextMenu(mainWindow);
-  installWindowResponsivenessDiagnostics(mainWindow, { label: 'main' });
-  mainWindowRef = mainWindow;
-  applyMainWindowBackgroundThrottling();
-  applyPageZoomLevel(mainWindow, getPersistedWindowZoom());
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (mainWindow.isDestroyed()) return;
-    applyPageZoomLevel(mainWindow, getPersistedWindowZoom());
-  });
-  // Deep link æ¨¡å—æŒæœ‰åŒä¸€ä¸ª mainWindow å¼•ç”¨ â€” è§£æžå‡ºçš„ URL é€šè¿‡ webContents.send
-  // æŽ¨ç»™ renderer (channel 'deep-link:navigate')ã€‚å…³çª—æ—¶åŒæ­¥æ¸…ç©º, é¿å…ç»™å·²é”€æ¯
-  // çš„ BrowserWindow å‘ IPC è§¦å‘ 'Object has been destroyed'ã€‚
-  setDeepLinkMainWindow(mainWindow);
-  mainWindow.once('closed', () => {
-    if (resourceUsagePrewarmTimer) {
-      clearTimeout(resourceUsagePrewarmTimer);
-      resourceUsagePrewarmTimer = null;
-    }
-    resourceUsageWindowController.destroyWindow();
-    remoteDesktopViewerWindows.reset();
-    rsbWindowController.destroyWindow();
-    ghostPanelWindowsController.destroyAllWindows();
-    if (mainWindowRef === mainWindow) mainWindowRef = null;
-    setDeepLinkMainWindow(null);
-  });
-  // Main-window close policy is explicit because hidden utility windows (for
-  // example the prewarmed global voice overlay) can keep the process alive.
-  mainWindow.on('close', (event) => {
-    if (isQuitting) return;
-    // macOS: keep the window + renderer alive and hide only, so Dock activation
-    // can restore it without remounting the renderer.
-    if (process.platform === 'darwin') {
-      event.preventDefault();
-      resourceUsageWindowController.hideWithOwner();
-      if (mainWindow.isFullScreen()) {
-        mainWindow.once('leave-full-screen', () => {
-          if (!mainWindow.isDestroyed()) mainWindow.hide();
-        });
-        mainWindow.setFullScreen(false);
-      } else {
-        mainWindow.hide();
-      }
-      return;
-    }
-    // Windows and Linux ask once on first close, then reuse the persisted choice.
-    // The keep-running action follows each platform: tray on Windows, minimize on Linux.
-    event.preventDefault();
-    if (process.platform === 'win32') {
-      const behavior = readWindowBehaviorSettings().windowsCloseBehavior;
-      if (!behavior) {
-        windowsClosePromptFallback.request();
-        return;
-      }
-      applyWindowsCloseBehavior(mainWindow, behavior);
-      return;
-    }
-    if (process.platform === 'linux') {
-      const behavior = readWindowBehaviorSettings().linuxCloseBehavior;
-      if (!behavior) {
-        linuxClosePromptFallback.request();
-        return;
-      }
-      applyLinuxMainWindowCloseBehavior(mainWindow, behavior, () => app.quit());
-      return;
-    }
-    app.quit();
-  });
-  void ensureMainAppPresence('main-window-created', mainWindow);
-
-  installApplicationMenu(
-    mainWindow,
-    currentApplicationMenuLocale ?? getPreferredApplicationLocale(),
-  );
-
-  // Windows / Linux æ²¡æœ‰ Mac åº”ç”¨èœå• acceleratorã€‚ä¸»çª—å£å’Œä¼šè¯å‰¯çª—å£éƒ½èµ°
-  // åŒä¸€ä¸ªçª—å£çº§å®‰è£…å™¨ï¼Œå‘½ä»¤å‘å›žå®žé™…æŽ¥æ”¶æŒ‰é”®çš„çª—å£ï¼›Mac å®‰è£…å™¨ä¼šç›´æŽ¥ no-opã€‚
-  installNewMakerWindowShortcut(mainWindow);
-
-  // Register before state restoration so the initial transition is tracked.
-  installWindowFullscreenStateBroadcast(mainWindow, {
-    // macOS 26 no longer emits will-leave-full-screen. Resize detects the
-    // animation start so traffic-light padding returns before the end event.
-    getDisplayBounds: (bounds) => screen.getDisplayMatching(bounds).bounds,
-  });
-
-  // Wire resize / move / maximize / fullscreen listeners that persist the
-  // state to disk on `close`. Must run before any user resize event fires.
-  mainWindowState.manage(mainWindow);
-  if (shouldRestoreMaximized && !mainWindow.isMaximized()) mainWindow.maximize();
-  // Windows can transiently unmaximize during display/DPI re-layout. macOS
-  // owns its native Zoom behavior, so do not install the Windows recovery
-  // state machine there.
-  if (process.platform === 'win32') {
-    const maximizeRecovery = installMainWindowMaximizeRecovery(mainWindow, screen, {
-      armed: shouldRestoreMaximized,
-      log: createSchedulerLogger('main-window-maximize-recovery'),
-    });
-    mainWindowMaximizeRecoveryController = maximizeRecovery;
-    const removeNativeRestoreIntent = installMainWindowNativeRestoreIntent(
-      mainWindow,
-      maximizeRecovery.notifyUserUnmaximizeIntent,
-    );
-    mainWindow.once('closed', () => {
-      removeNativeRestoreIntent();
-      if (mainWindowMaximizeRecoveryController === maximizeRecovery) {
-        mainWindowMaximizeRecoveryController = null;
-      }
-    });
-  }
-
-  // dev-only:F12 åˆ‡æ¢ DevTools çš„å…œåº•é€šé“ã€‚èµ° before-input-event åœ¨ main ä¾§
-  // æ‹¦æˆª,æŒ‰é”®æ ¹æœ¬ä¸è¿› renderer â€”â€” ä¸å—é¡µé¢å†…å¿«æ·é”®ç³»ç»Ÿ / è¾“å…¥ç„¦ç‚¹ / èœå•
-  // accelerator æ³¨å†ŒçŠ¶æ€å½±å“,ä»»ä½• dev çŽ¯å¢ƒéƒ½ä¿è¯èƒ½å¼€ã€‚F12 æœªè¢«åº”ç”¨å†…ä»»ä½•
-  // å¿«æ·é”®å ç”¨,æ— åŒè§¦å‘é£Žé™©;æ­£å¼åŒ…(app.isPackaged)ä¸æŒ‚è½½,é›¶æš´éœ²ã€‚
-  if (!app.isPackaged) {
-    mainWindow.webContents.on('before-input-event', (_event, input) => {
-      if (input.type === 'keyDown' && input.key === 'F12') {
-        mainWindow.webContents.toggleDevTools();
-      }
-    });
-  }
-
-  // Show window only after content is rendered â€” eliminates theme flash
-  mainWindow.once('ready-to-show', () => {
-    showMainWindowAndRestoreFullscreen(mainWindow, {
-      restoreFullscreen: shouldRestoreMacFullscreen,
-    });
-    refreshWindowsAppBadge();
-    if (!app.isPackaged || isCindyVersionLaunchPending())
-      markDesktopDevWindowReady(mainWindow.webContents.getOSProcessId());
-    void runComputerUseSmokeIfRequested();
-    // èµ„æºç”¨é‡çª—å£ä¸åº”ä¸Žä¸»çª—å£é¦–å¸§äº‰ CPUã€‚ä¸»çª—å£å¯è§åŽå†åŽå°å®Œæˆ BrowserWindowã€
-    // renderer å’Œé¦–ä»½è¿›ç¨‹å¿«ç…§é¢„çƒ­ï¼›å›žè°ƒç»‘å®šå½“ä»£ä¸»çª—å£ï¼Œé‡å»º/é€€å‡ºåŽä¸ä¼šåˆ›å»ºå­¤å„¿çª—ã€‚
-    resourceUsagePrewarmTimer = setTimeout(() => {
-      resourceUsagePrewarmTimer = null;
-      if (isQuitting || mainWindowRef !== mainWindow || mainWindow.isDestroyed()) return;
-      resourceUsageWindowController.setLocale(
-        currentApplicationMenuLocale ?? getPreferredApplicationLocale(),
-      );
-      resourceUsageWindowController.prewarm();
-      remoteDesktopViewerWindows.setLocale(
-        currentApplicationMenuLocale ?? getPreferredApplicationLocale(),
-      );
-      remoteDesktopViewerWindows.prewarm();
-      // å³ä¾§æ å­çª—å£é¢„çƒ­:å¤åˆ»èµ„æºç”¨é‡çª—å£æ¨¡å¼,ä¸»çª—å£å¯è§åŽåŽå°åˆ›å»º
-      // éšè— BrowserWindow å¹¶åŠ è½½è½»é‡ renderer,åŽç»­ detach ç‚¹å‡»ä»… show+focusã€‚
-      rsbWindowController.prewarm();
-      // æ’ä»¶é¢æ¿ä¿æŒæŒ‰éœ€åˆ›å»ºï¼šåˆ†ç¦»çŠ¶æ€ä¸è·¨é‡å¯æ¢å¤ï¼Œå¤šå®žä¾‹ä¹Ÿä¸åœ¨å¯åŠ¨æœŸå…¨é‡é¢„çƒ­ã€‚
-    }, 1_500);
-    resourceUsagePrewarmTimer.unref?.();
-    // æ—¥å¿—ä¸ŠæŠ¥çš„å¯åŠ¨è¡¥ä¼ :é‡‡é›† + è„±æ•æ˜¯åŒæ­¥çš„é‡æ´»,å¿…é¡»è®©ä¸»çª—å£å…ˆå‡ºæ¥(å†…éƒ¨å†å»¶è¿Ÿ 15s,
-    // é¿å¼€é¦–å¸§çš„ IO äº‰ç”¨)ã€‚æ²¡æœ‰å¾…è¡¥ä¼ æ ‡è®°æ—¶æ˜¯é›¶æˆæœ¬ no-opã€‚
-    scheduleStartupBackfill();
-    // `open` may successfully start the updated process while macOS refuses
-    // frontmost activation at the lock/login window. Presentation is not an
-    // installation-health signal; retain a one-shot focus grant for unlock.
-    updatePresentationRecovery?.onWindowReady();
-    if (process.env.OPEN_DEVTOOLS === '1') {
-      mainWindow.webContents.openDevTools();
-    }
-    // å†·å¯åŠ¨é˜¶æ®µç¼“å­˜çš„ deep link / --open-folder payload ç”± MainLayout mount åŽ
-    // é€šè¿‡ IPC 'deep-link:take-pending' ä¸»åŠ¨æ‹‰å–æ¶ˆè´¹ (è§ deepLink.ts pending
-    // buffer æ³¨é‡Š)ã€‚è¿™æ ·æœªç™»å½•ç”¨æˆ·å†·å¯åŠ¨åŽå®Œæˆ Feishu OAuth â†’ MainLayout ç¬¬ä¸€æ¬¡
-    // mount â†’ åŒä¸€æ¡ pull è·¯å¾„æ¶ˆè´¹ payload, ä¸ä¼šå› ä¸ºç™»å½•æµç¨‹è·³è¿‡è€Œä¸¢å¤±æ„å›¾ã€‚
-  });
-
-  // è£…é¥°åŠ¨ç”»é—¸é—¨çš„å…œåº•ä¿¡å·ã€‚ä¸»çª—åœ¨ running turn æœŸé—´ä¼šå…³æŽ‰ backgroundThrottling,
-  // é‚£ä¹‹åŽ Renderer çš„ visibilityState å°±ä¸å†åæ˜ çœŸå®žå¯è§æ€§,ç»†èŠ‚è§æ¨¡å—å¤´æ³¨é‡Šã€‚
-  setGhostNodeRuntimeStartAttemptContextReader(() => {
-    let observedMainWindowState:
-      'absent' | 'hidden' | 'minimized' | 'visible-unfocused' | 'focused' | 'unknown' = 'unknown';
-    try {
-      if (mainWindow.isDestroyed()) observedMainWindowState = 'absent';
-      else if (mainWindow.isMinimized()) observedMainWindowState = 'minimized';
-      else if (!mainWindow.isVisible()) observedMainWindowState = 'hidden';
-      else if (mainWindow.isFocused()) observedMainWindowState = 'focused';
-      else observedMainWindowState = 'visible-unfocused';
-    } catch {
-      observedMainWindowState = 'unknown';
-    }
-    let observedScreenState: 'active' | 'idle' | 'locked' | 'unknown' = 'unknown';
-    try {
-      const state = powerMonitor.getSystemIdleState(60);
-      if (state === 'active' || state === 'idle' || state === 'locked') {
-        observedScreenState = state;
-      }
-    } catch {
-      observedScreenState = 'unknown';
-    }
-    return { observedMainWindowState, observedScreenState };
-  });
-  installWindowHiddenBroadcast(mainWindow);
-  // Keyboard hello when the window comes back from hide / minimize / Dock.
-  attachWorkLouderCodexWindowReveal(mainWindow);
-
-  // App badge æŠ•å½±å½“å‰ä»»åŠ¡å…³æ³¨æ€»æ•°ï¼›çª—å£èšç„¦ä¸ç­‰äºŽè¯»å®Œæ‰€æœ‰ä»»åŠ¡ï¼Œä¸æ¸…æ€»æ•°ã€‚
-  // Agent Island smart suppression åŒæ ·æŒ‰ app çº§ç„¦ç‚¹åˆ¤æ–­:ä¸»çª— blur åˆ°ã€Œåœ¨æ–°çª—å£æ‰“å¼€ã€
-  // çš„ä¼šè¯å‰¯çª—æ—¶,ç”¨æˆ·ä»åœ¨ Cindy å†…,ä¸èƒ½æŠŠ appFocused ç½® falseã€‚
-
-  // Find-in-page: forward Chromium's match results back to the renderer overlay.
-  // The renderer drives findInPage / stopFindInPage via IPC (see registerIpcHandlers).
-  mainWindow.webContents.on('found-in-page', (_event, result) => {
-    mainWindow.webContents.send('find-in-page:result', {
-      requestId: result.requestId,
-      activeMatchOrdinal: result.activeMatchOrdinal,
-      matches: result.matches,
-      finalUpdate: result.finalUpdate,
-    });
-  });
-
-  // Global navigation guard â€” any http(s) link that tries to navigate the
-  // main window or open a new window is redirected to the system browser.
-  //
-  // Dev caveat: in dev the renderer itself is hosted at http://localhost:<port>,
-  // so a naive http(s) check would also send our own internal navigations
-  // (e.g. notification-click â†’ navigate('/cc-agent/<id>')) out to the system
-  // browser. Whitelist the dev server origin so only true externals leak out.
-  // Production loads via file:// which never matches the http(s) check, so the
-  // whitelist is a no-op there.
-  const devOrigin = MAIN_WINDOW_VITE_DEV_SERVER_URL
-    ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).origin
-    : null;
-  const isInternalUrl = (url: string): boolean => {
-    if (!devOrigin) return false;
-    try {
-      return new URL(url).origin === devOrigin;
-    } catch {
-      return false;
-    }
-  };
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isInternalUrl(url)) return;
-    const parsed = new URL(url);
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-  });
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isInternalUrl(url)) return { action: 'allow' };
-    const parsed = new URL(url);
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      shell.openExternal(url);
-    }
-    return { action: 'deny' };
-  });
-
-  // â”€â”€ Renderer åŠ è½½å¤±è´¥å¯è§‚æµ‹æ€§(dev + prod)â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // é»‘å±ä¸‰å…„å¼Ÿä»¥å‰å…¨æ˜¯ã€Œå“‘å¼¹ã€:ä¸»è¿›ç¨‹æ—¥å¿—é›¶ç—•è¿¹ã€çª—å£æ°¸è¿œé»‘ç€ã€‚è¿™é‡ŒæŠŠå®ƒä»¬å…¨éƒ¨æŽ¥è¿›
-  // ç»Ÿä¸€æ—¥å¿—;dev ä¸‹å åŠ  RendererBootGuard è¶…æ—¶è‡ªåŠ¨ reload è‡ªæ„ˆã€‚
-  mainWindow.webContents.on('preload-error', (_e, preloadPath, error) => {
-    rendererGuardLog.error(`preload-error path=${preloadPath} error=${error.message}`);
-  });
-  mainWindow.webContents.on('console-message', (details) => {
-    // error æ’è®°;warning ä»… dev(react dev å‘Šè­¦ç­‰å™ªéŸ³ä¸è¿›ç”Ÿäº§æ—¥å¿—)ã€‚æˆªæ–­é˜²è¶…é•¿å †æ ˆåˆ·å±ã€‚
-    //
-    // âš ï¸ è¿™é‡Œåˆ»æ„ç”¨ `renderer-console` è€Œä¸æ˜¯ `renderer-guard`:è½¬å‘çš„æ˜¯**æ¸²æŸ“è¿›ç¨‹ä»»æ„
-    // console æ­£æ–‡**,å¯èƒ½å¸¦ç”¨æˆ·å†…å®¹(åŠŸèƒ½ä»£ç çš„ console.error é‡Œçš„æ¶ˆæ¯æ–‡æœ¬ã€æœç´¢è¯ã€
-    // ç¬¬ä¸‰æ–¹åº“æ‰“å‡ºçš„ payloadã€React é”™è¯¯è¾¹ç•Œé‡Œçš„ props)ã€‚æ—¥å¿—ä¸ŠæŠ¥çš„æ¥æºç™½åå•åªæ”¾è¡Œ
-    // `renderer-guard`(preload-error / åŠ è½½å¤±è´¥ / boot guard â€”â€” ç™½å±æŽ’æŸ¥å¿…éœ€ä¸”æ— ç”¨æˆ·å†…å®¹),
-    // `renderer-console` ä¸åœ¨åå•å†…ã€‚ä¸¤è€…æ··ç”¨åŒä¸€ä¸ª scope ä¼šè®©æ•´ç±»æ¸²æŸ“è¿›ç¨‹å†…å®¹è·Ÿç€æ”¾è¡Œ,
-    // è¿åã€Œæ¸²æŸ“è¿›ç¨‹è½¬å‘çš„æ—¥å¿—æ•´ç±»ä¸¢å¼ƒã€(docs/dev-rules/log-upload-and-redaction.md Â§1.2)ã€‚
-    const { level, message, lineNumber, sourceId } = details;
-    if (level === 'error') {
-      rendererConsoleLog.error(
-        `renderer console.error ${sourceId}:${lineNumber} ${message.slice(0, 2000)}`,
-      );
-    } else if (level === 'warning' && !app.isPackaged) {
-      rendererConsoleLog.warn(
-        `renderer console.warn ${sourceId}:${lineNumber} ${message.slice(0, 2000)}`,
-      );
-    }
-  });
-  let devLoadRetries = 0;
-  mainWindow.webContents.on(
-    'did-fail-load',
-    (_e, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      // -3 (ERR_ABORTED) æ˜¯æ­£å¸¸å¯¼èˆªä¸­æ–­(reload / redirect),ä¸æ˜¯å¤±è´¥ã€‚
-      if (!isMainFrame || errorCode === -3) return;
-      rendererGuardLog.error(
-        `did-fail-load code=${errorCode} desc=${errorDescription} url=${validatedURL}`,
-      );
-      // dev: vite dev server æœªå°±ç»ª / çŸ­æš‚ç«žæ€ â†’ å®šæ¬¡é€€é¿é‡è¯•,æ›¿ä»£æ°¸ä¹…é»‘å±ã€‚
-      if (MAIN_WINDOW_VITE_DEV_SERVER_URL && devLoadRetries < 5 && !mainWindow.isDestroyed()) {
-        devLoadRetries += 1;
-        const delayMs = 1000 * devLoadRetries;
-        rendererGuardLog.info(`retrying loadURL in ${delayMs}ms (attempt ${devLoadRetries}/5)`);
-        setTimeout(() => {
-          if (!mainWindow.isDestroyed()) void mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-        }, delayMs);
-      }
-    },
-  );
-
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-    // dev-only å¯åŠ¨çœ‹é—¨ç‹—:renderer åœ¨æ¨¡å—æ±‚å€¼æœŸçŒæ­»(stale prebundle ç­‰)æ—¶é¡µé¢ä¸è§¦å‘
-    // did-fail-load,å”¯ä¸€å¯é åˆ¤æ®æ˜¯ã€Œè¿Ÿè¿Ÿæ²¡æœ‰ä»»ä½• renderer ä¾§ä¿¡å·ã€ã€‚å­˜æ´»ä¿¡å·ç”±
-    // renderer:log IPC ä¸Ž check-environment handler å›žè°ƒ markAlive()(è§ registerIpcHandlers)ã€‚
-    rendererBootGuard?.dispose();
-    rendererBootGuard = new RendererBootGuard(mainWindow.webContents, {
-      logError: (msg) => rendererGuardLog.error(msg),
-      logInfo: (msg) => rendererGuardLog.info(msg),
-    });
-    rendererBootGuard.start();
-    mainWindow.once('closed', () => {
-      rendererBootGuard?.dispose();
-      rendererBootGuard = null;
-    });
-  } else {
-    mainWindow.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
-  }
-};
-
-let disposeSkillhubAutoSyncAuthListener: (() => void) | null = null;
-let disposeProviderAccessAuthListener: (() => void) | null = null;
-let pluginMarketSyncInFlightScope: string | null = null;
-let lastPluginMarketSyncScope: string | null = null;
-let lastPluginMarketSyncAt = 0;
-let pluginMarketPeriodicSyncTimer: ReturnType<typeof setInterval> | null = null;
-const PLUGIN_MARKET_PERIODIC_SYNC_MS = 30 * 60 * 1000;
-
-let startupDatabaseSizeWarningStatus: DatabaseSizeWarningStatus = { databaseBytes: null };
-let startupDatabaseSizeWarningStatusChecked = false;
-let startupDatabaseSizeWarningOwnerScope: string | null = null;
-
-function collectCurrentDatabaseSizeWarningStatus(): DatabaseSizeWarningStatus {
-  return collectDatabaseSizeWarningStatus({
-    getCurrentDbPath: localDbGetCurrentDbPath,
-    getCurrentUserId: getCurrentDbClientUserId,
-    resolveDbPathForUser: getDbPathForUser,
-  });
-}
-
-function broadcastDatabaseSizeWarningChanged(): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
-      win.webContents.send('database-size-warning:changed');
-    }
-  }
-}
-
-const databaseSizeWarningSettingsWatcher = createDatabaseSizeWarningSettingsWatcher(() => {
-  broadcastDatabaseSizeWarningChanged();
-});
-
-app.once('will-quit', () => databaseSizeWarningSettingsWatcher.dispose());
-
-function rebindDatabaseSizeWarningSettingsWatcher(): void {
-  databaseSizeWarningSettingsWatcher.rebind(getDatabaseSizeWarningSettingsFilePath());
-}
-
-/** Capture the database size once after the first local DB startup completes. */
-function checkDatabaseSizeWarningAtStartup(): void {
-  const ownerScope = activeOwnerScopeKey();
-  if (
-    startupDatabaseSizeWarningStatusChecked &&
-    startupDatabaseSizeWarningOwnerScope === ownerScope
-  )
-    return;
-  startupDatabaseSizeWarningStatus = collectCurrentDatabaseSizeWarningStatus();
-  startupDatabaseSizeWarningStatusChecked = true;
-  startupDatabaseSizeWarningOwnerScope = ownerScope;
-  dbClientLog.info(
-    'database size warning startup check completed',
-    startupDatabaseSizeWarningStatus,
-  );
-  broadcastDatabaseSizeWarningChanged();
-}
-
-/** Run market discovery and automatic updates for the current stable owner. */
-function syncPluginMarketForActiveOwner(minIntervalMs = 0): void {
-  const session = getActiveAppSession();
-  if (!session.dataOwnerId || isAppSessionBoundaryPending()) return;
-  const scope = activeOwnerScopeKey();
-  if (scope === pluginMarketSyncInFlightScope) return;
-  const now = Date.now();
-  if (scope === lastPluginMarketSyncScope && now - lastPluginMarketSyncAt < minIntervalMs) {
-    return;
-  }
-  pluginMarketSyncInFlightScope = scope;
-  lastPluginMarketSyncScope = scope;
-  lastPluginMarketSyncAt = now;
-  void syncDefaultMarketPlugins().finally(() => {
-    if (pluginMarketSyncInFlightScope === scope) pluginMarketSyncInFlightScope = null;
-  });
-}
-
-function parseOptionalDeviceLinkDeviceId(value: unknown): string | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (trimmed.length === 0 || trimmed.length > 256 || value !== trimmed) {
-    throwIpcError(
-      'INVALID_PARAMS',
-      'deviceLinkDeviceId must be a non-empty, trimmed string of at most 256 characters or null',
-    );
-  }
-  return trimmed;
-}
-
-const registerIpcHandlers = () => {
-  ipcMain.handle('database-size-warning:get-settings', (event) => {
-    assertTrustedAppRendererEvent(event);
-    const state = readDatabaseSizeWarningSettingsState();
-    return {
-      ...state.value,
-      isCustomized: state.isCustomized,
-      defaultThresholdGiB: DEFAULT_DATABASE_SIZE_WARNING_THRESHOLD_GIB,
-    };
-  });
-  ipcMain.handle('database-size-warning:set-settings', async (event, payload: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    const parsed = parseDatabaseSizeWarningSettingsPatch(payload);
-    if ('error' in parsed) throwIpcError('INVALID_PARAMS', parsed.error);
-    await writeDatabaseSizeWarningSettings(parsed.patch);
-    const state = readDatabaseSizeWarningSettingsState();
-    broadcastDatabaseSizeWarningChanged();
-    return {
-      ...state.value,
-      isCustomized: state.isCustomized,
-      defaultThresholdGiB: DEFAULT_DATABASE_SIZE_WARNING_THRESHOLD_GIB,
-    };
-  });
-  ipcMain.handle('database-size-warning:reset-settings', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    await resetDatabaseSizeWarningSettings();
-    const state = readDatabaseSizeWarningSettingsState();
-    broadcastDatabaseSizeWarningChanged();
-    return {
-      ...state.value,
-      isCustomized: state.isCustomized,
-      defaultThresholdGiB: DEFAULT_DATABASE_SIZE_WARNING_THRESHOLD_GIB,
-    };
-  });
-  ipcMain.handle('database-size-warning:get-status', (event) => {
-    assertTrustedAppRendererEvent(event);
-    return startupDatabaseSizeWarningStatus;
-  });
-  ipcMain.handle('database-size-warning:measure', (event) => {
-    assertTrustedAppRendererEvent(event);
-    return collectCurrentDatabaseSizeWarningStatus();
-  });
-
-  // Find the primary app window, skipping transient utility BrowserWindows like
-  // the voice-input overlay (minimizable:false, maximizable:false). Electron's
-  // BrowserWindow.getAllWindows() ordering is not guaranteed to be stable across
-  // versions / platforms, so once the overlay has been opened once and stays
-  // cached (see voice-input/global.ts), [0] could return the overlay â€” which
-  // would silently no-op window-minimize / window-maximize IPC and make the
-  // title bar's min/max buttons appear unresponsive.
-  const getWindow = () => {
-    // ä¸»çª—å£ä¼˜å…ˆ â€”â€” ã€Œåœ¨æ–°çª—å£æ‰“å¼€ã€çš„å‰¯çª—å£ä¹Ÿæ˜¯æ™®é€šå¯æœ€å°åŒ–çª—å£, ä¸èƒ½è®©å®ƒåœ¨
-    // getAllWindows() é‡Œè¢« isMinimizable() å‘½ä¸­åŽåŠ«æŒ badge / notification /
-    // fullscreen-state è¿™äº›ã€Œä¸»çª—å£è¯­ä¹‰ã€çš„è°ƒç”¨ã€‚
-    if (mainWindowRef && !mainWindowRef.isDestroyed()) return mainWindowRef;
-    const windows = BrowserWindow.getAllWindows();
-    return windows.find((w) => !w.isDestroyed() && w.isMinimizable()) ?? windows[0];
-  };
-
-  registerBillingIpc({
-    getMainWindow: () => mainWindowRef,
-    requirePersonalAccount: () => {
-      requireAppCapability(
-        'canUseCindyAccountServices',
-        'Billing requires a personal Cindy account.',
-      );
-      if (authManager.getAuthState().user?.membershipKind !== 'personal') {
-        throwIpcError('PERMISSION_DENIED', 'Billing is only available to personal accounts.');
-      }
-    },
-  });
-
-  initAppBadgeService({
-    getWindow: () => getWindow() ?? null,
-    onSessionAttentionMarked: (sessionId) => {
-      getAgentIslandService()?.handleSessionAttentionMarked(sessionId);
-    },
-    onSessionAttentionCleared: (sessionId, intent) => {
-      getAgentIslandService()?.handleSessionAttentionCleared(sessionId, intent);
-    },
-  });
-
-  // ç³»ç»Ÿçº§é€šçŸ¥ï¼ˆCC Agent session å®Œæˆæ—¶å¼¹å‡º / å¯é€‰é£žä¹¦ç§èŠï¼‰
-  initNotificationService({
-    getWindow: () => getWindow() ?? null,
-    feishuIm,
-  });
-  initWecomGroupNotificationIpc();
-  initAgentIslandService({
-    getMainWindow: () => getWindow() ?? null,
-    isPlannedRemoteDaemonClose: isCcMgrUpgradeInFlight,
-    onSessionActivityChange: (activity) => {
-      updateInputDeviceSessionActivity(activity);
-    },
-  })?.setAppFocused(hasFocusedAppWindow());
-  // å®šå‘ replay:å¿«ç…§åªè¡¥å‘ç»™åˆšå®Œæˆ sessions è®¢é˜…çš„é‚£ä¸€å°æŽ§åˆ¶ç«¯ã€‚è‹¥æ²¿é»˜è®¤å¹¿æ’­
-  // é€šé“æ‰‡å‡º,æ¯æ¬¡ subscribe éƒ½ä¼šæŠŠ O(ä¼šè¯æ•°) çš„å¸§é‡å¤çŒç»™å…¶å®ƒæ‰€æœ‰æŽ§åˆ¶ç«¯,
-  // å¤šæŽ§åˆ¶ç«¯é‡è¿žé£Žæš´ä¸­ä¼šäº’ç›¸æŒ¤çˆ†å¯¹æ–¹çš„å¯é ä¼ è¾“çª—å£ã€‚
-  setSessionsSubscribedListener((controllerDeviceId) => {
-    getAgentIslandService()?.replaySessionActivity((payload) => {
-      pushSessionActivityToController(controllerDeviceId, payload);
-    });
-  });
-
-  // ã€Œåœ¨æ–°çª—å£æ‰“å¼€ã€ä¼šè¯å¤šå¼€ â€”â€” æ–°å»ºä¸€ä¸ªå®Œæ•´çª—å£å®šä½åˆ°è¯¥ session, åˆå§‹ bounds å–ä¸»çª—ã€‚
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.OPEN_SESSION_IN_NEW_WINDOW,
-    (event, sessionId: unknown, deviceIdRaw: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (typeof sessionId !== 'string' || sessionId.length === 0) {
-        throwIpcError('INVALID_PARAMS', 'sessionId required');
-      }
-      const deviceId = parseOptionalDeviceLinkDeviceId(deviceIdRaw);
-      const sourceWindow = BrowserWindow.fromWebContents(event.sender);
-      openSessionInNewWindow(sessionId, sourceWindow ?? mainWindowRef, deviceId);
-    },
-  );
-
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.OPEN_SESSION_IN_NEW_WINDOW_IF_DROPPED_OUTSIDE,
-    (event, sessionId: unknown, deviceIdRaw: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (typeof sessionId !== 'string' || sessionId.length === 0) {
-        throwIpcError('INVALID_PARAMS', 'sessionId required');
-      }
-      const deviceId = parseOptionalDeviceLinkDeviceId(deviceIdRaw);
-      const sourceWindow = BrowserWindow.fromWebContents(event.sender);
-      // The renderer normally ends the preview immediately before invoking
-      // this check. Stop again here so a delayed dragend/IPC cannot leave the
-      // transient card visible after the drop has already been classified.
-      // Keep the owner check so a delayed IPC from one window cannot stop a
-      // newer drag that already started in another window.
-      if (sourceWindow) endSessionDragPreview(sourceWindow);
-      const nativeResult = sourceWindow
-        ? consumeNativeSessionDragOpenResult(sourceWindow, sessionId, deviceId)
-        : null;
-      if (nativeResult !== null) return nativeResult;
-      return openSessionInNewWindowIfDroppedOutside(
-        sessionId,
-        mainWindowRef,
-        sourceWindow,
-        deviceId,
-      );
-    },
-  );
-
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.SESSION_DRAG_PREVIEW_START,
-    (event, labelRaw: unknown, sessionId: unknown, deviceIdRaw: unknown, paletteRaw: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (typeof labelRaw !== 'string' || typeof sessionId !== 'string' || sessionId.length === 0) {
-        throwIpcError('INVALID_PARAMS', 'label and sessionId required');
-      }
-      const deviceId = parseOptionalDeviceLinkDeviceId(deviceIdRaw);
-      const palette = parseSessionDragPreviewPalette(paletteRaw);
-      if (!palette) {
-        throwIpcError('INVALID_PARAMS', 'invalid session drag preview palette');
-      }
-      const sourceWindow = BrowserWindow.fromWebContents(event.sender);
-      if (!sourceWindow || sourceWindow.isDestroyed()) return;
-      beginSessionDragPreview(
-        sourceWindow,
-        truncateSessionDragPreviewLabel(labelRaw),
-        sessionId,
-        deviceId,
-        palette,
-      );
-    },
-  );
-
-  ipcMain.on(MAKER_SEND.SESSION_DRAG_PREVIEW_END, (event, dragEndAtMsRaw: unknown) => {
-    // Fire-and-forget callers cannot receive an IPC error. Drop stale or
-    // untrusted senders instead of throwing through Electron's EventEmitter.
-    if (!isTrustedAppRendererEvent(event)) return;
-    const sourceWindow = BrowserWindow.fromWebContents(event.sender);
-    if (!sourceWindow || sourceWindow.isDestroyed()) return;
-    const receivedAtMs = Date.now();
-    endSessionDragPreview(sourceWindow);
-    if (!app.isPackaged) {
-      const dragEndAtMs =
-        typeof dragEndAtMsRaw === 'number' &&
-        Number.isFinite(dragEndAtMsRaw) &&
-        Math.abs(receivedAtMs - dragEndAtMsRaw) <= 60_000
-          ? dragEndAtMsRaw
-          : null;
-      sessionDragPreviewLog.info(
-        JSON.stringify({
-          event: 'sessionDragPreview.end.dispatched',
-          rendererToMainMs: dragEndAtMs === null ? null : Math.max(0, receivedAtMs - dragEndAtMs),
-          hideApiDispatchMs: Date.now() - receivedAtMs,
-        }),
-      );
-    }
-  });
-
-  // E4D æ¯›çŽ»ç’ƒ(R1 audit,ç”¨æˆ·è£å†³é€å£çº¸ 2026-07-17):ä»… CINDY family å¯ç”¨æ¯›çŽ»ç’ƒé€å£çº¸;
-  // å…¶ä»– family æ¢å¤ä¸é€æ˜Žã€‚macOS èµ° setVibrancy + é€æ˜Žåº•;Windows 11 èµ° setBackgroundMaterial
-  // (acrylic/mica,è§ resolveVibrancyConfig),Windows 10/Linux å›žé€€ä¸é€æ˜Ž surfaceã€‚
-  // family åˆ‡æ¢æ—¶ç» IPC theme:apply-vibrancy è¿è¡Œæ—¶åŠ¨æ€è°ƒç”¨,åŒæ­¥ä¸»çª—å£ä¸Žå…¨éƒ¨å‰¯çª—å£ã€‚
-  function applyWindowVibrancy(familyId: string, isDark: boolean): void {
-    const win = mainWindowRef;
-    if (!win || win.isDestroyed()) return;
-    const config = resolveVibrancyConfig(familyId, isDark, process.platform);
-    if (process.platform === 'darwin') {
-      win.setVibrancy(config.vibrancy as 'under-window' | null);
-    }
-    if (process.platform === 'win32' && config.backgroundMaterial) {
-      win.setBackgroundMaterial(config.backgroundMaterial);
-      win.webContents.send(WINDOW_BACKDROP_MATERIAL_CHANGED_CHANNEL, config.backgroundMaterial);
-    }
-    win.setBackgroundColor(config.backgroundColor);
-    applyVibrancyToSecondaryWindows(familyId, isDark);
-  }
-
-  ipcMain.on('theme:apply-vibrancy', (event, rawPayload: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    const payload = parseWindowThemeVibrancyPayload(rawPayload);
-    if (!payload) return;
-    if (payload.mode === undefined || payload.systemModeFollowsSystem === undefined) return;
-    if (process.platform === 'win32') {
-      writeWindowThemeSnapshot(
-        payload.mode,
-        payload.isDark,
-        payload.familyId,
-        payload.systemModeFollowsSystem,
-      );
-    }
-    rememberResolvedAppTheme(payload.isDark);
-    applyWindowVibrancy(payload.familyId, payload.isDark);
-  });
-
-  ipcMain.on('get-app-version', (event) => {
-    event.returnValue = app.getVersion();
-  });
-
-  ipcMain.on('get-os-release', (event) => {
-    event.returnValue = os.release();
-  });
-
-  // é¦–å¯äº®è‰²é—¨çš„åŒæ­¥ä¼šè¯çº¿ç´¢(è§ authSessionHint.ts):renderer bootstrap åœ¨
-  // ä»»ä½•æ¸²æŸ“å‰åˆ¤å®šã€ŒçœŸé¦–å¯ã€,localStorage ä¸ºç©ºä½†ä¸»è¿›ç¨‹æŒæœ‰å­˜é‡ä¼šè¯(æŒä¹…åŒ–
-  // refresh token / local æ¨¡å¼)æ—¶ä¸å¾—æ¿€æ´»äº®è‰²é—¨,å¦åˆ™å·²ç™»å½•æš—è‰²ç”¨æˆ·ä¼šå…ˆçœ‹åˆ°
-  // äº®è‰²é¦–å¸§ã€‚å¿…é¡» sendSyncâ€”â€”åˆ¤å®šå‘ç”Ÿåœ¨é¦–å¸§ä¹‹å‰,å¼‚æ­¥ IPC èµ¶ä¸ä¸Šã€‚
-  ipcMain.on('auth:has-persisted-session-hint-sync', (event) => {
-    event.returnValue = hasPersistedSessionHint({ userDataPath: app.getPath('userData') });
-  });
-
-  ipcMain.on('get-app-display-version-info', (event) => {
-    event.returnValue = getAppDisplayVersionInfo();
-  });
-
-  // Renderer â†’ main æ—¥å¿—è½¬å‘:èµ° unified logger çš„ writeFromRenderer,
-  // è®© main çš„ level filter ç”Ÿæ•ˆ(scope åŠ  r: å‰ç¼€ä»¥åŒºåˆ†æ¥æº)ã€‚
-  ipcMain.on(
-    'renderer:log',
-    (
-      _e,
-      level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal',
-      scope: string,
-      msg: string,
-    ) => {
-      // renderer èƒ½å‘æ—¥å¿— = JS å·²è·‘èµ·æ¥ â†’ è§£é™¤ dev å¯åŠ¨çœ‹é—¨ç‹—(è§ renderer-boot-guard.ts)ã€‚
-      rendererBootGuard?.markAlive();
-      writeFromRenderer(level, scope, msg);
-    },
-  );
-
-  // Maker memory å¯åŠ¨ IPC â€”â€” renderer/index.tsx åœ¨ React mount å‰è°ƒç”¨ï¼Œç”¨ main çœŸå€¼
-  // åŒæ­¥ localStorage å¹¶è¿ç§»æ—§ opt-outï¼›æ—¶æœºè¿œæ—©äºŽ splash åŽæ‰æ³¨å†Œçš„äº¤äº’å¼ maker:*
-  // handlerï¼Œå› æ­¤ç‹¬ç«‹æå‰æŒ‚è½½ã€‚è¿ç§»åªä¼šå†™æŒä¹…åŒ–å€¼ï¼Œå¹¶åœ¨ Maker å·²è¢«å…¶å®ƒå¯åŠ¨è·¯å¾„æž„é€ 
-  // æ—¶é¡ºå¸¦ disable çŽ°æœ‰ managerï¼›ä¸ä¼šä¸ºè¿ç§»è€Œä¸»åŠ¨æž„é€  Makerã€‚æ­£å¸¸ toggle/reset ä»åœ¨
-  // register.ts ä¸­æ³¨å†Œï¼Œå› ä¸ºå®ƒä»¬ä¾èµ– splash å®ŒæˆåŽçš„å®Œæ•´ agent runtimeã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.MEMORY_GET_SETTINGS, async () => {
-    return readMemorySettings();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.MEMORY_GET_SETTINGS_STATE, async () => {
-    return memorySettingsWire();
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.MEMORY_PRESERVE_LEGACY_MAKER_DISABLED,
-    async (_e, legacyRendererValue: unknown) => {
-      const parsedLegacyRendererValue =
-        legacyRendererValue === true ? true : legacyRendererValue === false ? false : null;
-      try {
-        const settings = preserveLegacyMakerMemoryDisabled(parsedLegacyRendererValue);
-        // renderer migration å¯èƒ½æ™šäºŽ splash åˆ›å»º Makerã€‚æŒä¹…åŒ–ä¸º false åŽå¿…é¡»ç«‹å³åŒæ­¥
-        // å·²å­˜åœ¨çš„ managerï¼Œé¿å…å½“å‰è¿›ç¨‹ç»§ç»­æŒ‰æ—§çš„ enabled=true å¯åŠ¨æ–° Sessionã€‚
-        const maker = getMakerIfReady();
-        if (!settings.maker && maker?.makerMemory?.isEnabled()) {
-          await maker.makerMemory.disable();
-          await maker.setAgentMemory('claude-code', settings.claudeCode);
-          await maker.setAgentMemory('codex', settings.codex);
-        }
-        return settings;
-      } catch (err) {
-        throwIpcError(
-          'INTERNAL',
-          `memory settings migration failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    },
-  );
-  ipcMain.handle(MAKER_IPC_INVOKE.IM_DEFAULT_SETTINGS_GET, async (_e, rawChannel: unknown) => {
-    return imDefaultSettingsWire(parseImDefaultSettingsChannel(rawChannel));
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.IM_DEFAULT_SETTINGS_SET,
-    async (_e, patch: unknown, rawChannel: unknown) => {
-      const channel = parseImDefaultSettingsChannel(rawChannel);
-      const parsedPatch = parseImDefaultSettingsPatch(patch);
-      writeImDefaultSettingsPatch(parsedPatch, channel);
-      return imDefaultSettingsWire(channel);
-    },
-  );
-  ipcMain.handle(MAKER_IPC_INVOKE.IM_DEFAULT_SETTINGS_RESET, async (_e, rawChannel: unknown) => {
-    const channel = parseImDefaultSettingsChannel(rawChannel);
-    if (channel) {
-      resetImDefaultSettingsChannel(channel);
-    } else {
-      resetImDefaultSettingsGlobal();
-    }
-    return imDefaultSettingsWire(channel);
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SUBAGENT_MODEL_SETTINGS_GET, async () => {
-    return subagentModelSettingsWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SUBAGENT_MODEL_SETTINGS_SET, async (event, patch: unknown) => {
-    // æœ¬ channel å·²å‡çº§ä¸ºå¯è§¦å‘è¿›ç¨‹ç®¡ç†(è½¯å…³/é‡å¯æœ¬åœ° Codex ä¼šè¯)çš„æ“ä½œ,
-    // å¿…é¡»å…ˆéªŒè¯è°ƒç”¨æ–¹æ˜¯å¯ä¿¡ä¸»æ¸²æŸ“å™¨,ä¸èƒ½è®©ä»»æ„å–å¾— channel çš„ frame/WebView
-    // æ”¹å†™ owner-scoped é…ç½®å¹¶é‡å¯ä¼šè¯(codex review P1)ã€‚
-    assertTrustedAppRendererEvent(event);
-    // é…å¯¹ä¸€è‡´æ€§æŒ‰ã€Œpatch åˆå¹¶å½“å‰å­˜å‚¨ã€åˆ¤å®š:æœ‰æ•ˆæ¨¡åž‹ä¸º null æ—¶æ¥æºå¼ºåˆ¶æ¸…ç©º,
-    // åŒæ—¶å…œä½ã€Œæ¸…æ¨¡åž‹æ¼æ¸…æ¥æºã€ä¸Žã€Œæ¨¡åž‹æœªæŒ‡å®šæ—¶çš„ provider-only patchã€ä¸¤ç±»å­¤å„¿å†™å…¥ã€‚
-    const current = readSubagentModelSettings();
-    const parsed = reconcileSubagentModelSettingsPatch(
-      parseSubagentModelSettingsPatch(patch),
-      current,
-    );
-    // codex çš„ -c æ³¨å…¥åœ¨å…±äº« app-server çš„ spawn æ—¶åˆ»,å˜æ›´è§¦åŠæ³¨å…¥é”®ä¸”æœ‰å­˜æ´»
-    // maker æ—¶èµ° DeferredCodexRestart æ‰§è¡Œä½“(ç©ºé—²å³è½¯é‡å¯,busy è½ç›˜åŽå»¶è¿Ÿå…‘çŽ°);
-    // æ—  maker(å¯åŠ¨æ—©æœŸ/å·²å…³)æ—¶æ–° spawn å¤©ç„¶çŽ°è¯»æ–°å€¼,ç›´æŽ¥è½ç›˜ã€‚
-    const needsCodexRestart =
-      codexSpawnConfigChanged(current, { ...current, ...parsed }) && getMakerIfReady() !== null;
-    if (!needsCodexRestart) {
-      writeSubagentModelSettingsPatch(parsed);
-      return { ...subagentModelSettingsWire(), codexRestartDeferred: false };
-    }
-    // æ‰§è¡Œä½“çš„ prepare(è½¯å…³ä¼šè¯)è·¨å¤šä¸ª await,æœŸé—´å¯èƒ½å‘ç”Ÿç™»å‡º/åˆ‡å·;persist æŒ‰
-    // ã€Œè¯·æ±‚æ—¶åˆ»çš„å½“å‰ ownerã€è§£æžè·¯å¾„,ä¸ç»‘å®š scope ä¼šæŠŠ A çš„ä¿®æ”¹å†™è¿› B / ç™»å‡º
-    // å‘½åç©ºé—´(appSessionState.activeOwnerScopeKey çš„è·¨ await å†™å…¥å¥‘çº¦,codex
-    // review P1)ã€‚è¿‡æœŸå³æ‹’,ä¸é™é»˜è½ç›˜ã€‚
-    const ownerScopeKey = activeOwnerScopeKey();
-    // æœ‰æ•ˆæ€§ = scope æœªå˜ **ä¸”** æ²¡æœ‰ owner boundary åœ¨é€”:beginAppSessionBoundary
-    // åªåŠ  boundaryDepth,scope key çš„ generation è¦ç­‰ boundary åŽçš„ç¨³å®šä¼šè¯ commit
-    // æ‰å˜ â€”â€” teardown å·²ç» clearDeferredCodexRestartForOwnerBoundary è€Œ scope-only
-    // æ£€æŸ¥ä»ä¸º true çš„çª—å£é‡Œ,è¿‡æœŸè¯·æ±‚ä¼šé‡æ–°è½ç›˜/ç™»è®°(codex review P1 ç¬¬ 4 è½®)ã€‚
-    // boundary åœ¨é€”ä¸€å¾‹ fail-closedã€‚
-    const stillValid = () =>
-      !isAppSessionBoundaryPending() && activeOwnerScopeKey() === ownerScopeKey;
-    return applyCodexSpawnConfigChangeWithRestart(async () => {
-      if (!stillValid()) {
-        throwIpcError(
-          'PRECONDITION_FAILED',
-          'app session changed during codex restart; write dropped',
-        );
-      }
-      writeSubagentModelSettingsPatch(parsed);
-      return subagentModelSettingsWire();
-      // stillValid åŒæ—¶ä¼ ç»™æ‰§è¡Œä½“:busy è·¯å¾„ persist ä¸Žç™»è®°ä¹‹é—´è¿˜æœ‰ä¸€ä¸ª await è¾¹ç•Œ,
-      // è¯¥çª—å£å†… owner boundary æ¸…æŽ‰æ—§ç™»è®°åŽ,æœ¬è¯·æ±‚ä¸å¾—å† schedule(codex review
-      // P1 ç¬¬ 3 è½®)ã€‚
-    }, stillValid);
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SUBAGENT_MODEL_SETTINGS_RESET, async (event) => {
-    // åŒ SET:restart-capable æ“ä½œ,å…ˆéªŒå¯ä¿¡æ¸²æŸ“å™¨(codex review P1)ã€‚
-    assertTrustedAppRendererEvent(event);
-    const needsCodexRestart =
-      codexSpawnConfigChanged(readSubagentModelSettings(), SUBAGENT_MODEL_SETTINGS_DEFAULTS) &&
-      getMakerIfReady() !== null;
-    if (!needsCodexRestart) {
-      resetSubagentModelSettings();
-      return { ...subagentModelSettingsWire(), codexRestartDeferred: false };
-    }
-    // åŒ SET:è·¨ await çš„ owner-scoped å†™å…¥å¿…é¡»ç»‘å®š scope,è¿‡æœŸå³æ‹’(codex review P1);
-    // stillValid ä¼ ç»™æ‰§è¡Œä½“å®ˆä½ persistâ†’ç™»è®° çš„çª—å£,å¹¶æŠŠ boundary åœ¨é€”å¹¶å…¥åˆ¤å®š
-    // (scope key åœ¨ boundary commit å‰ä¸å˜,codex review P1 ç¬¬ 3/4 è½®)ã€‚
-    const ownerScopeKey = activeOwnerScopeKey();
-    const stillValid = () =>
-      !isAppSessionBoundaryPending() && activeOwnerScopeKey() === ownerScopeKey;
-    return applyCodexSpawnConfigChangeWithRestart(async () => {
-      if (!stillValid()) {
-        throwIpcError(
-          'PRECONDITION_FAILED',
-          'app session changed during codex restart; reset dropped',
-        );
-      }
-      resetSubagentModelSettings();
-      return subagentModelSettingsWire();
-    }, stillValid);
-  });
-
-  // è§†è§‰æ¡¥è®¾ç½® IPC â€”â€” store ä¸Ž Maker å•ä¾‹æ— å…³, æå‰æ³¨å†Œï¼ˆè§ vision-bridge-settings-storeï¼‰ã€‚
-  // GET ä¹Ÿæ˜¯ç‰¹æƒé…ç½®é¢è¯»å–ï¼ˆproviderId/modelId/å¼€å…³ï¼‰ï¼Œéžå¯ä¿¡ sender åŒæ ·æ‹’ç»ï¼ˆä¸Ž SET/RESET å¯¹é½ï¼‰ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_GET, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return visionBridgeSettingsWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_SET, async (event, patch: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    const parsed = parseVisionBridgeSettingsPatch(patch);
-    writeVisionBridgeSettings(parsed);
-    return visionBridgeSettingsWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.VISION_BRIDGE_SETTINGS_RESET, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    resetVisionBridgeSettings();
-    return visionBridgeSettingsWire();
-  });
-
-  // Claude Code è‡ªåŠ¨ä¸Šä¸‹æ–‡åŽ‹ç¼©é˜ˆå€¼ IPC â€”â€” store è·Ÿ Maker å•ä¾‹æ— å…³, æå‰æ³¨å†Œã€‚
-  // buildDesktopClaudeRuntimeConfig.behaviorFlags æ˜¯åŠ¨æ€ getter, ä¸‹ä¸ªæ–° session è¯»åˆ°æ–°å€¼ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.SILENT_ENCRYPTED_RETRY_GET, async () => {
-    return silentEncryptedRetryWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SILENT_ENCRYPTED_RETRY_SET, async (_e, enabled: unknown) => {
-    if (typeof enabled !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'silent encrypted retry enabled required (boolean)');
-    }
-    writeSilentEncryptedRetryEnabled(enabled);
-    return {
-      ...silentEncryptedRetryWire(),
-      effective: 'immediate' as const,
-    };
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SILENT_ENCRYPTED_RETRY_RESET, async () => {
-    resetSilentEncryptedRetrySettings();
-    return {
-      ...silentEncryptedRetryWire(),
-      effective: 'immediate' as const,
-    };
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SESSION_RUNTIME_FALLBACK_GET, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return sessionRuntimeFallbackWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SESSION_RUNTIME_FALLBACK_SET, async (event, enabled: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    if (typeof enabled !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'session runtime fallback enabled required (boolean)');
-    }
-    writeSessionRuntimeFallbackEnabled(enabled);
-    return { ...sessionRuntimeFallbackWire(), effective: 'immediate' as const };
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.SESSION_RUNTIME_FALLBACK_RESET, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    resetSessionRuntimeFallbackSettings();
-    return { ...sessionRuntimeFallbackWire(), effective: 'immediate' as const };
-  });
-
-  ipcMain.handle(MAKER_IPC_INVOKE.COMPACTION_GET_PCT, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return readCompactionPct();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.COMPACTION_GET_STATE, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return compactionWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.COMPACTION_RESET_PCT, async (event, owner: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    assertCompactionMutationOwner(owner);
-    resetCompactionPct();
-    return compactionWire();
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.COMPACTION_SET_PCT,
-    async (event, pct: unknown, owner: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (typeof pct !== 'number' || !Number.isFinite(pct)) {
-        throwIpcError('INVALID_PARAMS', 'compaction pct required (number)');
-      }
-      assertCompactionMutationOwner(owner);
-      writeCompactionPct(pct);
-      return compactionWire();
-    },
-  );
-
-  ipcMain.handle(MAKER_IPC_INVOKE.PI_COMPACTION_GET_PCT, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return readPiCompactionPct();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.PI_COMPACTION_GET_STATE, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return piCompactionWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.PI_COMPACTION_RESET_PCT, async (event, owner: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    assertCompactionMutationOwner(owner);
-    resetPiCompactionPct();
-    return piCompactionWire();
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT,
-    async (event, pct: unknown, owner: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (typeof pct !== 'number' || !Number.isFinite(pct)) {
-        throwIpcError('INVALID_PARAMS', 'pi compaction pct required (number)');
-      }
-      assertCompactionMutationOwner(owner);
-      writePiCompactionPct(pct);
-      return piCompactionWire();
-    },
-  );
-
-  // Window behavior â€”â€” swallowActivationClick ä¿æŒ renderer è¿è¡Œæ—¶äº‹å®žæ ‡å‡†;
-  // Windows / Linux close behavior ç”± main è¯»å†™å¹¶æ‰§è¡Œã€‚
-  ipcMain.handle(
-    WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL,
-    async (_e, enabled: unknown) => {
-      if (typeof enabled !== 'boolean') {
-        throwIpcError('INVALID_PARAMS', 'swallowActivationClick required (boolean)');
-      }
-      writeSwallowActivationClick(enabled);
-      return { ok: true as const };
-    },
-  );
-  ipcMain.handle(WINDOW_BEHAVIOR_GET_WINDOWS_CLOSE_BEHAVIOR_CHANNEL, async () => {
-    return readWindowBehaviorSettings().windowsCloseBehavior;
-  });
-  ipcMain.handle(
-    WINDOW_BEHAVIOR_SET_WINDOWS_CLOSE_BEHAVIOR_CHANNEL,
-    async (_e, behavior: unknown) => {
-      if (!isWindowsCloseBehavior(behavior)) {
-        throwIpcError('INVALID_PARAMS', 'Windows close behavior required (quit|tray)');
-      }
-      windowsClosePromptFallback.acknowledge();
-      writeWindowsCloseBehavior(behavior);
-      if (behavior === 'quit') destroyWindowsTray();
-      return behavior;
-    },
-  );
-  ipcMain.on(WINDOW_BEHAVIOR_WINDOWS_CLOSE_BEHAVIOR_SHOWN_CHANNEL, (event) => {
-    if (BrowserWindow.fromWebContents(event.sender) === mainWindowRef) {
-      windowsClosePromptFallback.acknowledge();
-    }
-  });
-  ipcMain.handle(WINDOW_BEHAVIOR_GET_LINUX_CLOSE_BEHAVIOR_CHANNEL, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return readWindowBehaviorSettings().linuxCloseBehavior;
-  });
-  ipcMain.handle(
-    WINDOW_BEHAVIOR_SET_LINUX_CLOSE_BEHAVIOR_CHANNEL,
-    async (event, behavior: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      if (!isLinuxCloseBehavior(behavior)) {
-        throwIpcError('INVALID_PARAMS', 'Linux close behavior required (quit|minimize)');
-      }
-      linuxClosePromptFallback.acknowledge();
-      writeLinuxCloseBehavior(behavior);
-      return behavior;
-    },
-  );
-  ipcMain.on(WINDOW_BEHAVIOR_LINUX_CLOSE_BEHAVIOR_SHOWN_CHANNEL, (event) => {
-    assertTrustedAppRendererEvent(event);
-    if (BrowserWindow.fromWebContents(event.sender) === mainWindowRef) {
-      linuxClosePromptFallback.acknowledge();
-    }
-  });
-  // LSP Beta å¼€å…³ IPC â€”â€” åŒ compat-mode æ¨¡å¼:
-  // GET ç»™ renderer å¯åŠ¨æœŸåŒæ­¥ localStorage é•œåƒ; SET è½ JSON æ–‡ä»¶ + æ›´æ–° cache,
-  // mcp providers isEnabled ä¸‹æ¬¡ session.start æ—¶è¯»åˆ°æ–°å€¼ã€‚å·²å¼€ session ä¸å˜ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.LSP_MODE_GET, async () => {
-    return readLspModeSettings();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.LSP_MODE_SET, async (_e, enabled: unknown) => {
-    if (typeof enabled !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'lsp mode enabled required (boolean)');
-    }
-    writeLspModeEnabled(enabled);
-    return { effective: 'next-session' as const };
-  });
-
-  // æ™ºèƒ½é€šè®¯å½• IPC â€”â€” è®¾ç½®å¼€å…³ + æ•°æ® CRUD(è®¾ç½®é¡µç®¡ç† UI é€šé“), æå‰æ³¨å†Œã€‚
-  registerContactsIpc({
-    restartCodexAfterAuthModeChange,
-    shutdownCodexEnvironment,
-    scheduleDeferredCodexRestart,
-    invalidatePiEnvironment,
-  });
-
-  // èŠå¤©åµŒå…¥å¼€å…³ IPC â€”â€” ä¸Ž compat-mode åŒç†æå‰æ³¨å†Œ:
-  // renderer å¯åŠ¨ bootstrap åŒæ­¥ localStorage é•œåƒ, è¿œæ—©äºŽ splash å®Œæˆã€‚
-  // SET è·¯å¾„æ—¢è½ JSON ä¹Ÿç«‹å³æŠŠ chat-history-embedder çš„è¿è¡Œæ—¶ enabled åˆ‡æ¢ â€”â€”
-  // toggle off åŽä¸‹ä¸€æ¡æ–°æ¶ˆæ¯å°±ä¸å†å…¥é˜Ÿ, ä¸éœ€è¦é‡å¯ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.CHAT_EMBEDDING_GET, async () => {
-    return chatEmbeddingWire();
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.CHAT_EMBEDDING_SET,
-    async (_e, enabled: unknown, owner: unknown) => {
-      if (typeof enabled !== 'boolean') {
-        throwIpcError('INVALID_PARAMS', 'chat embedding enabled required (boolean)');
-      }
-      assertChatEmbeddingMutationOwner(owner);
-      if (enabled && !isChatEmbeddingAvailable()) {
-        throwIpcError(
-          'UNSUPPORTED_CAPABILITY',
-          'Chat embedding is not available for this account or region.',
-        );
-      }
-      // å…ˆæŠŠç”¨æˆ·é€‰æ‹©åŽŸå­å†™å…¥å½“å‰ ownerï¼›é”ç­‰å¾…æœŸé—´åˆ‡å·ä¼š fail closedï¼Œä¸ä¼šæŠŠ A çš„é€‰æ‹©å†™ç»™ Bã€‚
-      try {
-        await writeChatEmbeddingEnabled(enabled, chatEmbeddingDefaultContext());
-      } catch (error) {
-        // å†™å…¥å¯èƒ½åœ¨è·¨è¿›ç¨‹é”æˆ– owner boundary ä¸Šå¤±è´¥ï¼›æ— è®ºå¦‚ä½•æŒ‰ç£ç›˜æœ€æ–°çœŸå€¼ reconcileï¼Œ
-        // é¿å… UI æ”¶åˆ°é”™è¯¯æ—¶ runtime ä»æ²¿ç”¨æ—§å¼€å…³ã€‚
-        await scheduleChatEmbeddingRuntimeReconcile();
-        if (!isIpcError(error)) {
-          createSchedulerLogger('chat-embedding-settings').error(
-            'Failed to save chat embedding settings',
-            { error: error instanceof Error ? error.message : String(error) },
-          );
-        }
-        rethrowChatEmbeddingPersistError(error, 'Failed to save chat embedding settings');
-      }
-      // è¿è¡Œæ—¶ reconcile æ€»æ˜¯é‡è¯»æœ€æ–°è´¦å·ã€‚å³ä½¿å†™å…¥å®ŒæˆåŽç«‹åˆ»åˆ‡å·ï¼Œæ—§è¯·æ±‚ä¹Ÿä¸ä¼šç›´æŽ¥æŽ§åˆ¶æ–°è´¦å·ã€‚
-      await scheduleChatEmbeddingRuntimeReconcile();
-      return chatEmbeddingWire();
-    },
-  );
-  ipcMain.handle(MAKER_IPC_INVOKE.CHAT_EMBEDDING_RESET, async (_e, owner: unknown) => {
-    assertChatEmbeddingMutationOwner(owner);
-    try {
-      await resetChatEmbeddingSettings(chatEmbeddingDefaultContext());
-    } catch (error) {
-      await scheduleChatEmbeddingRuntimeReconcile();
-      if (!isIpcError(error)) {
-        createSchedulerLogger('chat-embedding-settings').error(
-          'Failed to reset chat embedding settings',
-          { error: error instanceof Error ? error.message : String(error) },
-        );
-      }
-      rethrowChatEmbeddingPersistError(error, 'Failed to reset chat embedding settings');
-    }
-    await scheduleChatEmbeddingRuntimeReconcile();
-    return chatEmbeddingWire();
-  });
-
-  // Git safety settings IPC â€”â€” store ç‹¬ç«‹äºŽ Maker å•ä¾‹,æå‰æ³¨å†Œä»¥ä¾¿ renderer
-  // å¯åŠ¨æ—¶åŒæ­¥æœ¬åœ°é•œåƒã€‚SET åªå½±å“ä¹‹åŽçš„ turn è¾¹ç•Œ,å·²è¿è¡Œ turn ä¸è¿½æº¯ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.GIT_SAFETY_GET, async () => {
-    return gitSafetyWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.GIT_SAFETY_SET, async (_e, enabled: unknown) => {
-    if (typeof enabled !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'git safety enabled required (boolean)');
-    }
-    writeGitSafetyAutoSnapshotEnabled(enabled);
-    return gitSafetyWire();
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.GIT_SAFETY_RESET, async () => {
-    resetGitSafetySettings();
-    return gitSafetyWire();
-  });
-
-  // Codex runtime route GET â€”â€” å³ä¸‹è§’ç”¨é‡ chip è¯» app-server å½“å‰ spawn å†»ç»“çš„é‰´æƒæ³¨å…¥æ–¹å¼
-  // (oauth-bearer = èµ°è®¢é˜… / env-key = èµ°ç½‘å…³ / provider-oauth = proxy æ³¨å…¥ä¾›åº”å•† OAuth)ã€‚
-  // é€€å½¹å…¨å±€é‰´æƒå¼€å…³åŽå·²æ—  SET,åªä¿ç•™ GET;spawn å‡­è¯å½¢æ€ç”± provider é€‰æ‹©å†³å®šã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.CODEX_RUNTIME_ROUTE_GET, async () => {
-    return readCodexRuntimeRoute();
-  });
-
-  // cc é»˜è®¤è·¯ç”±ä¼šè¯çš„ç”Ÿæ•ˆè®¡è´¹è·¯ç”± â€”â€” proxy transform æŒ‰è¯·æ±‚è§‚å¯Ÿè¿› registry(è·¯ç”±çœŸå€¼),
-  // ç”¨é‡ chip ä¼˜å…ˆç”¨å®ƒæ˜¾ç¤ºè®¢é˜… / ç½‘å…³å½¢æ€(spawn å‡­è¯å†»ç»“, å…¨å±€æ´»æ€§çŠ¶æ€é‡ç®—ä¼šå‘æ•£)ã€‚
-  // GET è¯»æœ€è¿‘è§‚å¯Ÿå€¼; å˜åŒ–æ—¶(æ¯ä¼šè¯ç”Ÿå‘½å‘¨æœŸé€šå¸¸ä¸€æ¬¡)å¹¿æ’­ç»™æ‰€æœ‰çª—å£ã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.CLAUDE_SESSION_ROUTE_GET, async (_event, sessionId: unknown) => {
-    if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
-    return readClaudeSessionRoute(sessionId);
-  });
-  onClaudeSessionRouteChange((sessionId, route) => {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      try {
-        win.webContents.send(MAKER_PUSH.CLAUDE_SESSION_ROUTE_CHANGED, { sessionId, route });
-      } catch {
-        /* no-op */
-      }
-    }
-    // device-link:payload é¡¶å±‚ sessionId â†’ session:<id> topic,æ‰“å¼€è¯¥è¿œç¨‹ä¼šè¯çš„
-    // æŽ§åˆ¶ç«¯æ®æ­¤å®žæ—¶åˆ‡æ¢è®¢é˜… / ç½‘å…³æ˜¾ç¤ºå½¢æ€(æ¯ä¼šè¯ç”Ÿå‘½å‘¨æœŸé€šå¸¸ä»…ä¸€æ¬¡,æžä½Žé¢‘)ã€‚
-    tapWindowBroadcast(MAKER_PUSH.CLAUDE_SESSION_ROUTE_CHANGED, { sessionId, route });
-  });
-
-  // â”€â”€ æœ¬æœº Claude Code è®¢é˜…ï¼šåªç®¡ç† Cindy çš„ä½¿ç”¨è®¸å¯ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // ä¸Žé‰´æƒæ¨¡å¼å¼€å…³æ­£äº¤:ç®¡ç†è®¢é˜…å‡­è¯æœ¬èº«(åƒ Codex çš„ OAuth ç™»å½•ç‹¬ç«‹äºŽ API æ¨¡å¼)ã€‚
-  // Anthropic æ¨¡åž‹æ¸…å•åŠ¨æ€å‘çŽ°æŽ¥çº¿(2026-07-19 ç»Ÿä¸€é‡æž„):
-  //   - active-catalog ç»Ÿä¸€æ”¶å£ capabilities åˆ·æ–° + revision å¹¿æ’­;
-  //   - SDK supportedModels æ•èŽ·(maker-core ä¼šè¯ init åŽä¸ŠæŠ¥)æ˜¯èƒ½åŠ›å­—æ®µæƒå¨ã€‚
-  setClaudeSupportedModelsListener(noteAnthropicSdkSupportedModels);
-  ipcMain.handle(MAKER_IPC_INVOKE.CLAUDE_OAUTH_STATUS, async () => {
-    return { authorized: hasClaudeAiOAuth() };
-  });
-  ipcMain.handle(MAKER_IPC_INVOKE.CLAUDE_OAUTH_LOGIN, async (event, loginKey?: string) => {
-    assertTrustedAppRendererEvent(event);
-    const owner = activeOwnerScopeKey();
-    if (isAppSessionBoundaryPending() || !getActiveAppSession().dataOwnerId)
-      return { ok: false, reason: 'login_cancelled', authorized: false };
-    const signal = beginClaudeLocalLogin(loginKey);
-    resetProviderModelAutoRefreshCooldowns('anthropic');
-    await clearAnthropicDiscoveredModels();
-    if (signal.aborted || owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-      return { ok: false, reason: 'login_cancelled', authorized: false };
-    await ensureAnthropicCompatProxyReady();
-    if (signal.aborted || owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-      return { ok: false, reason: 'login_cancelled', authorized: false };
-    if (!reconnectClaudeAiOAuth())
-      return { ok: false, reason: 'local_unavailable', authorized: false };
-    // Binding is the commit point; auxiliary refresh must not prolong the cancellable login.
-    void broadcastClaudeAuthStateChanged();
-    syncClaudeSubscriptionUsageForAuthChange();
-    void refreshAnthropicModelsFromHttp();
-    return { ok: true, authorized: hasClaudeAiOAuth() };
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.CLAUDE_OAUTH_LOGOUT,
-    async (event, ownerScope?: { dataOwnerId: string | null; ownerGeneration: number }) => {
-      assertTrustedAppRendererEvent(event);
-      const active = getActiveAppSession();
-      const owner = activeOwnerScopeKey();
-      if (
-        isAppSessionBoundaryPending() ||
-        (ownerScope &&
-          (ownerScope.dataOwnerId !== active.dataOwnerId ||
-            ownerScope.ownerGeneration !== active.generation))
-      ) {
-        throwIpcError('INVALID_PARAMS', 'Provider owner changed');
-      }
-      // Cancel pending Cindy login/refresh before revoking the binding; keep native credentials.
-      try {
-        cancelClaudeOAuthLogin();
-        await disconnectClaudeAiOAuth();
-        if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-          return { authorized: false };
-        resetProviderModelAutoRefreshCooldowns('anthropic');
-      } catch (err) {
-        throwIpcError(
-          'INTERNAL',
-          `claude oauth logout failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      await broadcastClaudeAuthStateChanged();
-      if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-        return { authorized: false };
-      // Binding revoked: read() clears the Cindy quota snapshot and broadcasts null.
-      syncClaudeSubscriptionUsageForAuthChange();
-      // æ¨¡åž‹æ¸…å•åŠ¨æ€å‘çŽ°:ç™»å‡ºå®Œæˆå‰æ¸…ç©ºæ¸…å• + åˆ ç£ç›˜ç¼“å­˜,å¹¶ç­‰å¾…æ—§ SDK å†™ç›˜æ”¶å°¾ã€‚
-      await clearAnthropicDiscoveredModels();
-      return { authorized: hasClaudeAiOAuth() };
-    },
-  );
-  ipcMain.handle(MAKER_IPC_INVOKE.CLAUDE_OAUTH_CANCEL, async (event, loginKey?: string) => {
-    assertTrustedAppRendererEvent(event);
-    cancelClaudeOAuthLogin(loginKey);
-    return { authorized: hasClaudeAiOAuth() };
-  });
-
-  // ä¸Šæ¸¸ä½œåºŸ xAI å‡­è¯ã€æ”¶å£è‡ªåŠ¨ç™»å‡ºåŽ,èµ°å’Œæ‰‹åŠ¨ç™»å‡ºå®Œå…¨ä¸€è‡´çš„ UI æ”¶å°¾(å¹¿æ’­ + æ¸…è´¦å·çº§
-  // é™æµå¿«ç…§),å¦åˆ™ç”¨æˆ·ä¼šåœåœ¨ã€Œæ˜¾ç¤ºå·²è¿žæŽ¥ã€è¯·æ±‚è¿žçŽ¯ 403ã€çš„å‡çŠ¶æ€ã€‚
-  setSubscriptionAccountInvalidatedHandler((providerId) => {
-    const scope = activeOwnerScopeKey();
-    const broadcast = () => {
-      if (scope === activeOwnerScopeKey() && !isAppSessionBoundaryPending()) {
-        refreshSelectableModelsAndBroadcast({ providerId });
-      }
-    };
-    void syncSubscriptionAccountUsage(providerId).then(broadcast, broadcast);
-  });
-  setXaiAuthInvalidatedHandler((providerId) => {
-    if (providerId !== 'xai') {
-      void clearSubscriptionAccountDiscoveredModels(providerId);
-      void syncSubscriptionAccountUsage(providerId).then(
-        broadcastXaiAuthStateChanged,
-        broadcastXaiAuthStateChanged,
-      );
-      return;
-    }
-    resetProviderModelAutoRefreshCooldowns('xai');
-    clearXaiDiscoveredModels();
-    clearXaiMediaModels();
-    clearXaiRateLimitSnapshot();
-    void (async () => {
-      await clearXaiSubscriptionUsageSnapshot();
-      await syncXaiSubscriptionUsageForAuthChange();
-      broadcastXaiAuthStateChanged();
-    })();
-  });
-
-  // xAI(SuperGrok è®¢é˜…)OAuth â€”â€” ä¸Ž claude-oauth åŒå½¢æ€ã€‚ç™»å½•æˆåŠŸåŽ bridge çš„ xai provider ç«‹å³å¯ç”¨
-  // (buildHeaders æ¯è¯·æ±‚çŽ°å– token);è¿žæŽ¥æ€ç”± renderer refetch listProviders æ—¶çŽ°è¯» hasGrokOAuthLoginã€‚
-  ipcMain.handle(MAKER_IPC_INVOKE.XAI_OAUTH_LOGIN, async (event) => {
-    assertTrustedAppRendererEvent(event);
-    const owner = activeOwnerScopeKey();
-    // reason æ˜¯ renderer å†³å®šæç¤ºç”¨çš„ç»“æž„åŒ–æ•°æ®,ä¸æŠ› throwIpcError(è§„åˆ™ 13 æŸ¥è¯¢åž‹ä¾‹å¤–)ã€‚
-    // ç™»å½•æˆåŠŸå³ç”Ÿæ•ˆ:è®¢é˜…ç›´è¿ž handler æ¯è¯·æ±‚ç» buildHeaders çŽ°å–å‡­è¯,æ— éœ€ä»»ä½•"å°±ç»ª"æ­¥éª¤ã€‚
-    const result = await runGrokOAuthLogin();
-    if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-      return { ok: false, reason: 'login_cancelled', authorized: false };
-    if (result.ok) {
-      void retainProviderPresentationAfterAuthChange('xai');
-      resetProviderModelAutoRefreshCooldowns('xai');
-      // æ–°å‡­è¯åœ¨ runGrokOAuthLogin è¿”å›žå‰å·²ç»è½ç›˜ã€‚å…ˆåŒæ­¥å…³æŽ‰æ—§å‘¨ç”¨é‡è¯»å–çª—å£,
-      // å†åŽ»åšæ¨¡åž‹ç£ç›˜æ¸…ç†ç­‰ await,é¿å…æ¢å·é—´éš™é‡Œ IPC read ä»è¿”å›žè´¦å· A çš„å¿«ç…§ã€‚
-      await clearXaiSubscriptionUsageSnapshot();
-      if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-        return { ok: false, reason: 'login_cancelled', authorized: false };
-      // ç™»å½•å¯ç›´æŽ¥è¦†ç›–æ—§ SuperGrok è´¦å·ï¼šå…ˆæ¸…æ—§ä¸–ä»£å†…å­˜ï¼Œå†ç›´æŽ¥è¯»æ–°è´¦å·å®˜æ–¹æ¸…å•ã€‚
-      // è¿™é‡Œä¸èƒ½å…ˆæ¢å¤åŒä¸€ Cindy owner çš„ç£ç›˜ LKGï¼Œå¦åˆ™ Aâ†’B é‡ç™»ä¼šçŸ­æš‚å±•ç¤º A çš„æˆå‘˜ã€‚
-      clearXaiDiscoveredModels();
-      await discardXaiModelsDiskCache();
-      if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-        return { ok: false, reason: 'login_cancelled', authorized: false };
-      // ç™»å½•å¯ç›´æŽ¥è¦†ç›–æ—§è´¦å·å‡­è¯ã€‚å…ˆè·¨æŽˆæƒè¾¹ç•Œæ¸…æŽ‰æ—§è´¦å·å‘çŽ°å¿«ç…§ï¼Œå†è¡¥æ‹‰æ–°è´¦å·ï¼›
-      // æ—§åœ¨é€”è¯·æ±‚ç”± discovery generation + owner scope åŒé‡å®ˆå«ä½œåºŸã€‚
-      clearXaiMediaModels();
-      // ç™»å½•æˆåŠŸåŽå¹¿æ’­ provider å˜æ›´ â€”â€” å…¶å®ƒå·²æ‰“å¼€çš„çª—å£(èŠå¤©/æ¨¡åž‹é€‰æ‹©å™¨ç­‰)è·Ÿéšåˆ·æ–°
-      // xAI è¿žæŽ¥æ€,ä¸å†ç­‰ remount/æ‰‹åŠ¨åˆ·æ–°(å¯¹é½ CLAUDE_OAUTH_LOGIN çš„ broadcastClaudeAuthStateChanged)ã€‚
-      // é™æµå¿«ç…§æ˜¯è´¦å·çº§çš„:é‡ç™»å¯èƒ½æ¢è´¦å·,æ—§å¿«ç…§ä¸€å¹¶æ¸…æŽ‰(ç­‰æ–°è´¦å·é¦–ä¸ª xai/ è½®è‡ªç„¶è¡¥ä¸Š)ã€‚
-      clearXaiRateLimitSnapshot();
-      await syncXaiSubscriptionUsageForAuthChange();
-      if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-        return { ok: false, reason: 'login_cancelled', authorized: false };
-      broadcastXaiAuthStateChanged();
-      void refreshXaiModelsFromHttp();
-      void refreshProviderModelsManually('xai').catch((error) => {
-        createLogger('xai-model-refresh').warn('xAI models refresh after login failed', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-      return { ok: true, authorized: true };
-    }
-    return { ok: false, reason: result.reason ?? 'unknown', authorized: hasGrokOAuthLogin() };
-  });
-  ipcMain.handle(
-    MAKER_IPC_INVOKE.XAI_OAUTH_LOGOUT,
-    async (event, ownerScope?: { dataOwnerId: string | null; ownerGeneration: number }) => {
-      assertTrustedAppRendererEvent(event);
-      const active = getActiveAppSession();
-      const owner = activeOwnerScopeKey();
-      if (
-        isAppSessionBoundaryPending() ||
-        (ownerScope &&
-          (ownerScope.dataOwnerId !== active.dataOwnerId ||
-            ownerScope.ownerGeneration !== active.generation))
-      ) {
-        throwIpcError('INVALID_PARAMS', 'Provider owner changed');
-      }
-      try {
-        cancelGrokOAuthLogin();
-        logoutGrok();
-        const presentation = retainProviderPresentationAfterAuthChange('xai');
-        resetProviderModelAutoRefreshCooldowns('xai');
-        await clearXaiSubscriptionUsageSnapshot();
-        await presentation;
-        if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-          return { ok: false, reason: 'login_cancelled', authorized: false };
-        clearXaiDiscoveredModels();
-        clearXaiMediaModels();
-      } catch (err) {
-        throwIpcError(
-          'INTERNAL',
-          `xai oauth logout failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      // ç™»å‡ºåŽåŒæ­¥å¹¿æ’­ç»™å…¶å®ƒçª—å£,è®©å·²æŒ‚è½½çš„ useProviders ç«‹åˆ»é‡æ‹‰è¿žæŽ¥æ€;
-      // å¹¶æ¸…æŽ‰è´¦å·çº§é™æµå¿«ç…§ â€”â€” ç™»å‡ºåŽæ²¡æœ‰ä¸‹ä¸€ä¸ªæˆåŠŸå“åº”æ¥è¦†ç›–,ä¸æ¸…ä¼šä¸€ç›´æŒ‚ç€æ—§è´¦å·ä½™é‡ã€‚
-      clearXaiRateLimitSnapshot();
-      await syncXaiSubscriptionUsageForAuthChange();
-      if (owner !== activeOwnerScopeKey() || isAppSessionBoundaryPending())
-        return { ok: false, reason: 'login_cancelled', authorized: false };
-      broadcastXaiAuthStateChanged();
-      return { authorized: hasGrokOAuthLogin() };
-    },
-  );
-  ipcMain.handle(MAKER_IPC_INVOKE.XAI_OAUTH_CANCEL, async () => {
-    cancelGrokOAuthLogin();
-    return { authorized: hasGrokOAuthLogin() };
-  });
-
-  // çª—å£æŽ§ä»¶æŒ‰ event.sender è§£æžç›®æ ‡çª—å£ â€”â€” ã€Œåœ¨æ–°çª—å£æ‰“å¼€ã€ä¼šæœ‰å¤šä¸ªå®Œæ•´çª—å£,
-  // min/max å¿…é¡»æ“ä½œ"ç‚¹æŒ‰é’®çš„é‚£ä¸ªçª—å£"è€Œéžå…¨å±€ä¸»çª—ã€‚fallback åˆ° mainWindowRef å…œåº•
-  // æžç«¯æƒ…å†µ(sender å·²é”€æ¯ç­‰)ã€‚
-  ipcMain.on('window-minimize', (event) => {
-    (BrowserWindow.fromWebContents(event.sender) ?? mainWindowRef)?.minimize();
-  });
-  ipcMain.on('window-maximize', (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindowRef;
-    if (!win) return;
-    if (win.isMaximized()) {
-      if (win === mainWindowRef) {
-        mainWindowMaximizeRecoveryController?.notifyUserUnmaximizeIntent();
-      }
-      win.unmaximize();
-    } else {
-      win.maximize();
-    }
-  });
-  // Exit-only fallback for macOS native fullscreen. Resolve the target from
-  // the trusted sender so a secondary window can never manipulate the main window.
-  ipcMain.on('window-exit-fullscreen', (event) => {
-    assertTrustedAppRendererEvent(event);
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return;
-    if (win.isSimpleFullScreen()) {
-      win.setSimpleFullScreen(false);
-    } else if (win.isFullScreen()) {
-      win.setFullScreen(false);
-    }
-  });
-  // æ‰‹åŠ¨çª—å£æ‹–æ‹½:no-drag å…ƒç´ (ä¼šè¯æ ‡é¢˜æ–‡å­—ç­‰,éœ€è¦åŒæ—¶å“åº”åŒå‡»)æŒ‰ä½ç§»åŠ¨
-  // æ—¶ç”± renderer å‘èµ·,main ç”¨å…‰æ ‡ä½ç½®é©±åŠ¨çª—å£è·Ÿéš;pointerup åŽ stopã€‚
-  // è¯¦è§ windowManualDrag.ts å¤´æ³¨é‡Šã€‚
-  const windowManualDrag = new WindowManualDragController(screen);
-  // start / stop éƒ½ä¸¥æ ¼ç»‘å®š sender çª—å£,è§£æžä¸åˆ°(çª—å£é”€æ¯ä¸­)ç›´æŽ¥å¿½ç•¥,
-  // ä¸ fallback ä¸»çª—:å¤šçª—å£ä¸‹å‰¯çª—çš„å»¶è¿Ÿæ¶ˆæ¯è‹¥è½åˆ°ä¸»çª—ä¸Š,start ä¼šè®©ä¸»çª—
-  // æ„å¤–ç²˜é™„å…‰æ ‡å¹¶è¯¯åœä»–çª—çš„åˆæ³•æ‹–æ‹½,stop ä¼šè¯¯åœä¸»çª—æ‹–æ‹½ã€‚å·²é”€æ¯çª—å£çš„
-  // æ‹–æ‹½ç”± controller çš„ isDestroyed å·¡æ£€è‡ªåœ,æ— éœ€å…œåº•ã€‚
-  ipcMain.on('window-drag-move-start', (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return;
-    windowManualDrag.start(win);
-  });
-  ipcMain.on('window-drag-move-stop', (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return;
-    windowManualDrag.stop(win);
-  });
-  // å…³é—­è¯­ä¹‰æŒ‰çª—å£åŒºåˆ†:
-  //  - ä¸»çª—(Windows): èµ° win.close() è§¦å‘ close handler,ç”± handler å†³å®šæ‰˜ç›˜éšè—æˆ–é€€å‡ºã€‚
-  //  - ä¸»çª—(æˆ–è§£æžä¸åˆ° sender çš„å…œåº•,Windows ä¹‹å¤–): è‡ªå®šä¹‰ X è¯­ä¹‰æ˜¯"é€€å‡º app",
-  //    èµ° app.quit() æ‰èƒ½ trigger before-quit â†’ disposer chain,æŠŠ codex å­è¿›ç¨‹ / im / db
-  //    ç­‰éƒ½æ”¶æŽ‰;å¦åˆ™ voice overlay è¿™ç§ hidden BrowserWindow è¿˜æ´»ç€,window-all-closed
-  //    ä¸ fire,æ®‹ç•™è¿›ç¨‹ã€‚
-  //  - ã€Œåœ¨æ–°çª—å£æ‰“å¼€ã€çš„å‰¯çª—: åªå…³è‡ªå·±, ä¸é€€å‡º app(ä¼šè¯æ´»åœ¨ä¸»è¿›ç¨‹, ä¸å—å½±å“)ã€‚
-  ipcMain.on('window-close', (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win || win === mainWindowRef) {
-      if (process.platform === 'win32' && win) {
-        win.close();
-        return;
-      }
-      app.quit();
-      return;
-    }
-    win.close();
-  });
-  // mac âŒ˜W çš„çª—å£çº§ fallback (renderer ç„¦ç‚¹ä¸åœ¨å³ä¾§æ æ—¶è°ƒç”¨): è¯­ä¹‰ = åŽŸç”Ÿèœå•
-  // role close, å³å¯¹ sender çª—å£ win.close() â€”â€” ä¸»çª—åœ¨ mac ä¸Šè¢« close handler
-  // preventDefault æˆéšè—, å‰¯çª— / å­çª—æ­£å¸¸å…³é—­ã€‚ä¸Žä¸Šé¢ 'window-close'(è‡ªå®šä¹‰
-  // X æŒ‰é’®, ä¸»çª— = é€€å‡º app)æ˜¯ä¸¤ç§ä¸åŒè¯­ä¹‰, ä¸èƒ½åˆå¹¶ã€‚
-  ipcMain.on('window-close-self', (event) => {
-    BrowserWindow.fromWebContents(event.sender)?.close();
-  });
-  ipcMain.handle('page-zoom:in', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    const settings = await updatePersistedWindowZoom(PAGE_ZOOM_FACTOR_STEP);
-    return {
-      ok: true as const,
-      zoomFactor: settings.windowZoom,
-    };
-  });
-  ipcMain.handle('page-zoom:out', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    const settings = await updatePersistedWindowZoom(-PAGE_ZOOM_FACTOR_STEP);
-    return {
-      ok: true as const,
-      zoomFactor: settings.windowZoom,
-    };
-  });
-  ipcMain.handle('page-zoom:reset', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    const settings = await updatePersistedWindowZoom(null);
-    return {
-      ok: true as const,
-      zoomFactor: settings.windowZoom,
-    };
-  });
-
-  // Fullscreen state query â€” renderer calls this on mount to recover from the
-  // race where `enter-full-screen` fires before the renderer subscribes (e.g.
-  // when window-state restores a fullscreen window on launch).
-  ipcMain.handle('get-fullscreen-state', (event): boolean => {
-    assertTrustedAppRendererEvent(event);
-    return readWindowFullscreenState(BrowserWindow.fromWebContents(event.sender));
-  });
-
-  ipcMain.handle('toggle-fullscreen', (event): boolean => {
-    assertTrustedAppRendererEvent(event);
-    const win = BrowserWindow.fromWebContents(event.sender) ?? getWindow();
-    if (!win) return false;
-    const next = !(win.isFullScreen() || win.isSimpleFullScreen());
-    if (win.isSimpleFullScreen()) win.setSimpleFullScreen(false);
-    win.setFullScreen(next);
-    return next;
-  });
-
-  // Find-in-page (F-FIP-1): renderer overlay drives Chromium's native page search.
-  // start: returns the requestId Chromium assigns; renderer correlates with the
-  // result event sent from createWindow's `found-in-page` listener.
-  ipcMain.handle(
-    'find-in-page:start',
-    (
-      event,
-      params: {
-        text: string;
-        forward?: boolean;
-        findNext?: boolean;
-        matchCase?: boolean;
-      },
-    ): number | null => {
-      const wc = event.sender;
-      if (!wc || wc.isDestroyed() || !params?.text) return null;
-      return wc.findInPage(params.text, {
-        forward: params.forward ?? true,
-        findNext: params.findNext ?? false,
-        matchCase: params.matchCase ?? false,
-      });
-    },
-  );
-  ipcMain.on(
-    'find-in-page:stop',
-    (
-      event,
-      action: 'clearSelection' | 'keepSelection' | 'activateSelection' = 'clearSelection',
-    ) => {
-      const wc = event.sender;
-      if (!wc || wc.isDestroyed()) return;
-      wc.stopFindInPage(action);
-    },
-  );
-
-  // Device ID (hardware-based, survives app reinstall)
-  const machineId = machineIdSync();
-  ipcMain.handle('get-device-id', () => machineId);
-
-  // CC ç½‘ç»œè°ƒè¯•å¼€å…³ â€” renderer Settings â†’ Experimental "CC ç½‘ç»œè°ƒè¯•æ—¥å¿—" æ“ä½œæ­¤å€¼ã€‚
-  // æ”¹å†™ process.env.XDT_CC_DEBUG_NET, è®© buildClaudeEnv åœ¨ä¸‹æ¬¡ spawn cc æ—¶æ³¨å…¥
-  // ANTHROPIC_LOG=debug (å®Œæ•´è¯·æ±‚å« headers) + NODE_DEBUG=http,https,net,tls + SDK debug:trueã€‚
-  // ä»…å¯¹å¼€å…³åŽæ–°å»ºçš„ session ç”Ÿæ•ˆã€‚
-  //
-  // çŠ¶æ€æ¥æº (æŒ‰ä¼˜å…ˆçº§):
-  //   1. ç”¨æˆ·ç³»ç»ŸçŽ¯å¢ƒå˜é‡ XDT_CC_DEBUG_NET=1: è€ç”¨æ³•, å…¼å®¹
-  //   2. renderer Settings å¼€å…³ (localStorage æŒä¹…åŒ–, mount æ—¶ IPC åŒæ­¥è¿‡æ¥)
-  // dev æ¨¡å¼ä¸å†å¯åŠ¨æœŸç¡¬å¼€(ç†ç”±è§ä¸‹æ–¹ 2290 è¡Œé™„è¿‘æ³¨é‡Š)ã€‚
-  //
-  // packaged æ¨¡å¼ä¸‹ä¸æŒä¹…åŒ–ä¸»è¿›ç¨‹å€¼: é‡å¯å›ž off (é˜²æ­¢ç”¨æˆ·å¿˜å…³å¯¼è‡´æ—¥å¿—çˆ†ç‚¸),
-  // renderer è¿› Settings æ—¶å† sync å›žæ¥ã€‚
-  const ccDebugNetLog = createSchedulerLogger('cc-debug-net');
-
-  // cc å­è¿›ç¨‹å†…éƒ¨ debug çš„ raw ä¸­è½¬æ–‡ä»¶ (SDK debugFile é€‰é¡¹)ã€‚cc äºŒè¿›åˆ¶è‡ªå·± fopen
-  // å†™å®ƒ (æˆ‘ä»¬æ²¡æ³•æŽ¥ç®¡), ä¸‹é¢çš„ tailer é€è¡Œè¯»å‡ºåŽå½’ä¸€åŒ–æ±‡å…¥ç»Ÿä¸€ agent æµ
-  // (agent-<date>.ndjson, source=cc-debug)ã€‚æ–‡ä»¶åå¸¦ .raw è¡¨æ˜Žå®ƒæ˜¯ä¸­è½¬ã€ä¸æ˜¯æœ€ç»ˆæ—¥å¿—ã€‚
-  // dev: apps/desktop/logs/cc-debug.raw.log; packaged: <userData>/logs/cc-debug.raw.logã€‚
-  // ä»»ä½•æ¨¡å¼ä¸‹, åªè¦ XDT_CC_DEBUG_NET=1 å°±è®© SDK èµ° debugFile è·¯, ç»•è¿‡ SEA stderr æŠ‘åˆ¶ã€‚
-  const ccDebugLogPath = path.join(
-    !app.isPackaged
-      ? path.resolve(__dirname, '../../logs')
-      : path.join(app.getPath('userData'), 'logs'),
-    'cc-debug.raw.log',
-  );
-  process.env.XDT_CC_DEBUG_FILE = ccDebugLogPath;
-
-  // å¯åŠ¨æœŸ trim: è·Ÿ logger.ts åŒä¸€ç­–ç•¥ â€” ä¸ç•™ .1 å¤‡ä»½, ç å¤´ä¿å°¾ã€‚cc å­è¿›ç¨‹
-  // è¦ç­‰ç”¨æˆ·èµ· session æ‰ä¼š fopen è¿™ä¸ªæ–‡ä»¶, å¯åŠ¨æœŸæ”¹åŠ¨å®‰å…¨ã€‚dev æ¨¡å¼ cc-debug
-  // ä¸€ç›´åœ¨å†™, ä¸ trim å®¹æ˜“åƒæŽ‰å‡ ç™¾ MB ä»“åº“ç©ºé—´ã€‚
-  // é¡ºæ‰‹æ¸…æŽ‰åŽ†å²ç‰ˆæœ¬ç•™ä¸‹çš„ .1 (ä¸Šä¸€ç‰ˆæœ¬ rotation äº§ç‰©, çŽ°åœ¨ä¸å†åˆ›å»º)ã€‚
-  try {
-    fs.unlinkSync(`${ccDebugLogPath}.1`);
-  } catch {
-    /* not exist */
-  }
-  let ccDebugSizeBefore = 0;
-  try {
-    ccDebugSizeBefore = fs.statSync(ccDebugLogPath).size;
-  } catch {
-    /* not yet */
-  }
-  keepRecentSync(ccDebugLogPath);
-  if (ccDebugSizeBefore > 5 * 1024 * 1024) {
-    ccDebugNetLog.info(`trimmed cc-debug.raw.log on startup (was ${ccDebugSizeBefore} bytes)`);
-  }
-  // per-session raw (sessions/<id>/cc-debug.raw.log) åŒæ ·åœ¨å¯åŠ¨æœŸç å¤´ä¿å°¾ â€”â€” å®ƒä¸ç» emit,
-  // å¹³æ—¶åªé  cleanupOldSessions 30 å¤©æ•´ç›®å½•åˆ , æœŸé—´ä¸€ä¸ªå¼€ç€ NODE_DEBUG çš„æ´»è·ƒ session èƒ½æŠŠå•ä¸ª
-  // raw å†™çˆ†ç£ç›˜ã€‚å†…å®¹å·²è¢«ä¸‹é¢çš„ tailer æ±‡å…¥ <date>.ndjson, raw åªæ˜¯ä¸­è½¬, ç æŽ‰æ—§å¤´ä¸ä¸¢æœ‰æ•ˆä¿¡æ¯ã€‚
-  keepRecentSessionCcDebugSync();
-
-  // cc-debug.raw.log â†’ ç»Ÿä¸€ agent æµ (agent-<date>.ndjson, source=cc-debug):
-  // cc å­è¿›ç¨‹é€šè¿‡ SDK debugFile ç›´æŽ¥ fopen å†™ raw, ä¸ç» logger; è¿™é‡Œè½®è¯¢è¯»å¢žé‡,
-  // é€è¡Œè°ƒ writeCcDebugLine() è§£æžè¡Œé¦– UTC-ISO æ—¶é—´æˆ³åŽå½’ä¸€åŒ–å†™å…¥å½“å¤© agent æµ,
-  // è·Ÿ maker / proxy ä¸¤æºåˆå¹¶ã€å…±ç”¨æŒ‰å¤© rotate + ä¿ç•™ç­–ç•¥ã€‚
-  //
-  // - è½®è¯¢ 2s: cc-debug ä¸æ˜¯é«˜é¢‘çƒ­ç‚¹, ä¸éœ€è¦ fs.watch çš„å®žæ—¶æ€§ (æŽ’åºæŒ‰è§£æžå‡ºçš„ ts,
-  //   ä¸å— 2s è½®è¯¢å»¶è¿Ÿå½±å“, å»¶è¿Ÿåªå½±å“"å¤šä¹…å¯è§")
-  // - cc æŒæœ‰ fd æœŸé—´æˆ‘ä»¬ rotate ä¸æŽ‰ raw æ–‡ä»¶ (Windows rename å¤±è´¥, Linux truncate
-  //   ç•™ç¨€ç–ç©ºæ´ž, éƒ½ä¸å®‰å…¨), æ‰€ä»¥åå‘èµ° â”€ è¯»å‡ºå†…å®¹æ±‡å…¥ agent æµ, raw ä»…å¯åŠ¨æœŸ trim
-  // - æ£€æµ‹åˆ°æ–‡ä»¶ size å€’é€€ (truncate / å¯åŠ¨ rename), é‡ç½® read offset ä»Ž 0 å¼€å§‹
-  // - è·¨è¯»ä¿ç•™å°¾éƒ¨ä¸å®Œæ•´è¡Œ, è·Ÿä¸‹ä¸€æ®µæ‹¼èµ·æ¥å†åˆ‡, ä¸åˆ‡å multi-line ä¿¡æ¯
-  // - timer.unref() é˜²æ­¢è¿›ç¨‹å…³é—­æ—¶è¢«å¡ä½
-  // per-file tail çŠ¶æ€: filePath â†’ { offset, leftover }ã€‚åŒæ—¶ tail å…¨å±€ fallback raw
-  // (æ—  sessionId çš„ cc, ç½•è§) + å„ sessions/<id>/cc-debug.raw.log; sessionId ä»Žè·¯å¾„
-  // æå–åŽä¼ ç»™ writeCcDebugLine, è®© cc ç½‘ç»œ debug å½’åˆ°å¯¹åº” session çš„ <date>.ndjsonã€‚
-  const ccLogRootDir = path.dirname(ccDebugLogPath);
-  const ccTailState = new Map<string, { offset: number; leftover: string }>();
-
-  function tailOneCcFile(filePath: string, sessionId: string): void {
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(filePath);
-    } catch {
-      return;
-    }
-    const st = ccTailState.get(filePath);
-    if (!st) {
-      // é¦–æ¬¡å‘çŽ°: ä»Žå½“å‰æœ«å°¾å¼€å§‹, è·³è¿‡å·²æœ‰å†…å®¹ (é¿å… app é‡å¯åŽæŠŠæ—§ session çš„ raw é‡å¤
-      // çŒè¿› ndjson)ã€‚ä»£ä»·æ˜¯æ¼æŽ‰æ–‡ä»¶è¢«å‘çŽ°å‰ â‰¤ è½®è¯¢é—´éš” çš„å‡ è¡Œåˆå§‹ cc æ—¥å¿—, å¯æŽ¥å—ã€‚
-      ccTailState.set(filePath, { offset: stat.size, leftover: '' });
-      return;
-    }
-    if (stat.size < st.offset) {
-      st.offset = 0;
-      st.leftover = '';
-    }
-    if (stat.size === st.offset) return;
-    let fd: number;
-    try {
-      fd = fs.openSync(filePath, 'r');
-    } catch {
-      return;
-    }
-    try {
-      const len = stat.size - st.offset;
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, st.offset);
-      st.offset = stat.size;
-      st.leftover += buf.toString('utf8');
-      const lines = st.leftover.split('\n');
-      st.leftover = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line.length > 0) writeCcDebugLine(line, sessionId);
-      }
-    } finally {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  function tailCcDebugOnce(): void {
-    tailOneCcFile(ccDebugLogPath, ''); // å…¨å±€ fallback (æ—  sessionId çš„ cc)
-    const sessionsBase = path.join(ccLogRootDir, 'sessions');
-    let dirs: fs.Dirent[];
-    try {
-      dirs = fs.readdirSync(sessionsBase, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const d of dirs) {
-      if (!d.isDirectory()) continue;
-      tailOneCcFile(path.join(sessionsBase, d.name, 'cc-debug.raw.log'), d.name);
-    }
-  }
-  setInterval(tailCcDebugOnce, 2000).unref();
-
-  // dev æ¨¡å¼ä¸å†å¯åŠ¨æœŸç¡¬å¼€(2026-07-11 Lizi å®šæ¡ˆ):NODE_DEBUG=http,https,net,tls
-  // ä¼šé¡ºç€ cc å­è¿›ç¨‹ç»§æ‰¿è¿› agent çš„ Bash å­å‘½ä»¤â€”â€”æ‰€æœ‰å‘½ä»¤è¾“å‡ºè¢«è°ƒè¯•æ—¥å¿—åˆ·å±,
-  // è¿˜ä¼šæ±¡æŸ“"æ–­è¨€è¾“å‡ºå¹²å‡€"çš„å•æµ‹(slack-hook-server æ—¥å¿—è„±æ•ç”¨ä¾‹å®žæ’ž)ã€‚
-  // éœ€è¦ç½‘ç»œè¯Šæ–­æ—¶èµ° Settings â†’ Experimental å¼€å…³,æˆ–èµ· app å‰è®¾ XDT_CC_DEBUG_NET=1ã€‚
-
-  // release ç”¨æˆ·å¼€ Debug æ—¥å¿—æ—¶, æŠŠ main/maker logger ä¹Ÿä»Ž info æŠ¬åˆ° debug, è®©
-  // maker-core é‡Œ session.ts / maker.ts / codex client çš„ logger.debug(...) ä¸€èµ·è½ç›˜ â€”
-  // å•å¼€ cc å­è¿›ç¨‹ç½‘ç»œæ—¥å¿—æ²¡æ„ä¹‰, ç”¨æˆ·æŽ’æŸ¥é—®é¢˜éœ€è¦å…¨å¥—ä¸Šä¸‹æ–‡ã€‚
-  // dev æ¨¡å¼é»˜è®¤ trace, ä¸éœ€è¦ä¹Ÿä¸åº”è¢«è¿™é‡Œæ”¹ (ä¼šåå‘é™çº§)ã€‚
-  // å…³å›žåŽ»æ—¶æ¢å¤åŽŸçº§åˆ« (release é»˜è®¤ info)ã€‚
-  let levelBeforeDebugNet: LogLevel | null = null;
-  ipcMain.handle('cc:set-debug-net', (_event, enabled: boolean): { ok: true } => {
-    if (enabled) {
-      process.env.XDT_CC_DEBUG_NET = '1';
-      // release: æŠ¬çº§ã€‚dev: å·²ç»æ˜¯ trace, è·³è¿‡ã€‚
-      if (app.isPackaged) {
-        const cur = getLogLevel();
-        // åªåœ¨æ¯” debug å¼±çš„çº§åˆ«ä¸ŠæŠ¬, é¿å…æŠŠç”¨æˆ·é€šè¿‡ LOG_LEVEL=trace çš„æ›´é«˜è¯‰æ±‚é™çº§
-        if (cur === 'info' || cur === 'warn' || cur === 'error' || cur === 'fatal') {
-          levelBeforeDebugNet = cur;
-          setLogLevel('debug');
-          ccDebugNetLog.info(`bumped main/maker logger ${cur} â†’ debug`);
-        }
-      }
-    } else {
-      delete process.env.XDT_CC_DEBUG_NET;
-      if (app.isPackaged && levelBeforeDebugNet) {
-        setLogLevel(levelBeforeDebugNet);
-        ccDebugNetLog.info(`restored main/maker logger â†’ ${levelBeforeDebugNet}`);
-        levelBeforeDebugNet = null;
-      }
-    }
-    ccDebugNetLog.info(`set ${enabled ? 'on' : 'off'} via renderer`);
-    return { ok: true };
-  });
-
-  // Release notes (per-version, fetched from CDN). Platform is resolved
-  // inside the service so renderer never needs to pass it.
-  ipcMain.handle('release-notes:fetch', async (_event, version: string) => {
-    return fetchReleaseNotes(version);
-  });
-
-  // Release notes index â€” sorted list of every version with a notice on the
-  // CDN. Used by the renderer to compute the unread range on cross-version
-  // upgrade and pull every intermediate notice.
-  ipcMain.handle('release-notes:fetch-index', async () => {
-    return fetchReleaseNotesIndex();
-  });
-
-  // safeStorage IPC handlers
-  const isValidKey = (key: string): boolean => /^[a-zA-Z0-9_-]+$/.test(key);
-  const isValidRendererKey = (key: string): boolean =>
-    isValidKey(key) && isRendererAccessibleSafeStorageKey(key);
-  const resolveSafeStorageFilepath = (key: string): string | null => {
-    const scopedKey = resolveOwnerScopedSecretStorageKey(key);
-    return scopedKey
-      ? path.join(app.getPath('userData'), 'safe-storage', `${scopedKey}.enc`)
-      : null;
-  };
-
-  // å…±ç”¨çš„ api_key å˜æ›´åŽ, è‹¥ Codex app-server ä»¥ env-key å¯åŠ¨(æ—  OAuth,gateway key å†»å…¥
-  // å­è¿›ç¨‹ env)åˆ™é‡å»º â€”â€” settings æ”¹/åˆ äº† key è¿›ç¨‹æ„ŸçŸ¥ä¸åˆ°, å¿…é¡»é‡å»ºæ‰ç”Ÿæ•ˆã€‚oauth-bearer
-  // spawn çš„ codex ç”± proxy æŒ‰è¯·æ±‚ live è¯» gateway key(_readGatewayKey),æ”¹ key æ— éœ€é‡å»ºã€‚
-  // ä¸¥æ ¼ gated: éž api_key / éž env-key spawn ä¸€å¾‹ no-op, å¯¹ Claude è·¯å¾„é›¶å½±å“ (Claude æ¯ä¸ª
-  // session çŽ°è¯» key, å¤©ç„¶è·Ÿéš)ã€‚æ”¹ key â†’ env-key codex æ–°è¿›ç¨‹ç”¨æ–° key; åˆ  key â†’ å˜æœªæŽˆæƒã€‚
-  const shouldRestartCodexForApiKeyChange = (key: string): boolean =>
-    key === 'api_key' && getCodexProxyAuthInjectionState() === 'env-key';
-
-  const prepareApiKeyChangeMaybeRestartCodex = async (
-    key: string,
-  ): Promise<{ ok: true } | { ok: false; error: string }> => {
-    if (!shouldRestartCodexForApiKeyChange(key)) return { ok: true };
-    try {
-      await prepareCodexForAuthModeChange();
-      return { ok: true };
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      createLogger('codex-api-key-restart').warn('prepare before api_key change failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return { ok: false, error };
-    }
-  };
-
-  const finalizeApiKeyChangeMaybeRestartCodex = async (
-    key: string,
-  ): Promise<{ ok: true } | { ok: false; error: string }> => {
-    if (!shouldRestartCodexForApiKeyChange(key)) return { ok: true };
-    try {
-      await finalizeCodexAfterAuthModeChange();
-      return { ok: true };
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      createLogger('codex-api-key-restart').warn('restart after api_key change failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return { ok: false, error };
-    }
-  };
-
-  const cancelApiKeyChangeMaybeRestartCodex = (key: string): void => {
-    if (!shouldRestartCodexForApiKeyChange(key)) return;
-    cancelCodexAuthModeChange();
-  };
-
-  const notifyProviderKeyChanged = (providerId: string): void => {
-    getGhostSetupChangeBus().emitAll({
-      source: 'host_config',
-      ref: `provider:${providerId}`,
-    });
-    if (providerId === 'openai-images') {
-      notifyOpenAiMediaCredentialChanged();
-    }
-    // å‘æ‰€æœ‰çª—å£å¹¿æ’­ PROVIDER_CHANGED:useProviders ä¾èµ–æ­¤æ¶ˆæ¯åˆ·æ–°è¿žæŽ¥æ€å¿«ç…§(å¤šçª—å£åŒæ­¥)ã€‚
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) {
-        try {
-          win.webContents.send(MAKER_PUSH.PROVIDER_CHANGED, {});
-        } catch {
-          /* no-op */
-        }
-      }
-    }
-  };
-
-  ipcMain.handle(
-    'safe-storage-store',
-    async (event: Electron.IpcMainInvokeEvent, key: string, value: string): Promise<boolean> => {
-      try {
-        assertTrustedAppRendererEvent(event);
-        if (!isValidRendererKey(key)) return false;
-        const filepath = resolveSafeStorageFilepath(key);
-        if (!filepath) return false;
-        if (!safeStorage.isEncryptionAvailable()) return false;
-        const encrypted = safeStorage.encryptString(value);
-        const prepareResult = await prepareApiKeyChangeMaybeRestartCodex(key);
-        if (!prepareResult.ok) return false;
-        const dir = path.dirname(filepath);
-        const hadPrevious = fs.existsSync(filepath);
-        const previousContent = hadPrevious ? fs.readFileSync(filepath, 'utf-8') : null;
-        let mutated = false;
-        let finalized = false;
-        fs.mkdirSync(dir, { recursive: true });
-        try {
-          fs.writeFileSync(filepath, encrypted.toString('base64'), 'utf-8');
-          mutated = true;
-          const restartResult = await finalizeApiKeyChangeMaybeRestartCodex(key);
-          finalized = restartResult.ok;
-          if (restartResult.ok) {
-            // æ‰‹å¡« XD key ä¿å­˜æˆåŠŸ:æ¥æºæ ‡è®°ç¿» manual(endpoint å›žè½ç¼–è¯‘æœŸå¸¸é‡,
-            // ä¸Ž model-access è‡ªåŠ¨ä¸‹å‘çš„ endpoint è§£è€¦,è§ credentialsStore æ³¨é‡Š)ã€‚
-            if (key === 'api_key') {
-              noteManualXdKeySaved();
-              notifyProviderKeyChanged('xd');
-            }
-            return true;
-          }
-          if (hadPrevious && previousContent !== null)
-            fs.writeFileSync(filepath, previousContent, 'utf-8');
-          else if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
-          return false;
-        } finally {
-          if (!finalized) {
-            if (!mutated) cancelApiKeyChangeMaybeRestartCodex(key);
-          }
-        }
-      } catch (err) {
-        console.error('[safe-storage-store]', err);
-        cancelApiKeyChangeMaybeRestartCodex(key);
-        return false;
-      }
-    },
-  );
-
-  ipcMain.handle(
-    'safe-storage-read',
-    async (event: Electron.IpcMainInvokeEvent, key: string): Promise<string | null> => {
-      const strictCustomProviderRead = isCustomProviderRuntimeKeyStorageKey(key);
-      try {
-        assertTrustedAppRendererEvent(event);
-        if (!isValidRendererKey(key)) return null;
-        const filepath = resolveSafeStorageFilepath(key);
-        if (!filepath) return null;
-        if (!safeStorage.isEncryptionAvailable()) {
-          if (strictCustomProviderRead) {
-            throwIpcError('INTERNAL', 'custom provider credential is unavailable');
-          }
-          return null;
-        }
-        if (!fs.existsSync(filepath)) return null;
-        const content = fs.readFileSync(filepath, 'utf-8');
-        const buffer = Buffer.from(content, 'base64');
-        return safeStorage.decryptString(buffer);
-      } catch (err) {
-        // éžå¯ä¿¡ auxiliary/WebView renderer è§¦å‘çš„æ‹’ç»æ˜¯é¢„æœŸå®‰å…¨ç»“æžœ,é™ä¸º debugï¼›
-        // guardã€allowlistã€è·¯å¾„å’Œæ˜Žæ–‡è¿”å›žè¾¹ç•Œä¿æŒä¸å˜ã€‚å…¶å®ƒå¼‚å¸¸ä»å¯è§,ä½†åªè®°å½•
-        // å®‰å…¨çš„ç±»åž‹/code,ç»ä¸è½åŽŸå§‹ messageã€è·¯å¾„ã€sender æˆ–å¯†æ–‡ã€‚
-        if (isIpcError(err) && err.code === 'PERMISSION_DENIED') {
-          safeStorageReadLog.debug('read denied for untrusted renderer');
-        } else {
-          safeStorageReadLog.error('read failed', {
-            error: isIpcError(err) ? err.code : err instanceof Error ? err.name : 'unknown',
-          });
-          if (strictCustomProviderRead) {
-            throwIpcError('INTERNAL', 'custom provider credential is unreadable');
-          }
-        }
-        return null;
-      }
-    },
-  );
-
-  ipcMain.handle(
-    'safe-storage-remove',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      key: string,
-    ): Promise<{ success: boolean; error?: string }> => {
-      try {
-        assertTrustedAppRendererEvent(event);
-        if (!isValidRendererKey(key)) {
-          return { success: false, error: 'invalid key' };
-        }
-        const filepath = resolveSafeStorageFilepath(key);
-        if (!filepath) return { success: true };
-        const prepareResult = await prepareApiKeyChangeMaybeRestartCodex(key);
-        if (!prepareResult.ok) {
-          return { success: false, error: 'codex_restart_failed' };
-        }
-        const hadPrevious = fs.existsSync(filepath);
-        const previousContent = hadPrevious ? fs.readFileSync(filepath, 'utf-8') : null;
-        try {
-          if (fs.existsSync(filepath)) {
-            fs.unlinkSync(filepath);
-          }
-        } catch (err: unknown) {
-          // ENOENT è¡¨ç¤ºæ–‡ä»¶å·²ä¸å­˜åœ¨ï¼Œåˆ é™¤è¯­ä¹‰ä¿æŒå¹‚ç­‰ã€‚
-          if (!(
-            err instanceof Error &&
-            'code' in err &&
-            (err as NodeJS.ErrnoException).code === 'ENOENT'
-          )) {
-            console.error('[safe-storage-remove]', err);
-            cancelApiKeyChangeMaybeRestartCodex(key);
-            return {
-              success: false,
-              error: 'remove_failed',
-            };
-          }
-        }
-        const restartResult = await finalizeApiKeyChangeMaybeRestartCodex(key);
-        if (!restartResult.ok) {
-          if (hadPrevious && previousContent !== null) {
-            fs.mkdirSync(path.dirname(filepath), { recursive: true });
-            fs.writeFileSync(filepath, previousContent, 'utf-8');
-          }
-          return { success: false, error: 'codex_restart_failed' };
-        }
-        // æ‰‹å¡« XD key è¢«åˆ é™¤(æ–­å¼€):æ¸…æ¥æºæ ‡è®°,endpoint å›žè½ç¼–è¯‘æœŸå¸¸é‡ã€‚
-        if (key === 'api_key') {
-          noteManualXdKeyRemoved();
-          notifyProviderKeyChanged('xd');
-        }
-        return { success: true };
-      } catch (err: unknown) {
-        console.error('[safe-storage-remove]', err);
-        cancelApiKeyChangeMaybeRestartCodex(key);
-        return {
-          success: false,
-          error: 'remove_failed',
-        };
-      }
-    },
-  );
-
-  // å†…ç½® API-key ä¾›åº”å•†ä¸“ç”¨ IPC(æŸ¥/å†™/åˆ ,has åªå›žå­˜åœ¨æ€§,æ°¸ä¸å›žè¯»æ˜Žæ–‡)ã€‚
-  // ä¸šåŠ¡ä½“(ç™½åå•/ç±»åž‹/é•¿åº¦æ ¡éªŒ + ç»Ÿä¸€é”™è¯¯åè®®)åœ¨ secrets/builtinApiKeyBridge.ts,
-  // è¾¹ç•Œè¡Œä¸ºæœ‰å•æµ‹;è¿™é‡Œåªåš sender å®ˆå« + ä¾èµ–è£…é…ã€‚
-  const builtinApiKeyLog = createLogger('secrets:builtin-api-key');
-  const builtinApiKeyDeps: BuiltinApiKeyBridgeDeps = {
-    store: getProviderSecretStore(),
-    onKeyChanged: (id) => notifyProviderKeyChanged(id),
-    logError: (message, err) => builtinApiKeyLog.error(message, err),
-  };
-
-  ipcMain.handle(
-    'builtin-api-key-has',
-    async (event: Electron.IpcMainInvokeEvent, providerId: unknown): Promise<boolean> => {
-      assertTrustedAppRendererEvent(event);
-      return builtinApiKeyHas(builtinApiKeyDeps, providerId);
-    },
-  );
-
-  ipcMain.handle(
-    'builtin-api-key-store',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      providerId: unknown,
-      value: unknown,
-    ): Promise<void> => {
-      assertTrustedAppRendererEvent(event);
-      builtinApiKeyStore(builtinApiKeyDeps, providerId, value);
-      await retainProviderPresentationAfterAuthChange(
-        builtinApiKeyPresentationId(providerId as string),
-      );
-    },
-  );
-
-  ipcMain.handle(
-    'builtin-api-key-remove',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      providerId: unknown,
-      ownerScope?: { dataOwnerId: string | null; ownerGeneration: number },
-    ): Promise<void> => {
-      assertTrustedAppRendererEvent(event);
-      const active = getActiveAppSession();
-      if (
-        isAppSessionBoundaryPending() ||
-        (ownerScope &&
-          (ownerScope.dataOwnerId !== active.dataOwnerId ||
-            ownerScope.ownerGeneration !== active.generation))
-      )
-        throwIpcError('INVALID_PARAMS', 'Provider owner changed');
-      builtinApiKeyRemove(builtinApiKeyDeps, providerId);
-      await retainProviderPresentationAfterAuthChange(
-        builtinApiKeyPresentationId(providerId as string),
-      );
-    },
-  );
-
-  // â”€â”€ Auth IPC handlers (delegated to authManager) â”€â”€
-
-  ipcMain.handle('auth:initialize', async () => {
-    try {
-      let pendingCompletion: Promise<authManager.AuthState> | null = null;
-      const state = await authManager
-        .initialize({
-          onColdStartPending: (completion) => {
-            pendingCompletion = completion;
-          },
-        })
-        .finally(() => authCredentialRecovery.request());
-      await authManager.ensureStableOwnerPostCommitTasks('auth-initialize');
-      if (!app.isPackaged || isCindyVersionLaunchPending()) {
-        recordDesktopDevAuthStartupResult(state, pendingCompletion, () =>
-          authManager.getAuthState(),
-        );
-      }
-      // ä½¿ç”¨ç»Ÿè®¡åŒæ„é—¸çš„ä¸€æ¬¡æ€§å­˜é‡è¿ç§»:åªè®¤å†·å¯åŠ¨æ¢å¤å‡ºæ¥çš„ç™»å½•æ€ã€‚å†…éƒ¨æœ‰ guard,
-      // å¤šä¸ªçª—å£å„è‡ª initialize åªä¼šè¯„ä¼°ä¸€æ¬¡(è§ analyticsSettingsService)ã€‚
-      // åŸ‹ç‚¹æ˜¯ best-effort:å†åŒ…ä¸€å±‚ catch,ä»»ä½•å¼‚å¸¸éƒ½ä¸å¾—è®©è¿™æ¬¡è®¤è¯è¢«åˆ¤å¤±è´¥
-      // (é‚£ä¼šè®©ç”¨æˆ·è¢«å½’ä¸€æˆæœªç™»å½•)ã€‚
-      try {
-        noteAuthColdStartState(state, pendingCompletion);
-      } catch (analyticsErr) {
-        console.warn('[analytics] cold-start consent migration failed', analyticsErr);
-      }
-      return state;
-    } catch (err) {
-      if (!app.isPackaged) {
-        markDesktopDevStartupFailed(
-          'AUTH_INIT_FAILED',
-          err instanceof Error ? err.message : String(err),
-          {
-            phase: 'auth:initialize',
-          },
-        );
-      }
-      throw err;
-    }
-  });
-
-  ipcMain.handle('auth:get-login-state', async () => authManager.getLoginState());
-
-  ipcMain.handle('auth:dispatch-login-action', async (_event, action: unknown) => {
-    return authManager.dispatchLoginAction(action);
-  });
-
-  // ç™»å½• captcha æ‰˜ç®¡æŒ‘æˆ˜é¡µåœ°å€(ä¸å« query)ã€‚åªè¿”å›žæŒ‰æž„å»ºåŒºåŸŸæ‹¼å‡ºçš„å…¬å¼€ URL,
-  // æ— å‰¯ä½œç”¨ã€ä¸å«å‡­è¯;renderer çš„ LoginCaptchaOverlay ç”¨å®ƒè£…è½½ webviewã€‚
-  ipcMain.handle('auth:get-captcha-challenge-url', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return authManager.getLoginCaptchaChallengeUrl();
-  });
-
-  ipcMain.handle('auth:logout', async () => {
-    await authManager.logout();
-  });
-
-  ipcMain.handle('auth:accounts:list', (event) => {
-    assertTrustedAppRendererEvent(event);
-    return authManager.listSavedAccounts();
-  });
-
-  ipcMain.handle('auth:accounts:sync', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      return await authManager.syncSavedAccounts();
-    } catch (error) {
-      throwAuthAccountIpcError(error);
-    }
-  });
-
-  ipcMain.handle('auth:accounts:switch', async (event, accountKey: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      await authManager.switchSavedAccount(accountKey);
-    } catch (error) {
-      throwAuthAccountIpcError(error);
-    }
-  });
-
-  ipcMain.handle('auth:accounts:begin-add', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      return await authManager.beginAddAccountLogin();
-    } catch (error) {
-      throwAuthAccountIpcError(error);
-    }
-  });
-
-  ipcMain.handle('auth:accounts:cancel-add', (event) => {
-    assertTrustedAppRendererEvent(event);
-    authManager.cancelAddAccountLogin();
-  });
-
-  ipcMain.handle('auth:enter-local', async () => {
-    if (getActiveAppSession().mode === 'local') {
-      return authManager.getAuthState();
-    }
-    await authManager.waitForSessionInvalidation();
-    return authManager.enterLocalMode();
-  });
-
-  ipcMain.handle('auth:exit-local', async () => {
-    if (getActiveAppSession().mode !== 'local') {
-      throwIpcError('PRECONDITION_FAILED', 'Local mode is not active.');
-    }
-    return authManager.exitLocalMode();
-  });
-
-  ipcMain.handle('auth:refresh', async () => {
-    return authManager.refresh();
-  });
-
-  // â”€â”€ Account deletion IPC â”€â”€
-  // Receipt and auth tokens stay in main. A successful confirm first reuses
-  // the full logout account-boundary teardown, then clears only this local
-  // session (the server has already revoked its refresh family).
-  const accountDeletionLog = createLogger('accountDeletion');
-  const accountDeletionHandlers = createAccountDeletionIpcHandlers({
-    getAvailability: () => authManager.getAccountDeletionAvailability(),
-    requestChallenge: () => authManager.requestAccountDeletionChallenge(),
-    confirm: (input) => authManager.confirmAccountDeletion(input),
-    getStatus: () => authManager.getAccountDeletionStatus(),
-    clearReceipt: () => authManager.clearAccountDeletionReceipt(),
-    consumeRestoredNotice: () => authManager.consumeAccountDeletionRestoredNotice(),
-    isConfirmedLocalSessionCurrent: () => authManager.isConfirmedAccountDeletionSessionCurrent(),
-    clearLocalSession: () => authManager.clearLocalSessionAfterAccountDeletion(),
-    logWarn: (message, error) => accountDeletionLog.warn(message, error),
-  });
-
-  ipcMain.handle('auth:account-deletion:get-availability', () =>
-    accountDeletionHandlers.getAvailability(),
-  );
-  ipcMain.handle('auth:account-deletion:request-challenge', () =>
-    accountDeletionHandlers.requestChallenge(),
-  );
-  ipcMain.handle('auth:account-deletion:confirm', (_event, input: unknown) =>
-    accountDeletionHandlers.confirm(input),
-  );
-  ipcMain.handle('auth:account-deletion:get-status', () => accountDeletionHandlers.getStatus());
-  ipcMain.handle('auth:account-deletion:clear-receipt', () =>
-    accountDeletionHandlers.clearReceipt(),
-  );
-  ipcMain.handle('auth:account-deletion:consume-restored-notice', () =>
-    accountDeletionHandlers.consumeRestoredNotice(),
-  );
-
-  // â”€â”€ Profile ç¼–è¾‘ IPC(è®¾ç½® â†’ ç”¨æˆ·å¡ç‰‡ç¼–è¾‘;ä¸šåŠ¡ä½“åœ¨ profileEdit.ts,
-  //    èµ„æ–™ç›´å†™ auth-server,å¤´åƒç» oss-server é¢„ç­¾åç›´ä¼ ) â”€â”€
-
-  const profileEditLog = createLogger('profileEdit');
-  const profileEditDeps: profileEdit.ProfileEditDeps = {
-    getCurrentUserId: () => authManager.getCurrentUserId(),
-    getServerProfile: () => authManager.getServerProfile(),
-    showAvatarOpenDialog: async () => {
-      const result = await dialog.showOpenDialog({
-        properties: ['openFile'],
-        filters: [{ name: 'Images', extensions: profileEdit.AVATAR_FILE_EXTENSIONS }],
-      });
-      return result.canceled || !result.filePaths[0] ? null : result.filePaths[0];
-    },
-    readFile: (filePath) => fs.promises.readFile(filePath),
-    uploadAvatar: async ({ buffer, mimeType }) => {
-      const result = await uploadPublicAsset(
-        {
-          fetchImpl: (input, init) => net.fetch(input, init),
-          getBaseUrl: () => getClientEndpoint('ossApiBaseUrl'),
-          getToken: () => authManager.getAccessToken(),
-        },
-        { scene: 'avatar', contentType: mimeType, body: buffer },
-      );
-      if (!result.ok && result.status === 401 && result.code === 'ACCOUNT_UNAVAILABLE') {
-        void authManager.invalidateSession('account-unavailable');
-      }
-      return result;
-    },
-    patchProfile: (patch) => authManager.updateServerProfile(patch),
-    logWarn: (message, err) => profileEditLog.warn(message, err),
-  };
-
-  const requireCloudProfile = (): void => {
-    if (!getAppCapabilities().canUseCindyAccountServices) {
-      throwIpcError('PERMISSION_DENIED', 'Profile editing requires a Cindy account.');
-    }
-  };
-
-  ipcMain.handle('profile:get-state', async () => {
-    requireCloudProfile();
-    return profileEdit.getProfileEditState(profileEditDeps);
-  });
-
-  ipcMain.handle('profile:choose-avatar', async () => {
-    requireCloudProfile();
-    return profileEdit.chooseAvatarFile(profileEditDeps);
-  });
-
-  ipcMain.handle('profile:update', async (_event, params: unknown) => {
-    requireCloudProfile();
-    return profileEdit.updateProfile(profileEditDeps, params);
-  });
-
-  // Google OAuth é›†æˆå·²äºŽ 2026-07-13 éš lizi_google é€€å½¹â€”â€”Google èƒ½åŠ›æ•´ä½“
-  // è¿å…¥å†…ç½®æ„è¯† filo-google(è®¾ç½®å…¥å£åœ¨ æ„è¯† â†’ Filo Google)ã€‚
-
-  // Jira OAuth (Atlassian 3LO + loopback redirect)
-
-  // Slack å®˜æ–¹ MCP OAuth IPC å·²äºŽ 2026-07-15 é€€å½¹(èƒ½åŠ›è¿å…¥å†…ç½®æ„è¯† cindy-slack,
-  // æŽˆæƒèµ° oauth-broker;è€è´¦å·ç”± slackAccountsMigration æ— æ„Ÿæ¬å…¥)ã€‚
-
-  // GitHub / GitLab PAT IPC å·²äºŽ 2026-07-14 é€€å½¹(GitHub èƒ½åŠ›è¿å…¥å†…ç½®æ„è¯†
-  // cindy-github,GitLab èƒ½åŠ›è¿å…¥å†…ç½®æ„è¯† cindy-gitlab)ã€‚
-
-  // Maker Core IPC æ³¨å†Œå¿…é¡»ç­‰ splash æŠŠ claude/codex binary éƒ½ provision å¥½ä¹‹åŽå†åš â€”â€”
-  // getMaker() åœ¨æž„é€ æœŸå°±è¯» binary path, æ—©äºŽ splash è°ƒç”¨ä¼šæŠ›é”™; ç¬¬ä¸€æ¬¡ splash æˆåŠŸåŽç½® true,
-  // åŽç»­ retry èµ° check-environment ä¸é‡å¤æ³¨å†Œ (é‡å¤ ipcMain.handle ä¼šè¦†ç›–åŒå handler)ã€‚
-  let makerIpcsRegistered = false;
-  // Pi æ˜¯â€œæœ¬æ¬¡å¯åŠ¨å¯é€‰â€çš„èƒ½åŠ›ï¼šå‡†å¤‡å¤±è´¥ä¸é˜»å¡žä¸»ç•Œé¢ï¼Œäº¤ç»™ recovery åœ¨ç½‘ç»œæ¢å¤åŽ
-  // é‡æ–°èµ° managed prepareï¼Œå¹¶åœ¨æˆåŠŸåŽåŠ¨æ€æ³¨å†Œåˆ°å½“å‰ Makerã€‚
-  const piRuntimeRecovery = createPiRuntimeRecovery({
-    isOnline: () => net.isOnline(),
-    prepare: async () => {
-      const result = await binaryPrepare('pi', {
-        broadcastFailure: false,
-        broadcastProgress: false,
-        signal: AbortSignal.timeout(PI_AGENT_INSTALL_STARTUP_DEADLINE_MS),
-      });
-      return result;
-    },
-    register: () => registerPiAgentIfAvailable(),
-    onRegistered: () => {
-      console.info('[bootstrap-electron] Pi runtime recovered and agent registered');
-    },
-    logWarn: (message, error) => console.warn(`[bootstrap-electron] ${message}`, error ?? ''),
-  });
-  retryPiRuntimeAfterNetworkRecovery = () => {
-    void piRuntimeRecovery.retryNow('window-focus');
-  };
-  disposePiRuntimeRecovery = () => piRuntimeRecovery.dispose();
-  const registerMakerIpcsAfterSplash = async (): Promise<void> => {
-    if (makerIpcsRegistered) return;
-    // æ¨¡åž‹ä¾›åº”å•†ç›®å½•(providers.json)æŒ‰ã€ŒOSS çœŸæº / bundled å…œåº•ã€åŠ è½½ä¸€æ¬¡å­˜å†…å­˜:å¿…é¡»åœ¨ç¬¬ä¸€æ¬¡
-    // getMakerCore()(ä¸‹é¢æž„é€  Makerã€åŒæ­¥ä»Ž getActiveCatalog() æ´¾ç”Ÿ availableModels)ä¹‹å‰å®Œæˆ,
-    // å¦åˆ™é¦–ä¸ªè¿›ç¨‹ä¼šç”¨å†…ç½®å…œåº•ç›®å½•æ´¾ç”Ÿæ¨¡åž‹æ¸…å•ã€‚ensureActiveCatalogLoaded å¹‚ç­‰ä¸”æ°¸ä¸æŠ›
-    // (å¤±è´¥å›žè½ bundled),æ‹‰å–èµ° splash æœŸã€è¢«è¿›åº¦æ¡ç›–ä½ã€‚
-    await ensureActiveCatalogLoaded();
-    // Anthropic-compat æœ¬åœ°ä»£ç†åœ¨ splash æœŸæ’å¯åŠ¨ â€”â€” é€€å½¹å…¼å®¹æ¨¡å¼å¼€å…³åŽ proxy æ’åœ¨é“¾è·¯é‡Œ
-    // (per-model / per-session ä¾›åº”å•†è·¯ç”±éƒ½æ´»åœ¨ proxy çš„ routingTransform é‡Œ, ç»•è¿‡å³å¤±æ•ˆ)ã€‚
-    // å¯åŠ¨å¤±è´¥ä¼š fail-open å›žè½çœŸä¸Šæ¸¸ + æ‰“ ERROR æ—¥å¿—, ä¸é˜»å¡ž appã€‚
-    //
-    // ClaudeCodeAgent.runtimeConfig.endpoint æ˜¯ getter (è§ runtime-configs.ts),
-    // æ¯æ¬¡ startSession éƒ½é‡è¯» getClaudeEndpoint(), proxy å°±ç»ªåŽæ–°å»º session è‡ªåŠ¨ç”¨ä¸Š loopbackã€‚
-    //
-    // è®¢é˜…ç›´è¿ž(chatgpt/ / xai/ å‰ç¼€)ä»¥ localHandler å½¢æ€æ’åœ¨æœ¬ proxy çš„ routingTransform é‡Œ
-    // (è§ anthropic-compat-proxy-host / anthropic-responses-bridge-host),çº¯å†…å­˜æ‡’è£…é…,
-    // æ— ç‹¬ç«‹ serverã€æ— å¯åŠ¨ / å…³åœç”Ÿå‘½å‘¨æœŸã€‚
-    await ensureAnthropicCompatProxyReady();
-    // codex proxy ä¸¤ç§ spawn å½¢æ€(oauth-bearer / env-key)éƒ½ç»å®ƒå‡ºå£,é¦–ä¸ª codex session spawn æ—¶
-    // ç”± prepareCodexExtraSpawnConfig æ‡’å¯åŠ¨(å¹‚ç­‰);æ­¤å¤„ä¸å†æŒ‰å…¨å±€å¼€å…³ eager-startã€‚
-    try {
-      setUpdateAutoRelaunchBusyProbe(async () => {
-        // A remote operator may be viewing a live session or file tree without an agent turn.
-        // Keep those paths alive, but do not let the lightweight `sessions` list subscription
-        // held by every eligible device block updates forever.
-        return hasUpdateRelaunchBusyActivity({
-          readSynchronousBusy: () =>
-            getUpdateRelaunchControllers().length > 0 ||
-            hasInFlightRemoteInvokes() ||
-            anySessionInTurn(getMakerCore()),
-          readScheduleBusy: () => readUpdateRelaunchScheduleBusy(getScheduleStorageIfInitialized()),
-        });
-      });
-      // æ‰‹åŠ¨æ›´æ–°é‡å¯(ä¾§æ  UpdateBanner)çš„é˜»æ–­åˆ¤å®šã€‚ä¸Žä¸Šé¢é‚£ä¸ª**æ— äººå€¼å®ˆ**æŽ¢é’ˆåˆ»æ„åˆ†å¼€:
-      // æ— äººå€¼å®ˆè¦è¿žã€Œæœ‰è¿œç¨‹è®¾å¤‡åœ¨çœ‹ä¼šè¯ã€éƒ½è®©è·¯,æ‰‹åŠ¨é‡å¯æ˜¯ç”¨æˆ·ä¸»åŠ¨å‘èµ·çš„,åªè¯¥å…³å¿ƒ
-      // ã€Œè¿™ä¸€ä¸‹ä¼šæ‰“æ–­å“ªäº›æ­£åœ¨è·‘çš„æ´»ã€ã€‚å››ä¸ªæ´»åŠ¨æ¥æºçš„èšåˆä¸Ž fail-closed å£å¾„è§
-      // relaunchBusyActivity.ts,handler ä¸Ž sender æ–­è¨€è§ relaunchBusyActivityIpc.ts;
-      // è¿™é‡Œåªæä¾›æ¥æº â€”â€” æœ¬è¿›ç¨‹å”¯ä¸€èƒ½åŒæ—¶çœ‹åˆ° makerã€cindy-brain ä¸Ž scheduler ä¸‰ä¾§çš„ä½ç½®ã€‚
-      //
-      // ä¸è¿› device-link allowlist:updater ç±» channel æŒ‰ allowlist é¡¶éƒ¨æ³¨é‡Šå±žã€Œæ°¸ä¸æ”¾è¡Œã€,
-      // ä¸”è¿œç¨‹æŽ§åˆ¶ç«¯ä¸ä¼šä»£æ›¿ç”¨æˆ·ç‚¹è¢«æŽ§ç«¯çš„æ›´æ–°é‡å¯ã€‚
-      registerRelaunchBusyActivityIpc(readRelaunchActivitySources);
-      // getMakerCore() é¦–æ¬¡è°ƒç”¨è§¦å‘ Maker æž„é€ ï¼ŒåŒæ—¶å‘èµ·è‡ªå®šä¹‰ MCP åˆå§‹åŠ è½½ã€‚
-      // await ç¡®ä¿ç¬¬ä¸€ä¸ªä¼šè¯çš„ mcpProviders æ•°ç»„å·²å¡«å…¥å·²ä¿å­˜çš„è‡ªå®šä¹‰ MCPï¼ˆP2 å†·å¯åŠ¨ç«žæ€ä¿®å¤ï¼‰ã€‚
-      getMakerCore();
-      await waitForInitialCustomMcpRefresh();
-      // IPC handlers live for the whole process, while the concrete Maker is
-      // replaced at every data-owner boundary. The facade resolves it lazily.
-      const ipcMaker = createDynamicMaker(() => {
-        if (isAppSessionBoundaryPending()) {
-          throwIpcError(
-            'PRECONDITION_FAILED',
-            'App session is switching; retry after the owner boundary settles.',
-          );
-        }
-        return getMakerCore();
-      });
-      registerMakerCoreIpc(ipcMaker, {
-        builtinApiKeyDeps,
-        onAnySessionTurnKeepaliveChange: (isRunning) => {
-          setMainWindowBackgroundThrottlingForActiveTurn(isRunning);
-          notifyUpdateAutoRelaunchBusyStateChanged();
-        },
-        refreshXdGatewayModels,
-        waitForAccountProviderModelsReady: waitForCurrentAccountProviderModelsReady,
-        onProviderModelAutoRefreshConfigured: markMakerProviderRefreshConfigured,
-      });
-      registerMakerTitleIpc({ isSessionTurnPendingCompletion });
-      registerWorkingStatusIpc();
-      registerAuxiliaryModelSettingsIpc();
-      registerMakerHelpIpc(ipcMaker);
-      registerHelpFeedbackIpc();
-      registerMakerPlanWriteIpc();
-      registerMakerRewindIpc();
-      registerMakerForkIpc();
-      registerMakerAuthIpc(ipcMaker);
-      registerMakerStatusIpc(ipcMaker);
-      registerMakerUsageIpc(ipcMaker);
-      registerMakerBinaryVersionIpc();
-      registerCrossAgentConvertIpc();
-      // Workdir File Browser (vscode-style lazy file tree + content viewer for
-      // a session's working directory). Pure local fs IO, no Maker dependency,
-      // but lives in this block to keep splash-gating simple.
-      registerFileBrowserIpc();
-      // device-link è¿œç¨‹æ–‡ä»¶æµè§ˆ:file-browser:remote-op handler + fs-watch topic
-      // è®¢é˜…é’©å­(è¢«æŽ§ç«¯è§’è‰²;invoke-registry æ•èŽ·åŽä¾›æŽ§åˆ¶ç«¯éš§é“è°ƒç”¨)ã€‚
-      registerFileBrowserDeviceOp();
-      // Remote SSH host management (Phase A) â€”â€” è¿žæŽ¥ç®¡ç† + ~/.ssh/config IO,
-      // æš‚æœªæ¶‰åŠ agent-on-remote / session åŒæ­¥,åŽç»­ Phase B æ‰©å±•ã€‚
-      registerRemoteSshIpc();
-      // Phase D â€” å¯åŠ¨åŽå° autoConnect: æŠŠ prefs é‡Œ autoConnect=true çš„ host
-      // æå‰è¿žå¥½, ç”¨æˆ·è¿›æ–°å»ºå¯¹è¯ç‚¹è¿œç¨‹é¡¹ç›®æ—¶ä¸ç”¨ç­‰ã€‚fire-and-forget, å¤±è´¥ä»…
-      // log.warn, ä¸é˜»å¡ž bootstrap åŽç»­æ­¥éª¤ã€‚æ³¨æ„å¿…é¡»åœ¨ registerRemoteSshIpc
-      // ä¹‹åŽ, å› ä¸º startAutoConnect å†…éƒ¨èµ° ensureHydrated, è€Œ pool æ˜¯ IPC
-      // æ³¨å†Œæ—¶åˆå§‹åŒ–çš„ã€‚
-      void startAutoConnectHostsBackground().catch((err) => {
-        // å…œåº•é˜²æ­¢ unhandled promise â€” startAutoConnect å†…éƒ¨å·² allSettled, è¿™é‡Œ
-        // åªå¯èƒ½æ˜¯ ensureHydrated è‡ªå·±ç‚¸äº† (ç£ç›˜æ•…éšœçº§), warn å³å¯ã€‚
-        createLogger('remote-ssh:auto-connect').warn('startAutoConnectHostsBackground threw', {
-          error: String(err),
-        });
-      });
-      // Hook è¿žæŽ¥(å¤–éƒ¨ hook server æŽ¥å…¥): IPC æ³¨å†Œ + æŒ‰é…ç½®æ‹‰èµ·å¯ç”¨çš„è¿žæŽ¥ã€‚
-      // å‡ºåŽ‚è¿žæŽ¥åˆ—è¡¨ä¸ºç©º â€”â€” æ²¡é…è¿‡çš„ç”¨æˆ·æ­¤å¤„é™¤ä¸€æ¬¡ç©ºæ–‡ä»¶è¯»å–å¤–é›¶è¡Œä¸ºã€‚
-      registerHookControlIpc();
-      // é¡¹ç›®çº§æ–‡æœ¬æœç´¢ (workdir-browse search panel) â€” spawn è‡ªå¸¦ ripgrep,
-      // NDJSON æµå¼å›žæŽ¨åˆ° rendererã€‚å®Œå…¨ç‹¬ç«‹äºŽ file-browser ä¸»é“¾è·¯,æ”¾è¿™é‡Œ
-      // ä»…ä¸ºåŒä¸€å¯åŠ¨æœŸæ³¨å†Œã€‚
-      registerSearchIpc();
-      // Desktop slash command registry â€”â€” æ³¨å†Œ /help /clear ç­‰å†…ç½®é¡¹,
-      // IPC æš´éœ²è§ maker-ipc/desktop-commands.ts (å¾… Step 5 æ·»åŠ )ã€‚
-      // å•ä¾‹ + å¹‚ç­‰ä¿æŠ¤ (makerIpcsRegistered flag) ä¿è¯ builtins åªçŒä¸€æ¬¡ã€‚
-      // remoteInvoke:è¿œç¨‹ä¼šè¯(ctx.deviceId)çš„ /goal /learn /cmd ä¸šåŠ¡ä½“ç»éš§é“è·¯ç”±
-      // åˆ°è¢«æŽ§ç«¯ â€”â€” èµ°ä¸Ž renderer deviceLink.invoke åŒä¸€æ¡ handleInvoke ä¸»è·¯å¾„
-      // (æŽ§åˆ¶å¼€å…³æ ¡éªŒ + é”™è¯¯æ˜ å°„ä¸€è‡´)ã€‚
-      registerBuiltinDesktopCommands(getDesktopCommandRegistry(), {
-        getGoalController,
-        getLearnController,
-        isLearnEnabled: isCindyLearnSkillEnabled,
-        remoteInvoke: (deviceId, channel, args) =>
-          deviceLinkHandleInvoke(deviceLinkIpcDeps(), deviceId, channel, args),
-      });
-      // desktop-cmd:run â€”â€” /cmd çš„è¢«æŽ§ç«¯è¿œç¨‹æ‰§è¡Œ handler(ä»…éš§é“ dispatch æ¶ˆè´¹,
-      // æœ¬æœº /cmd ä»åœ¨ builtins å†…è”æ‰§è¡Œ,ä¸èµ° IPC å¾€è¿”)ã€‚
-      registerRemoteCmdIpc();
-      // learn:* handler æå‰ä¸€æ¬¡æ€§æ³¨å†Œ(eager,åŒ goal);handler å†…éƒ¨è¯»å– controller
-      // å•ä¾‹,invoke æ—¶ controller å·²ç”± startLearnHost å¯åŠ¨ã€‚
-      registerLearnIpc();
-      // maker:schedule:* handler æå‰ä¸€æ¬¡æ€§æ³¨å†Œ;handler å†…éƒ¨ awaitReady ç­‰çœŸå®ž
-      // scheduler å®žä¾‹(ç”±åŽç»­ attemptStartScheduler é€šè¿‡ attachSchedulerEventListeners
-      // â†’ setSchedulerReady å–‚å…¥)ã€‚è¿™æ¡ä¿®å¤ cold-start race:ä¹‹å‰ handler åœ¨
-      // attemptStartScheduler å†…æ‰æŒ‚,renderer mount useSchedules è½åœ¨é‚£ 3 ç§’çª—å£
-      // å†…ä¼šæ‹¿åˆ° "No handler registered" é”™è¯¯ä¸”æ—  retry â†’ UI å¡æ­»ã€‚
-      // getMaker æƒ°æ€§æ³¨å…¥:ä»…ã€ŒAI ç”Ÿæˆå‰ç½®æ£€æŸ¥è„šæœ¬ã€handler ç”¨(utility model å•æ¬¡ç”Ÿæˆ),
-      // invoke æ—¶æ‰è§£å¼•ç”¨;maker æœªå°±ç»ªæ—¶ handler å†…éƒ¨æŠ¥ INTERNAL è€Œéžæ³¨å†ŒæœŸå´©æºƒã€‚
-      registerScheduleHandlers(() => {
-        try {
-          return getMakerCore();
-        } catch {
-          return null;
-        }
-      });
-      // maker:goal:* handler åŒæ ·æå‰ä¸€æ¬¡æ€§æ³¨å†Œ(eager);handler å†…éƒ¨ getGoalController()
-      // å–å•ä¾‹,invoke æ—¶ controller å·²ç”± attemptStartScheduler â†’ startGoalController å¯åŠ¨ã€‚
-      registerGoalHandlers();
-      // clear-context æ¸…ç›®æ ‡ / turn æ”¶å°¾ idle å…œåº•ç»­è·‘(setter æ³¨å…¥,null-safe)ã€‚
-      setGoalClearObserver((sid) => {
-        void getGoalController()?.clearGoal(sid);
-      });
-      setGoalIdleObserver((sid) => {
-        void getGoalController()?.maybeContinueActiveGoal(sid);
-      });
-      setGoalDeferredResumeCancelObserver((sid) => {
-        getGoalController()?.cancelDeferredManualResume(sid, { restoreUsageResume: true });
-      });
-      // ç”¨æˆ· Stop å½“å‰ turn â†’ æš‚åœ active ç›®æ ‡ã€‚è¿”å›ž Promise è®© ABORT_SESSION åœ¨ abort å‰ await,
-      // ç¡®ä¿ç›®æ ‡å…ˆ paused + detach ç›‘å¬,abort ç»ˆæ­¢äº‹ä»¶ä¸å†è§¦å‘ç»­è·‘åˆ¤å®šã€‚
-      setGoalStopObserver((sid) => getGoalController()?.pauseGoal(sid, 'paused: stopped by user'));
-      // (Option B)ç”¨æˆ·ç­”å®Œ AskUserQuestion â†’ å³æ—¶æŠŠæ‰€é€‰ç­”æ¡ˆæ”¹å†™ä¸ºç›®æ ‡(ä»…é¦–è½®ã€ä¸”æœ¬æ¬¡ç¡®ä¸º
-      // "ç›®æ ‡æ¾„æ¸…é—®é¢˜"æ—¶æ”¹å†™;controller å†…ç”¨ questions çš„ç¡®å®šæ€§æ ‡è®° + å¤šé‡ guard æŠŠå…³)ã€‚
-      setGoalAskAnswerObserver((sid, answers, questions) => {
-        // best-effort:ç›®æ ‡æ”¹å†™å¤±è´¥ä¸åº”å†’æ³¡æˆ unhandled rejection(äº¤äº’è§£æžé“¾è·¯æ˜¯ fire-and-forget)ã€‚
-        void getGoalController()
-          ?.applyClarificationAnswer(sid, answers, questions)
-          .catch(() => {});
-      });
-      makerIpcsRegistered = true;
-      worktreeRuntimeCloseReady = true;
-      // device-link æ•èŽ·è‡ªæ£€æ”¾åœ¨è¿™é‡Œ(è€Œéž bootstrap çº¿æ€§æ®µ):maker:create-session / maker:send
-      // ç”±ä¸Šé¢çš„ registerMakerCoreIpc æ³¨å†Œ,å±ž splash åŽçš„å»¶è¿Ÿæ³¨å†Œ;è‹¥åœ¨çº¿æ€§æ®µ(initDeviceLinkService
-      // ä¹‹åŽ)å°± assert,ä¼šè¯¯æŠ¥è¿™ä¸¤ä¸ª sentinelã€Œæœªæ•èŽ·ã€ã€‚æ­¤åˆ»æ‰€æœ‰ sentinel(å«çº¿æ€§æ®µå·²æ³¨å†Œçš„
-      // local-db:sessions:list)éƒ½å·²å°±ä½,è‡ªæ£€ç»“æžœæ‰å‡†ç¡®ã€‚installInvokeCapture åœ¨ index.ts æœ€æ—©æœŸ
-      // patch äº† ipcMain.handle,æ•…æ— è®ºå»¶è¿Ÿä¸Žå¦,è¿™äº› handler éƒ½å·²è¢«æ•èŽ·ã€‚
-      assertCaptureHealthy();
-    } catch (err) {
-      console.error('[bootstrap-electron] failed to register maker:* IPC', err);
-      // ä¸é˜»å¡žå¯åŠ¨ â€”â€” è€é“¾è·¯ä»å¯ç”¨; ä¸‹æ¬¡ splash retry å†å°è¯•ã€‚
-    }
-
-    startReadyWorktreeMaintenance();
-    // åˆ é™¤ worktree æ—¶å› æ‹¿ä¸åˆ°å…¨å±€ safe.directory é”è€Œè½ç›˜çš„æ®‹ç•™è·¯å¾„, å¯åŠ¨æœŸè¡¥æ¸…ã€‚
-    void reconcilePendingSafeDirectoryCleanups().catch((err) => {
-      console.error(
-        '[bootstrap-electron] safe.directory cleanup reconcile failed (non-fatal):',
-        err,
-      );
-    });
-    // åŒçª—å£çš„ shadow savepoint å¯¹è´¦:owning session å·²åˆ é™¤çš„å­¤å„¿ä¿å­˜ç‚¹é“¾
-    // (refs/cindy/savepoints/<sid>)å¯åŠ¨æœŸè¡¥åˆ ã€‚fire-and-forget,ä¸é˜»å¡žå¯åŠ¨ã€‚
-    void reconcileSavepointRefsForDeletedSessions().catch((err) => {
-      console.error('[bootstrap-electron] savepoint reconcile failed (non-fatal):', err);
-    });
-
-    // Scheduler / Goal / Learn ç»Ÿä¸€ç”± localDb onReady åœ¨ provider readiness settle åŽå¯åŠ¨ã€‚
-    // DB ä¸Ž splash æ— è®ºè°å…ˆå®Œæˆï¼Œä¸Šæ–¹ configured ä¿¡å·éƒ½ä¼šè§£å¼€åŒä¸€æ¡åŽå°é“¾ï¼›
-    // è¿™é‡Œä¸å†ç›´å¯ï¼Œé¿å… scheduler åœ¨è´¦å·æ¨¡åž‹å‘çŽ°å®Œæˆå‰æŠ¢å…ˆé€‰è·¯ç”±ã€‚
-  };
-
-  // Environment check IPC handler â€” é¡ºåºæ£€æŸ¥ claude â†’ codex â†’ pi ä¸‰ä¸ª vendor binaryã€‚
-  // æå‰ peekNeedsDownload å†³å®š (x/y) æ ‡ç­¾ï¼šä¸¤ä¸ªåŠä»¥ä¸Šéœ€è¦ä¸‹è½½æ—¶ç»™ step/totalStepsï¼Œ
-  // å¦åˆ™ä¸å¸¦æ ‡ç­¾ï¼ˆsplash æ˜¾ç¤ºå•ä¸€ "å”¤é†’ Cindy ä¸­..." æ–‡æ¡ˆï¼‰ã€‚
-  // pi æ˜¯å¯é€‰å®žéªŒ agent:æ¸…å•æ— èµ„äº§ / ä¸‹è½½å¤±è´¥éƒ½ä¸ç®—çŽ¯å¢ƒæ£€æŸ¥å¤±è´¥(å¤±è´¥ä¸å¹¿æ’­
-  // failed payload),æœ¬æ¬¡ä¸æ³¨å†Œ piã€‚
-  ipcMain.handle('check-environment', async () => {
-    // splash é¦–ä¸ª invoke = renderer å­˜æ´»çš„å¼ºä¿¡å·(ä¸Ž renderer:log åŒä¿é™©)ã€‚
-    rendererBootGuard?.markAlive();
-    const platform = process.platform as 'darwin' | 'win32' | 'linux';
-    // Packaged Linux may install both CLIs during one startup check. Share a
-    // single deadline so sequential fallback installs cannot each consume the
-    // full timeout.
-    const linuxInstallSignal =
-      platform === 'linux' && app.isPackaged
-        ? AbortSignal.timeout(LINUX_AGENT_INSTALL_STARTUP_DEADLINE_MS)
-        : undefined;
-
-    // â”€â”€ Phase 0: peek å„ vendor æ˜¯å¦éœ€è¦ä¸‹è½½ï¼ˆå†³å®š (x/y) æ ‡ç­¾ï¼‰â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const needySteps: AgentBinaryKind[] = [];
-    for (const kind of ['claude-code', 'codex', 'pi'] as const) {
-      try {
-        if (await binaryPeekNeedsDownload(kind)) needySteps.push(kind);
-      } catch {
-        /* ä¿å®ˆ: peek å¤±è´¥æŒ‰ false å¤„ç†ï¼Œè¿›å…¥ prepare å†…éƒ¨é”™è¯¯æµç¨‹ */
-      }
-    }
-    const isMultiDownload = needySteps.length >= 2;
-    const totalSteps = Math.min(needySteps.length, 3) as 2 | 3;
-    const stepOptsFor = (kind: AgentBinaryKind): { step?: 1 | 2 | 3; totalSteps?: 2 | 3 } =>
-      isMultiDownload && needySteps.includes(kind)
-        ? { step: (needySteps.indexOf(kind) + 1) as 1 | 2 | 3, totalSteps }
-        : {};
-    // ä¸Šä¸€æ®µçœŸçš„å‘ç”Ÿè¿‡ä¸‹è½½ã€ä¸”å½“å‰æ®µä¹Ÿè¦ä¸‹è½½æ—¶,å…ˆå¹¿æ’­ reset payload è®© splash
-    // è¿›åº¦æ¡çž¬é—´å½’é›¶(ä¸èµ° transition åŠ¨ç”»),éšåŽå½“å‰æ®µä»Ž 0% å¼€å§‹æ­£å¸¸ç´¯åŠ ã€‚
-    const resetBeforeSegment = (kind: AgentBinaryKind, anyPreviousDownloaded: boolean): void => {
-      const stepOpts = stepOptsFor(kind);
-      if (anyPreviousDownloaded && stepOpts.step && stepOpts.totalSteps) {
-        binaryBroadcastResetForStep(kind, stepOpts.step, stepOpts.totalSteps);
-      }
-    };
-
-    // â”€â”€ Phase 1: claude æ®µ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let claudeRes: PrepareResult;
-    try {
-      claudeRes = await binaryPrepare('claude-code', {
-        ...stepOptsFor('claude-code'),
-        signal: linuxInstallSignal,
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        claudeCode: { status: 'failed' as const, error: message },
-        codex: { status: 'skipped' as const },
-        pi: { status: 'skipped' as const },
-        allPassed: false,
-        platform,
-      };
-    }
-
-    if (!claudeRes.ready || !claudeRes.path) {
-      return {
-        claudeCode: {
-          status: 'failed' as const,
-          error: claudeRes.error ?? 'Claude Code binary not available',
-        },
-        codex: { status: 'skipped' as const },
-        pi: { status: 'skipped' as const },
-        allPassed: false,
-        platform,
-      };
-    }
-
-    // setClaudeCodePath å·²é€€å½¹ â€”â€” agent-binaries.prepare() æˆåŠŸæ—¶å·²å†™ lastReadyPath cache;
-    // ä»»ä½•éœ€è¦ claude binary è·¯å¾„çš„åœ°æ–¹ä¸€å¾‹èµ° getReadyBinaryPath('claude-code')ã€‚
-
-    // â”€â”€ Phase 2: codex æ®µ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    resetBeforeSegment('codex', claudeRes.downloaded === true);
-
-    let codexRes: PrepareResult;
-    try {
-      codexRes = await binaryPrepare('codex', {
-        ...stepOptsFor('codex'),
-        signal: linuxInstallSignal,
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        claudeCode: { status: 'passed' as const, path: claudeRes.path },
-        codex: { status: 'failed' as const, error: message },
-        pi: { status: 'skipped' as const },
-        allPassed: false,
-        platform,
-      };
-    }
-
-    if (!codexRes.ready || !codexRes.path) {
-      return {
-        claudeCode: { status: 'passed' as const, path: claudeRes.path },
-        codex: { status: 'failed' as const, error: codexRes.error ?? 'Codex binary not available' },
-        pi: { status: 'skipped' as const },
-        allPassed: false,
-        platform,
-      };
-    }
-
-    // â”€â”€ Phase 2.5: bundled ripgrep(å¿…éœ€,codex spawn env ä¸Ž file-browser æœç´¢çš„
-    // ç¡¬ä¾èµ–)â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // æŽ¢æµ‹å·²æƒ°æ€§åŒ–(import ä¸å†è§¦å‘,issue #1956),å¯åŠ¨æœŸ fail-fast è½åœ¨ splash
-    // è¿™é‡Œ:ç¼ºå¤±æ—¶ä¸Ž claude/codex binary ç¼ºå¤±åŒä¸€ä½“éªŒ(splash failed + å¯é‡è¯•,
-    // dev è¡¥è·‘ pnpm install:ripgrep åŽé‡è¯•å³è¿‡),è€Œä¸æ˜¯ import æœŸç¡¬å´©ã€ä¹Ÿä¸æ˜¯
-    // maker:* IPC é™é»˜ä¸æ³¨å†Œçš„é™çº§å¯åŠ¨ã€‚memoize åŽæ­¤å¤„æŽ¢æµ‹è¿‘é›¶æˆæœ¬ã€‚
-    try {
-      ensureBundledRipgrepReady();
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      // splash å¤±è´¥æ€ UI ä¸æ¸²æŸ“ error å­—æ®µ,è¿™è¡Œæ—¥å¿—æ˜¯ç¼º rg æ—¶å”¯ä¸€çš„è¯Šæ–­å‡ºå£
-      // (è¡¥è£…æŒ‡å¼•åœ¨ message é‡Œ);ä¸Žä¸‹æ–¹ pi å¤±è´¥çš„ console.warn åŒä¸€æ—¢æœ‰æƒ¯ä¾‹ã€‚
-      console.error('[bootstrap-electron] bundled ripgrep check failed:', message);
-      return {
-        claudeCode: { status: 'passed' as const, path: claudeRes.path },
-        codex: { status: 'passed' as const, path: codexRes.path },
-        pi: { status: 'skipped' as const },
-        ripgrep: { status: 'failed' as const, error: message },
-        allPassed: false,
-        platform,
-      };
-    }
-
-    // â”€â”€ Phase 3: pi æ®µï¼ˆå¯é€‰,å¤±è´¥ä¸é˜»å¡žå¯åŠ¨ï¼‰â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // broadcastFailure: false â€”â€” pi ä¸‹è½½å¤±è´¥ä¸èƒ½æŠŠ splash æ‰“è¿›å¤±è´¥æ€;é™é»˜ç¦ç”¨
-    // æœ¬æ¬¡ pi æ³¨å†Œï¼ŒClaude Code / Codex ä¸Ž Cindy æœ¬èº«ä»ç…§å¸¸å¯ç”¨ã€‚
-    // åªä»Ž Pi é˜¶æ®µå¼€å§‹è®¡æ—¶ï¼Œä¸èƒ½è®©å‰é¢çš„å¿…éœ€ binary ä¸‹è½½åƒæŽ‰ Pi è‡ªå·±çš„é¢„ç®—ã€‚
-    const piInstallSignal = app.isPackaged
-      ? AbortSignal.timeout(PI_AGENT_INSTALL_STARTUP_DEADLINE_MS)
-      : undefined;
-    resetBeforeSegment('pi', claudeRes.downloaded === true || codexRes.downloaded === true);
-
-    let piInfo: { status: 'passed' | 'failed'; path?: string; error?: string };
-    try {
-      const piRes = await binaryPrepare('pi', {
-        ...stepOptsFor('pi'),
-        broadcastFailure: false,
-        signal: piInstallSignal,
-      });
-      piInfo =
-        piRes.ready && piRes.path
-          ? { status: 'passed' as const, path: piRes.path }
-          : { status: 'failed' as const, error: piRes.error ?? 'pi binary not available' };
-    } catch (err: unknown) {
-      piInfo = {
-        status: 'failed' as const,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-    if (piInfo.status === 'failed') {
-      piRuntimeRecovery.markUnavailable(piInfo.error);
-      console.warn(
-        `[bootstrap-electron] pi binary prepare failed (non-fatal, recovery scheduled): ${piInfo.error}`,
-      );
-    }
-
-    // å¿…è£… binary éƒ½ ready,çŽ°åœ¨æ‰èƒ½å®‰å…¨æž„é€  Maker å•ä¾‹å¹¶æŒ‚ maker:* / ç›¸å…³ IPCã€‚
-    await registerMakerIpcsAfterSplash();
-
-    return {
-      claudeCode: { status: 'passed' as const, path: claudeRes.path },
-      codex: { status: 'passed' as const, path: codexRes.path },
-      pi: piInfo,
-      ripgrep: { status: 'passed' as const },
-      allPassed: true,
-      platform,
-    };
-  });
-
-  // Codex å…ƒ IPC (auth/binary/usage) å·²å‡çº§åˆ° maker:* å‘½åç©ºé—´, è¯¦è§
-  // maker-ipc/auth.ts / status.ts / usage.ts, æ³¨å†ŒäºŽ registerMakerIpcsAfterSplash å†…ã€‚
-
-  const allowedSystemSettingsUrls = new Set([
-    'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
-    'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
-    'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
-  ]);
-
-  // Open external URL in system default browser, plus a small allowlist of
-  // macOS Privacy panes that Settings uses for permission onboarding.
-  ipcMain.handle(
-    'shell:open-external',
-    async (event: Electron.IpcMainInvokeEvent, url: string): Promise<{ success: boolean }> => {
-      try {
-        const parsed = new URL(url);
-        const isWebUrl = parsed.protocol === 'http:' || parsed.protocol === 'https:';
-        // Mail links are restricted to the fixed billing inbox. Renderer content may
-        // provide the localized subject/body, but it must not choose a recipient or
-        // use mailto as a general-purpose external scheme.
-        const isBillingMailto = isAllowedBillingMailtoRequest(
-          url,
-          isTrustedAppRendererEvent(event),
-        );
-        const isAllowedSystemSettingsUrl =
-          process.platform === 'darwin' && allowedSystemSettingsUrls.has(url);
-        if (!isWebUrl && !isBillingMailto && !isAllowedSystemSettingsUrl) {
-          return { success: false };
-        }
-        await shell.openExternal(url);
-        return { success: true };
-      } catch {
-        return { success: false };
-      }
-    },
-  );
-
-  // ChatGPT Desktop å½“å‰æ³¨å†Œ `codex:` åè®®ï¼ˆmacOS bundle id com.openai.codexï¼›
-  // Windows å®‰è£…åŒ…ä¹Ÿç”±ç³»ç»Ÿåè®®æ³¨å†Œè¡¨æŽ¥ç®¡ï¼‰ã€‚ç‹¬ç«‹æ— å‚ IPC ä¿æŒæœ€å°æƒé™ï¼Œä¸èƒ½å€Ÿæ­¤
-  // æ‰“å¼€ renderer æä¾›çš„ä»»æ„è‡ªå®šä¹‰ scheme / deep linkã€‚
-  ipcMain.handle('shell:open-chatgpt-app', async (event): Promise<{ success: boolean }> =>
-    handleOpenChatGPTApp(event, {
-      assertTrustedSender: (candidate) => {
-        // The cached global overlay is a trusted Cindy renderer but deliberately
-        // not app-content: it needs this fixed, no-argument capability to keep
-        // auth recovery visible without activating the main window.
-        const overlayWindow = BrowserWindow.fromWebContents(candidate.sender);
-        if (
-          isGlobalVoiceInputOverlaySender(candidate.sender) &&
-          candidate.senderFrame === candidate.sender.mainFrame &&
-          isTrustedCindyRendererWindow(overlayWindow)
-        )
-          return;
-        assertTrustedAppRendererEvent(candidate);
-      },
-      openExternal: (url) => shell.openExternal(url),
-    }),
-  );
-
-  // Show native directory picker dialog
-  ipcMain.handle(
-    'show-open-directory-dialog',
-    async (): Promise<{ canceled: boolean; path?: string }> => {
-      const targetWin = getWindow() ?? BrowserWindow.getFocusedWindow();
-      if (!targetWin) return { canceled: true };
-      const result = await dialog.showOpenDialog(targetWin, {
-        properties: ['openDirectory', 'createDirectory'],
-      });
-      if (result.canceled || result.filePaths.length === 0) {
-        return { canceled: true };
-      }
-      return { canceled: false, path: result.filePaths[0] };
-    },
-  );
-
-  // â”€â”€ Workspace scanning for @ mention panel (command-palette F2 / F5) â”€â”€
-  //
-  // Scans the given workingDir for candidate @-mention items:
-  //   - `.claude/agents/*.md` â†’ agent items (name = filename without .md)
-  //   - regular files & directories (respects common ignored dirs)
-  //
-  // Returns up to `cap` items total (agents + files + dirs combined). When
-  // truncated, the caller should hint the user to narrow the query.
-  //
-  // This runs on the main process because Node fs is the only reasonable way
-  // to walk the tree; renderer cannot do it through contextBridge safely.
-  //
-  // Performance: BFS with a hard cap (default 2000) and ignore list. On a
-  // medium repo this completes in <500ms (spec target).
-  ipcMain.handle(
-    'workspace:scan-at-resources',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { workingDir: string; cap?: number },
-    ): Promise<{
-      success: boolean;
-      error?: string;
-      items?: Array<
-        | { type: 'file'; name: string; relPath: string }
-        | { type: 'dir'; name: string; relPath: string }
-        | { type: 'agent'; name: string; relPath: string }
-      >;
-      truncated?: boolean;
-    }> => {
-      try {
-        // Clamp caller-supplied cap to the spec's 2000 ceiling â€” even a
-        // well-meaning caller shouldn't be able to force us into a scan
-        // that pins the event loop on a huge monorepo (review Minor #7).
-        const cap = Math.min(params.cap ?? 2000, 2000);
-        const root = params.workingDir;
-        if (!root || !path.isAbsolute(root) || !fs.existsSync(root)) {
-          return { success: false, error: 'workingDir not found' };
-        }
-
-        // Minimal ignore list â€” don't attempt full .gitignore parsing (out of
-        // MVP scope per spec). These are the dirs that would blow up a scan.
-        const IGNORE_DIRS = new Set([
-          '.git',
-          'node_modules',
-          '__pycache__',
-          '.cache',
-          '.vscode',
-          '.idea',
-          '.env',
-          'coverage',
-          '.sivi',
-          '.cursor',
-          'build',
-          'dist',
-          'out',
-          '.next',
-          '.turbo',
-          '.vite',
-        ]);
-
-        const items: Array<
-          | { type: 'file'; name: string; relPath: string; description?: string }
-          | { type: 'dir'; name: string; relPath: string; description?: string }
-          | { type: 'agent'; name: string; relPath: string; description?: string }
-        > = [];
-        let truncated = false;
-
-        // 1) Scan .claude/agents/*.md â€” silently skip if missing
-        try {
-          const agentsDir = path.join(root, '.claude', 'agents');
-          if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
-            const entries = fs.readdirSync(agentsDir, { withFileTypes: true });
-            for (const ent of entries) {
-              if (ent.isFile() && ent.name.endsWith('.md')) {
-                const name = ent.name.replace(/\.md$/, '');
-                // Extract description from YAML frontmatter via gray-matter â€”
-                // handles multi-line / quoted / escaped YAML correctly (the
-                // earlier hand-rolled regex only matched single-line strings
-                // and dropped any `description: |\n  multi line` content).
-                let description: string | undefined;
-                try {
-                  const raw = fs.readFileSync(path.join(agentsDir, ent.name), 'utf-8');
-                  const parsed = matter(raw);
-                  const desc = parsed.data?.description;
-                  if (typeof desc === 'string' && desc.trim()) {
-                    description = desc.trim().slice(0, 200);
-                  }
-                } catch {
-                  /* non-fatal */
-                }
-                items.push({
-                  type: 'agent',
-                  name,
-                  relPath: path.posix.join('.claude', 'agents', ent.name),
-                  description,
-                });
-                if (items.length >= cap) {
-                  truncated = true;
-                  return { success: true, items, truncated };
-                }
-              }
-            }
-          }
-        } catch (err) {
-          // Non-fatal â€” agents are a bonus source
-          console.warn('[workspace-scan] agents scan failed:', err);
-        }
-
-        // 2) BFS walk of workingDir â€” dirs then files, breadth-first so the
-        // caller sees top-level items first and truncation (if any) cuts off
-        // the deepest noise, not the most useful results.
-        const queue: string[] = [root];
-        while (queue.length > 0 && items.length < cap) {
-          const cur = queue.shift();
-          if (!cur) break;
-          let entries: fs.Dirent[];
-          try {
-            entries = fs.readdirSync(cur, { withFileTypes: true });
-          } catch {
-            continue;
-          }
-          // Sort alphabetically for deterministic truncation
-          entries.sort((a, b) => a.name.localeCompare(b.name));
-          for (const ent of entries) {
-            if (items.length >= cap) {
-              truncated = true;
-              break;
-            }
-            if (ent.name.startsWith('.') && ent.name !== '.claude') {
-              // Skip most dotfiles/dotdirs except .claude (agents handled above)
-              continue;
-            }
-            if (ent.isDirectory()) {
-              if (IGNORE_DIRS.has(ent.name)) continue;
-              const abs = path.join(cur, ent.name);
-              const rel = path.relative(root, abs).split(path.sep).join('/');
-              // `.claude/agents` is handled by step 1 as `type:'agent'` â€”
-              // skip the subtree here so we don't double-report the same
-              // *.md files as `type:'file'` entries (review Important #3).
-              if (rel === '.claude/agents') continue;
-              items.push({ type: 'dir', name: ent.name, relPath: rel });
-              queue.push(abs);
-            } else if (ent.isFile()) {
-              const abs = path.join(cur, ent.name);
-              const rel = path.relative(root, abs).split(path.sep).join('/');
-              items.push({ type: 'file', name: ent.name, relPath: rel });
-            }
-          }
-        }
-        if (items.length >= cap && queue.length > 0) truncated = true;
-
-        return { success: true, items, truncated };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error('[workspace:scan-at-resources] Failed:', err);
-        return { success: false, error: message };
-      }
-    },
-  );
-
-  // Scans `{workingDir}/.claude/commands/*.md` and `.claude/skills/*.md` for
-  // user-defined slash commands / skills (command-palette F1).
-  // Returns [] if dirs don't exist. No recursion.
-  ipcMain.handle(
-    'workspace:scan-slash-commands',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { workingDir: string },
-    ): Promise<{
-      success: boolean;
-      error?: string;
-      commands?: Array<{ name: string; description?: string; source?: 'user' | 'skill' }>;
-    }> => {
-      try {
-        const root = params.workingDir;
-        if (!root || !path.isAbsolute(root) || !fs.existsSync(root)) {
-          return { success: true, commands: [] };
-        }
-
-        /**
-         * Parse YAML frontmatter `description` from a .md file's raw content.
-         * Uses js-yaml for proper YAML parsing (matches cc-code's approach).
-         * Falls back to the first non-empty, non-heading body line.
-         */
-        const parseDescription = (raw: string): string | undefined => {
-          const fmMatch = raw.match(/^---\s*\n([\s\S]*?)---\s*\n?/);
-          if (fmMatch) {
-            try {
-              const parsed = yaml.load(fmMatch[1] || '') as Record<string, unknown> | null;
-              if (parsed && typeof parsed === 'object' && typeof parsed.description === 'string') {
-                const desc = parsed.description.trim();
-                if (desc) return desc.slice(0, 200);
-              }
-            } catch {
-              /* YAML parse error â€” fall through to body extraction */
-            }
-          }
-          // Fallback: first non-empty, non-heading body line
-          const bodyStart = fmMatch ? raw.indexOf(fmMatch[0]) + fmMatch[0].length : 0;
-          const firstLine = raw
-            .slice(bodyStart)
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find((l) => l.length > 0 && !l.startsWith('#') && l !== '---');
-          return firstLine?.slice(0, 200);
-        };
-
-        /**
-         * Scan `.claude/commands/` â€” flat .md files: `commands/{name}.md`
-         */
-        const scanCommands = (
-          dirPath: string,
-        ): Array<{ name: string; description?: string; source: 'user' | 'skill' }> => {
-          if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return [];
-          const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-          const results: Array<{ name: string; description?: string; source: 'user' | 'skill' }> =
-            [];
-          for (const ent of entries) {
-            if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
-            const name = ent.name.replace(/\.md$/, '');
-            let description: string | undefined;
-            try {
-              const raw = fs.readFileSync(path.join(dirPath, ent.name), 'utf-8');
-              description = parseDescription(raw);
-            } catch {
-              /* non-fatal */
-            }
-            results.push({ name, description, source: 'user' });
-          }
-          return results;
-        };
-
-        /**
-         * Scan `.claude/skills/` â€” subdirectory per skill: `skills/{name}/SKILL.md`
-         * (or `skill.md`, case-insensitive).
-         */
-        const scanSkills = (
-          dirPath: string,
-        ): Array<{ name: string; description?: string; source: 'user' | 'skill' }> => {
-          if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return [];
-          const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-          const results: Array<{ name: string; description?: string; source: 'user' | 'skill' }> =
-            [];
-          for (const ent of entries) {
-            if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
-            // Look for SKILL.md or skill.md inside the subdirectory
-            const subDir = path.join(dirPath, ent.name);
-            const skillFile = ['SKILL.md', 'skill.md'].find((f) =>
-              fs.existsSync(path.join(subDir, f)),
-            );
-            if (!skillFile) continue;
-            let description: string | undefined;
-            try {
-              const raw = fs.readFileSync(path.join(subDir, skillFile), 'utf-8');
-              description = parseDescription(raw);
-            } catch {
-              /* non-fatal */
-            }
-            results.push({ name: ent.name, description, source: 'skill' });
-          }
-          return results;
-        };
-
-        // Scan global (~/.claude/) first, then project (overrides on name
-        // collision) â€” matches Claude Code's own discovery precedence and
-        // covers Market-installed skills which always land in ~/.claude/skills/.
-        const home = os.homedir();
-        const merged = new Map<
-          string,
-          { name: string; description?: string; source: 'user' | 'skill' }
-        >();
-        for (const cmd of [
-          ...scanCommands(path.join(home, '.claude', 'commands')),
-          ...scanSkills(path.join(home, '.claude', 'skills')),
-          ...scanCommands(path.join(root, '.claude', 'commands')),
-          ...scanSkills(path.join(root, '.claude', 'skills')),
-        ]) {
-          merged.set(cmd.name, cmd);
-        }
-        const commands = Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
-        return { success: true, commands };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return { success: false, error: message };
-      }
-    },
-  );
-
-  registerSkillhubIpc({
-    getMaker: getMakerCore,
-    getManagedSkillRoots: () => getGhostManager().managedRootDirs(),
-    getBuiltInSkills: () => builtInSkillDescriptors(
-      app.getPath('userData'),
-      app.getPath('appData'),
-    ),
-    getAllowedProjectRoots: listAllowedSkillhubProjectRoots,
-  });
-  disposeSkillhubAutoSyncAuthListener = authManager.onAuthStateChange((state) => {
-    if (!state.isAuthenticated) return;
-    void skillhubAutoSyncService.runOnceAfterLogin();
-  });
-  disposeProviderAccessAuthListener = authManager.onAuthStateChange(() => {
-    refreshProviderAccessAfterAuthChange();
-    rebindChatEmbeddingSettingsWatcher();
-    // Chat embedding has an account-derived default in addition to provider availability.
-    // Reconcile on every committed auth projection so same-owner membership changes cannot
-    // leave the previous default running until an unrelated provider refresh occurs.
-    void scheduleChatEmbeddingRuntimeReconcile();
-  });
-  rebindChatEmbeddingSettingsWatcher();
-  // é»˜è®¤æ’ä»¶åŒæ­¥ä¸èƒ½ä¾èµ–ç”¨æˆ·å…ˆæ‰“å¼€æ’ä»¶é¡µã€‚å¯åŠ¨æ—¶æœ¬åœ° owner å·²ç»ç¨³å®šåˆ™ç«‹åˆ»
-  // å¤ç”¨å¸‚åœºå¿«ç…§ï¼›äº‘ç«¯ç™»å½•/åˆ‡å·çš„é€šçŸ¥å¯èƒ½æ—©äºŽ owner boundary é‡Šæ”¾ï¼Œå› æ­¤
-  // å»¶è¿Ÿåˆ°å½“å‰è°ƒç”¨æ ˆç»“æŸåŽå†æŒ‰å·²æäº¤çš„æ–° owner è¡¥è·‘ä¸€æ¬¡ã€‚
-  pluginMarketPeriodicSyncTimer ??= setInterval(
-    () => syncPluginMarketForActiveOwner(PLUGIN_MARKET_PERIODIC_SYNC_MS),
-    PLUGIN_MARKET_PERIODIC_SYNC_MS,
-  );
-  pluginMarketPeriodicSyncTimer.unref();
-  // â”€â”€ Dialog: ç›®å½•é€‰æ‹©å™¨ï¼ˆv0.6 æ–°å¢žï¼Œä¸Žæ—§ show-open-directory-dialog å¹¶å­˜ï¼‰ â”€â”€
-  ipcMain.handle(
-    'dialog:show-open-directory',
-    async (
-      event,
-      {
-        defaultPath,
-        writableGrantScope,
-      }: { defaultPath?: string; writableGrantScope?: string } = {},
-    ) => {
-      if (writableGrantScope !== undefined) {
-        assertTrustedAppRendererEvent(event);
-        if (!writableGrantScope || writableGrantScope.length > 128) {
-          throw new Error('invalid writable directory grant scope');
-        }
-      }
-      const targetWin = getWindow() ?? BrowserWindow.getFocusedWindow();
-      if (!targetWin) return { success: true, path: null };
-      const result = await dialog.showOpenDialog(targetWin, {
-        // createDirectory:macOS æ˜¾ç¤º"æ–°å»ºæ–‡ä»¶å¤¹"æŒ‰é’®(Windows è‡ªå¸¦);
-        // å¦åˆ™ç”¨æˆ·åœ¨ picker é‡Œæ²¡æ³•å½“åœºå»ºä¸€ä¸ªç›®æ ‡ç›®å½•,åªèƒ½å…ˆåŽ» Finder å»ºã€‚
-        properties: ['openDirectory', 'createDirectory'],
-        ...(defaultPath ? { defaultPath } : {}),
-      });
-      if (result.canceled || result.filePaths.length === 0) {
-        return { success: true, path: null };
-      }
-      const selectedPath = result.filePaths[0];
-      if (writableGrantScope !== undefined) {
-        await issueWritableDirectoryPickerGrant({
-          scopeId: writableGrantScope,
-          senderId: event.sender.id,
-          directory: selectedPath,
-        });
-      }
-      return { success: true, path: selectedPath };
-    },
-  );
-
-  // â”€â”€ Dialog: æ–‡ä»¶é€‰æ‹©å™¨(å‰ç½®æ£€æŸ¥è„šæœ¬é€‰å–ç­‰é€šç”¨åœºæ™¯;ä¸Žç›®å½•é€‰æ‹©å™¨åŒå½¢) â”€â”€
-  ipcMain.handle(
-    'dialog:show-open-file',
-    async (
-      _event,
-      { defaultPath, filters }: { defaultPath?: string; filters?: Electron.FileFilter[] } = {},
-    ) => {
-      const targetWin = getWindow() ?? BrowserWindow.getFocusedWindow();
-      if (!targetWin) return { success: true, path: null };
-      const result = await dialog.showOpenDialog(targetWin, {
-        properties: ['openFile'],
-        ...(defaultPath ? { defaultPath } : {}),
-        ...(filters ? { filters } : {}),
-      });
-      if (result.canceled || result.filePaths.length === 0) {
-        return { success: true, path: null };
-      }
-      return { success: true, path: result.filePaths[0] };
-    },
-  );
-
-  // â”€â”€ Dialog: @ èµ„æºå…¥å£çš„ç³»ç»Ÿé€‰æ‹©å™¨ â”€â”€
-  ipcMain.handle(
-    'dialog:show-open-resource',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      payload: unknown = {},
-    ): Promise<{
-      success: true;
-      path: string | null;
-      kind: 'file' | 'directory' | null;
-    }> => {
-      assertTrustedAppRendererEvent(event);
-      const params = requireObject(payload);
-      const defaultPathValue = params.defaultPath;
-      if (
-        defaultPathValue !== undefined &&
-        (typeof defaultPathValue !== 'string' ||
-          defaultPathValue.length > 4096 ||
-          !path.isAbsolute(defaultPathValue))
-      ) {
-        throwIpcError('INVALID_PARAMS', 'defaultPath must be an absolute path');
-      }
-      const owner = BrowserWindow.fromWebContents(event.sender);
-      if (!owner) return { success: true, path: null, kind: null };
-      try {
-        const picked = await pickNativeAtResource(
-          {
-            platform: process.platform,
-            showOpenDialog: (options) => dialog.showOpenDialog(owner, options),
-            isDirectory: (selectedPath) => fs.statSync(selectedPath).isDirectory(),
-          },
-          defaultPathValue,
-        );
-        return { success: true, ...picked };
-      } catch {
-        throwIpcError('INTERNAL', 'unable to open resource picker');
-      }
-    },
-  );
-
-  // (api-key:test-connection å·²éšæ‰‹å¡«å½•å…¥é“¾è·¯ç§»é™¤,2026-07-17:XD ç½‘å…³ key ä¸€å¾‹ç”±
-  //  model-access è‡ªåŠ¨ä¸‹å‘,è¿žé€šæ€§ç”±åŒæ­¥çŠ¶æ€æœºè´Ÿè´£ã€‚)
-
-  // â”€â”€ Generic API request proxy: å·²ç§»é™¤(2026-07 apiBaseUrl æ¸…ç†)â”€â”€
-  // æ›¾ç»çš„ `api:request`(renderer â†’ main â†’ ä¸» server)é€šç”¨ä»£ç†éšæœ€åŽä¸€ä¸ª
-  // è°ƒç”¨è€…(meService GET /api/me,äº§å“ role å·²é€€å½¹)ä¸€èµ·æ‹†é™¤ã€‚renderer ä»Žæ­¤
-  // å¯¹ä¸šåŠ¡ server é›¶è¯·æ±‚;main å†…éƒ¨è°ƒç”¨èµ° serverApiClient.serverApiFetchã€‚
-
-  // â”€â”€ API Key refresh from server: å·²ç§»é™¤ â”€â”€
-  // XD ç½‘å…³ key / Mivo key å‡ä¸ºæœ¬åœ° only(safeStorage),æ²¡æœ‰æœåŠ¡å™¨å‰¯æœ¬,
-  // å› æ­¤ä¸å†æä¾› `*:refresh-from-server` æ‹‰å–é€šé“ã€‚æœ¬åœ° key å¤±æ•ˆæ—¶ç”±ç”¨æˆ·åœ¨è®¾ç½®é‡Œé‡å¡«ã€‚
-
-  // â”€â”€ File attachment IPC (F-FI-7) â”€â”€
-  ipcMain.handle(
-    'read-file-for-attachment',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: {
-        filePath: string;
-        encoding: 'base64' | 'utf8';
-        maxSize?: number;
-      },
-    ): Promise<{
-      success: boolean;
-      error?: string;
-      data?: string;
-      size: number;
-      truncated?: boolean;
-    }> => {
-      try {
-        const { filePath, encoding } = params;
-        const maxSize = Math.min(params.maxSize ?? 30 * 1024 * 1024, 30 * 1024 * 1024);
-
-        if (!path.isAbsolute(filePath)) {
-          return { success: false, error: 'Path must be absolute', size: 0 };
-        }
-        if (!isPathAllowed(filePath)) {
-          return { success: false, error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„', size: 0 };
-        }
-
-        const stat = await fs.promises.stat(filePath);
-        const size = stat.size;
-
-        if (size > maxSize) {
-          return { success: false, error: 'File too large', size };
-        }
-
-        if (encoding === 'base64') {
-          const buffer = await fs.promises.readFile(filePath);
-          return { success: true, data: buffer.toString('base64'), size, truncated: false };
-        }
-
-        // utf8 mode
-        const TEXT_LIMIT = 1 * 1024 * 1024; // 1MB
-        if (size > TEXT_LIMIT) {
-          // Read only the first 1MB
-          const fileHandle = await fs.promises.open(filePath, 'r');
-          try {
-            const buf = Buffer.alloc(TEXT_LIMIT);
-            await fileHandle.read(buf, 0, TEXT_LIMIT, 0);
-            return { success: true, data: buf.toString('utf8'), size, truncated: true };
-          } finally {
-            await fileHandle.close();
-          }
-        }
-
-        const data = await fs.promises.readFile(filePath, 'utf8');
-        return { success: true, data, size, truncated: false };
-      } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err), size: 0 };
-      }
-    },
-  );
-
-  // Read a local file's raw bytes for in-app rendering (currently PDF preview).
-  // Returns a Uint8Array over structured clone instead of base64: pdf.js
-  // getDocument({ data }) wants bytes, and skipping base64 avoids a large
-  // transient string plus a main-thread atob/charCodeAt decode loop in the
-  // renderer. Same 30MB cap as read-file-for-attachment.
-  //
-  // Path policy is the SENSITIVE-MEDIA blocklist, not the system one used by the
-  // attachment IPCs: this channel replaces the xdt-file:// protocol as the byte
-  // source for PDF preview, and that protocol denies credential / browser-profile
-  // dirs (localFileProtocol.ts). Previewing files out of an agent-writable
-  // workdir means the click authorizes "show this PDF", not "read wherever this
-  // symlink points", so the stricter list is the right one â€” a workdir
-  // `leak.pdf -> ~/.ssh/id_rsa` must not reach the renderer here when the
-  // protocol it replaced would have refused it. Sibling ImagePreview still goes
-  // through xdt-file://, so this keeps one policy across the file browser.
-  ipcMain.handle(
-    'read-file-bytes',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      params: { filePath: string; maxSize?: number },
-    ): Promise<{ bytes: Uint8Array; size: number }> => {
-      // Reject any caller that is not the trusted main app renderer â€” an
-      // auxiliary window / child frame / webview bearing the shared preload
-      // must not be able to pull raw file bytes. Mirrors the shell:open-path
-      // policy (assertTrusted + isPathAllowed) for a path-taking privileged IPC.
-      assertTrustedAppRendererEvent(event);
-      // Validation + policy + regular-file + size-cap + exact-copy live in the
-      // injectable core (fileReadBytes.ts) so they are unit-tested without
-      // Electron; failures throw a sanitized IpcError that rejects the invoke().
-      // O_NOFOLLOW on the final component: the core opens the realpath'd target,
-      // whose last segment is a real file â€” so a legit open succeeds, but if the
-      // final component was swapped to a symlink in the realpathâ†’open race it
-      // fails (ELOOP) instead of following into a denied file. Falls back to 0
-      // where the platform lacks the flag (Windows), matching saveChatAttachment.
-      const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
-      return readFileBytesForPreview(params, {
-        isPathAllowed: (p) => isPathAllowedAgainst(p, getSensitiveMediaBlocklist()),
-        realpath: (p) => fs.promises.realpath(p),
-        // bigint stats: dev/ino identity must not be rounded (see FileIdentityStat).
-        stat: (p) => fs.promises.stat(p, { bigint: true }),
-        open: async (p) => {
-          const handle = await fs.promises.open(p, fs.constants.O_RDONLY | noFollow);
-          return {
-            stat: () => handle.stat({ bigint: true }),
-            read: (buffer, offset, length, position) =>
-              handle.read(buffer, offset, length, position),
-            close: () => handle.close(),
-          };
-        },
-      });
-    },
-  );
-
-  // â”€â”€ File header peek IPC (F-FI-8 fallback inference) â”€â”€
-  // Read at most `bytes` (default 8192, hard-cap 64KB) from the head of a file
-  // for the renderer to run magic-bytes + UTF-8 sniffing on. Independent from
-  // read-file-for-attachment because:
-  //   - returns actualBytes / totalSize, not size / truncated
-  //   - has no maxSize restriction (peek a head of any file size)
-  //   - permission policy may evolve independently
-  ipcMain.handle(
-    'peek-file-header',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: {
-        filePath: string;
-        bytes?: number;
-      },
-    ): Promise<{
-      success: boolean;
-      error?: string;
-      data?: string;
-      actualBytes: number;
-      totalSize: number;
-    }> => {
-      try {
-        const { filePath } = params;
-        const HARD_CAP = 64 * 1024;
-        const requested = Math.max(0, Math.min(params.bytes ?? 8192, HARD_CAP));
-
-        if (!path.isAbsolute(filePath)) {
-          return { success: false, error: 'Path must be absolute', actualBytes: 0, totalSize: 0 };
-        }
-        if (!isPathAllowed(filePath)) {
-          return { success: false, error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„', actualBytes: 0, totalSize: 0 };
-        }
-
-        const stat = await fs.promises.stat(filePath);
-        const totalSize = stat.size;
-
-        if (totalSize === 0) {
-          return { success: true, actualBytes: 0, totalSize: 0 };
-        }
-
-        const toRead = Math.min(requested, totalSize);
-        if (toRead === 0) {
-          return { success: true, actualBytes: 0, totalSize };
-        }
-
-        const fileHandle = await fs.promises.open(filePath, 'r');
-        try {
-          const buf = Buffer.alloc(toRead);
-          const { bytesRead } = await fileHandle.read(buf, 0, toRead, 0);
-          const slice = buf.subarray(0, bytesRead);
-          return {
-            success: true,
-            data: slice.toString('base64'),
-            actualBytes: bytesRead,
-            totalSize,
-          };
-        } finally {
-          await fileHandle.close();
-        }
-      } catch (err) {
-        return {
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-          actualBytes: 0,
-          totalSize: 0,
-        };
-      }
-    },
-  );
-
-  // â”€â”€ TextLightbox IPC (text-lightbox F4/F5) â”€â”€
-  //
-  // Reads a text file for the TextLightbox preview. Hard cap is 20 MB per
-  // text-lightbox spec; over-cap files are rejected with `oversize` so the
-  // renderer can render the Oversize body without re-statting the file.
-  // Reuses the same `isPathAllowed` blocklist as file-attachment IPCs.
-  ipcMain.handle(
-    'text-file:read-preview',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { filePath: string },
-    ): Promise<{
-      success: boolean;
-      error?: string;
-      /** 'oversize' = file > MAX_PREVIEW_MB; renderer should switch to Oversize body. */
-      reason?: 'oversize' | 'not_found' | 'forbidden' | 'read_failed';
-      data?: string;
-      size: number;
-      /** Preview cap in MB â€” surfaced so renderer can render dynamic copy
-       * ("exceeding the {limitMb} MB preview limit") without hard-coding. */
-      limitMb?: number;
-    }> => {
-      try {
-        // SDK on Windows emits POSIX-style file_path (`/e/AIWork/...`); convert
-        // to native Win32 (`E:\AIWork\...`) before any path checks or fs calls.
-        // No-op on Mac/Linux. See posixToWin32() above for context.
-        const filePath = posixToWin32(params.filePath);
-        // text-lightbox spec â€” F5 é˜ˆå€¼ã€‚Surface MB constant so the value is
-        // single-sourced for both the byte comparison and the IPC response
-        // (renderer reads `limitMb` to render dynamic copy).
-        // 10MB:é¢„è§ˆèµ°åŒæ­¥å…¨æ–‡è¯» + ä¸»çº¿ç¨‹é«˜äº®æ¸²æŸ“,å†å¤§ä¼šæ˜Žæ˜¾å¡;é™„ä»¶èµ°è·¯å¾„é€ä¼ 
-        // ä¸å è¿™æ¡é¢„è§ˆæˆæœ¬(é™„ä»¶å±‚å·²ä¸åœ¨ renderer åšå¤§å°é™åˆ¶),ä¸¤è€…è§£è€¦ã€‚
-        const MAX_PREVIEW_MB = 10;
-        const MAX_PREVIEW = MAX_PREVIEW_MB * 1024 * 1024;
-
-        if (!filePath || !path.isAbsolute(filePath)) {
-          return {
-            success: false,
-            error: 'Path must be absolute',
-            reason: 'forbidden',
-            size: 0,
-            limitMb: MAX_PREVIEW_MB,
-          };
-        }
-        if (!isPathAllowed(filePath)) {
-          return {
-            success: false,
-            error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„',
-            reason: 'forbidden',
-            size: 0,
-            limitMb: MAX_PREVIEW_MB,
-          };
-        }
-
-        let stat: fs.Stats;
-        try {
-          stat = await fs.promises.stat(filePath);
-        } catch {
-          return {
-            success: false,
-            error: 'File not found',
-            reason: 'not_found',
-            size: 0,
-            limitMb: MAX_PREVIEW_MB,
-          };
-        }
-        const size = stat.size;
-
-        if (size > MAX_PREVIEW) {
-          // Don't read the body â€” renderer will switch to Oversize view based
-          // on `reason: 'oversize'` and use `size` for the dynamic copy.
-          return { success: false, reason: 'oversize', size, limitMb: MAX_PREVIEW_MB };
-        }
-
-        const data = await fs.promises.readFile(filePath, 'utf8');
-        return { success: true, data, size, limitMb: MAX_PREVIEW_MB };
-      } catch (err) {
-        return {
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-          reason: 'read_failed',
-          size: 0,
-          limitMb: 10,
-        };
-      }
-    },
-  );
-
-  // â”€â”€ markdown-monorepo-resolve: smart relative-path resolver â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Implementation lives in ./pathResolver (pure module, unit-tested). This
-  // handler just enforces the IPC contract and injects `isPathAllowed` so
-  // candidates are subject to the same allow-list as direct file reads.
-  ipcMain.handle(
-    'fs:resolve-path',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { href: string; workingDir: string },
-    ): Promise<{
-      status: 'unique' | 'multiple' | 'none';
-      candidates: string[];
-      kind?: 'file' | 'directory';
-    }> => {
-      try {
-        return await resolveWorkspacePathCached(params.href, params.workingDir, {
-          isPathAllowed,
-        });
-      } catch (err) {
-        console.error('[fs:resolve-path] failed:', err);
-        return { status: 'none', candidates: [] };
-      }
-    },
-  );
-
-  // markdown-monorepo-resolve: BATCH resolver. The markdown renderer resolves
-  // every path-shaped target eagerly at render time (chip only when a path
-  // uniquely resolves). Switching to a session with hundreds of such targets
-  // used to fire hundreds of independent `fs:resolve-path` calls, each doing
-  // its own full *synchronous* workspace BFS â€” the main process froze for
-  // seconds. This collapses one render pass's hrefs into a single async walk.
-  ipcMain.handle(
-    'fs:resolve-path-batch',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { hrefs: string[]; workingDir: string },
-    ): Promise<
-      Record<string, { status: 'unique' | 'multiple' | 'none'; candidates: string[] }>
-    > => {
-      try {
-        return await resolveWorkspacePathBatchCached(params.hrefs, params.workingDir, {
-          isPathAllowed,
-        });
-      } catch (err) {
-        createLogger('fs:resolve-path-batch').error('failed', { error: String(err) });
-        const fallback: Record<
-          string,
-          { status: 'unique' | 'multiple' | 'none'; candidates: string[] }
-        > = {};
-        for (const href of params.hrefs ?? []) {
-          fallback[href] = { status: 'none', candidates: [] };
-        }
-        return fallback;
-      }
-    },
-  );
-
-  // file-chip å³é”®èœå• / å†…ç½®æµè§ˆå™¨ "åœ¨ç³»ç»Ÿæµè§ˆå™¨æ‰“å¼€":æŽ¥æ”¶ç»å¯¹è·¯å¾„æˆ–
-  // æœ¬æœº file:// URL,æ ¡éªŒæ‰©å±•ååœ¨ HTML ç™½åå•å†…,ç„¶åŽèµ°ç³»ç»Ÿé»˜è®¤ file://
-  // å¤„ç†å™¨(ç»å¤§å¤šæ•° OS ä¸Š .html/.htm éƒ½æ˜ å°„åˆ°é»˜è®¤æµè§ˆå™¨)ã€‚å’Œ
-  // `shell:open-external` åˆ†å¼€æ˜¯å› ä¸ºåŽè€…åªæ”¾è¡Œ http(s) é˜²æ»¥ç”¨;è¿™é‡Œæ”¶çª„åˆ°
-  // å—æŽ§çš„æ‰©å±•åé›†åˆåŽ,æ”¾è¡Œ file:// æ˜¯å¯æŽ§çš„ã€‚
-  const openFileInBrowserLog = createLogger('shell:open-file-in-browser');
-  const openFileUrlWithWindowsHandler = createWindowsFileUrlOpener({
-    platform: process.platform,
-    windowsDir: process.env.WINDIR,
-    execFile: (file, args, options, callback) => execFile(file, args, options, callback),
-  });
-  ipcMain.handle(
-    'shell:open-file-in-browser',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      filePathOrUrl: string,
-    ): Promise<{ success: true }> => {
-      assertTrustedAppRendererEvent(event);
-      const result = await handleOpenFileInBrowser(filePathOrUrl, {
-        isPathAllowed,
-        isBrowserOpenablePath,
-        existsSync: fs.existsSync,
-        openExternal: (url) => shell.openExternal(url),
-        openPath: (filePath) => shell.openPath(filePath),
-        openUrlWithWindowsHandler: openFileUrlWithWindowsHandler,
-        onOpenExternalError: ({ filePath, hasUrlState, error }) => {
-          openFileInBrowserLog.warn('openExternal failed', {
-            filePath,
-            hasUrlState,
-            fallback: hasUrlState
-              ? openFileUrlWithWindowsHandler
-                ? 'windows-url-handler'
-                : 'disabled'
-              : 'openPath',
-            error: String(error),
-          });
-        },
-        onWindowsUrlFallbackError: ({ filePath, error }) => {
-          openFileInBrowserLog.warn('Windows file URL fallback failed', {
-            filePath,
-            error: String(error),
-          });
-        },
-      });
-      if (!result.success) throwIpcError(result.errorCode, result.error);
-      return result;
-    },
-  );
-
-  // text-lightbox F4: open a file using the OS default application
-  // (e.g. .log â†’ Notepad / Console, .ts â†’ editor of choice). Mirrors the
-  // `shell:open-external` policy: only allow paths that pass `isPathAllowed`.
-  ipcMain.handle(
-    'shell:open-path',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      filePathOrUrl: string,
-    ): Promise<{ success: boolean; error?: string }> => {
-      try {
-        assertTrustedAppRendererEvent(event);
-        const filePath = resolveShellOpenPathTarget(filePathOrUrl);
-        if (filePath === null) {
-          return { success: false, error: 'Path must be absolute' };
-        }
-        if (!isPathAllowed(filePath)) {
-          return { success: false, error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„' };
-        }
-        // shell.openPath returns '' on success, error string on failure.
-        const errMsg = await shell.openPath(filePath);
-        if (errMsg) return { success: false, error: errMsg };
-        return { success: true };
-      } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    },
-  );
-
-  // æ–‡ä»¶ chip å³é”®ã€Œæ‰“å¼€æ–¹å¼ã€:æžšä¸¾ / æŒ‡å®šåº”ç”¨æ‰“å¼€ / ç³»ç»Ÿé€‰æ‹©å¯¹è¯æ¡†ã€‚
-  // ä¸šåŠ¡ä½“åœ¨ openWithApps.ts(ä¾èµ–æ³¨å…¥,å•æµ‹ç›´æŽ¥è°ƒ handler body);appId â†’ exe
-  // æ˜ å°„åªå­˜ main ä¾§,renderer ä¼ è·¯å¾„æ‰§è¡Œåœ¨ç»“æž„ä¸Šä¸å¯è¡¨è¾¾(è¯¥æ–‡ä»¶å¤´æ³¨é‡Š)ã€‚
-  {
-    // app.getFileIcon ä¼šå¶å‘æŒ‚æ­»(è§ fileThumbnail.ts),è¿™é‡ŒåŒæ¬¾ç¡¬è¶…æ—¶ + æŒ‰
-    // exe è·¯å¾„çš„è¿›ç¨‹å†…ç¼“å­˜(æ‰“å¼€æ–¹å¼èœå•åå¤å±•å¼€ä¸é‡å¤ä»˜åŽŸç”Ÿè°ƒç”¨æˆæœ¬)ã€‚
-    const appIconCache = new Map<string, string | null>();
-    const getAppIcon = async (exePath: string): Promise<string | null> => {
-      const key = exePath.toLowerCase();
-      const cached = appIconCache.get(key);
-      if (cached !== undefined) return cached;
-      try {
-        const icon = await Promise.race([
-          app.getFileIcon(exePath, { size: 'small' }),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
-        ]);
-        const dataUrl = icon && !icon.isEmpty() ? icon.toDataURL() : null;
-        appIconCache.set(key, dataUrl);
-        return dataUrl;
-      } catch {
-        appIconCache.set(key, null);
-        return null;
-      }
-    };
-    // reg.exe é‡å®šå‘è¾“å‡ºèµ°æŽ§åˆ¶å°ä»£ç é¡µ(ä¸­æ–‡ç³»ç»Ÿ GBK)è€Œéž UTF-8,æŒ‰å­—èŠ‚å–å›žã€
-    // ç”¨ chcp æŽ¢æµ‹åˆ°çš„ä»£ç é¡µè§£ç ,å¦åˆ™ä¸­æ–‡åº”ç”¨åä¼šå˜ U+FFFD ä¹±ç ã€‚
-    let consoleCodepagePromise: Promise<number | null> | null = null;
-    const getConsoleCodepage = (): Promise<number | null> => {
-      consoleCodepagePromise ??= new Promise((resolve) => {
-        execFile('chcp.com', { windowsHide: true, timeout: 3000 }, (err, stdout) => {
-          resolve(err ? null : parseChcpCodepage(String(stdout ?? '')));
-        });
-      });
-      return consoleCodepagePromise;
-    };
-    const openWith = createOpenWithHandlers({
-      platform: process.platform,
-      isPathAllowed,
-      fileExists: (p) => fs.existsSync(p),
-      regQuery: async (keyPath, args = []) => {
-        const codepage = await getConsoleCodepage();
-        return new Promise<string>((resolve) => {
-          execFile(
-            'reg.exe',
-            ['query', keyPath, ...args],
-            { windowsHide: true, timeout: 5000, encoding: 'buffer' },
-            (err, stdout) =>
-              resolve(err ? '' : decodeRegOutput(stdout ?? Buffer.alloc(0), codepage)),
-          );
-        });
-      },
-      getAppIcon,
-      spawnDetached: (command, args) => {
-        const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: false });
-        // detached å­è¿›ç¨‹æ— äººç›‘å¬ 'error' ä¼šå˜æˆ EventEmitter æœªå¤„ç†é”™è¯¯ç›´æŽ¥åŽ‹åž®
-        // main(å…¸åž‹:existsSync é€šè¿‡åŽ exe è¢«å¸è½½çš„çª—å£æœŸ)ã€‚spawn é”™è¯¯æ˜¯å¼‚æ­¥çš„,
-        // IPC å·²è¿”å›ž,åªèƒ½è®°æ—¥å¿—å…œåº•(PR #1835 review)ã€‚
-        child.once('error', (err) => {
-          createLogger('open-with').warn('spawn failed', { command, message: err.message });
-        });
-        child.unref();
-      },
-    });
-    ipcMain.handle('open-with:list', (event, params: { filePath: string }) => {
-      assertTrustedAppRendererEvent(event);
-      return openWith.list(params);
-    });
-    ipcMain.handle('open-with:open', (event, params: { filePath: string; appId: string }) => {
-      assertTrustedAppRendererEvent(event);
-      return openWith.open(params);
-    });
-  }
-
-  // å®‰å…¨é™çº§é™„ä»¶â€œå¦å­˜ä¸ºâ€ï¼šæºæ–‡ä»¶å¿…é¡»é€šè¿‡ç»Ÿä¸€è·¯å¾„ç­–ç•¥ï¼Œè§£æžçœŸå®žè·¯å¾„åŽè¿˜è¦
-  // ä½äºŽèŠå¤©é™„ä»¶/è¿œç¨‹æ–‡ä»¶ç¼“å­˜å†…ï¼›å»ºè®®ååœ¨ main ä¾§æ¸…æ´—ï¼Œå¤åˆ¶å®ŒæˆåŽä¸è°ƒç”¨
-  // openPathï¼Œé¿å…ç¬¦å·é“¾æŽ¥è¶Šç•Œæˆ–æ¢å¤åŽŸæ‰©å±•ååŽè¢«è‡ªåŠ¨æ‰§è¡Œã€‚
-  const saveChatAttachment = createChatAttachmentSaveHandler({
-    isPathAllowed,
-    realpath: (filePath) => fs.promises.realpath(filePath),
-    stat: (filePath) => fs.promises.stat(filePath, { bigint: true }),
-    openSource: async (filePath) => {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
-      const handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
-      return {
-        stat: () => handle.stat({ bigint: true }),
-        copyTo: async (targetPath) => {
-          await pipeline(
-            handle.createReadStream({ autoClose: false, start: 0 }),
-            fs.createWriteStream(targetPath),
-          );
-        },
-        close: () => handle.close(),
-      };
-    },
-    showSaveDialog: async (opts) => {
-      const targetWin = getWindow() ?? BrowserWindow.getFocusedWindow();
-      const result = targetWin
-        ? await dialog.showSaveDialog(targetWin, opts)
-        : await dialog.showSaveDialog(opts);
-      return { canceled: result.canceled, filePath: result.filePath || undefined };
-    },
-    getDownloadsDir: () => app.getPath('downloads'),
-    getAllowedSourceRoots: () => [
-      imageCacheStore.getCacheRoot(),
-      getChatAttachmentCacheRoot(),
-      getRemoteFileCacheRoot(),
-    ],
-  });
-  const stageChatAttachment = createChatAttachmentStageHandler({
-    isPathAllowed,
-    realpath: (filePath) => fs.promises.realpath(filePath),
-    stat: (filePath) => fs.promises.stat(filePath, { bigint: true }),
-    openSource: async (filePath) => {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
-      const handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
-      return {
-        stat: () => handle.stat({ bigint: true }),
-        copyTo: async (targetPath) => {
-          await pipeline(
-            handle.createReadStream({ autoClose: false, start: 0 }),
-            fs.createWriteStream(targetPath, { flags: 'wx' }),
-          );
-        },
-        close: () => handle.close(),
-      };
-    },
-    stageCopy: (params) => {
-      const ownerId = getActiveAppSession().dataOwnerId;
-      if (!ownerId) throw new Error('Cannot stage an attachment without an active data owner');
-      return stageLocalFileToCache({ ...params, ownerId });
-    },
-  });
-  ipcMain.handle(
-    'chat-attachment:stage',
-    (event, params: { sourcePath?: unknown; suggestedName?: unknown }) => {
-      assertTrustedAppRendererEvent(event);
-      return stageChatAttachment(params);
-    },
-  );
-  ipcMain.handle('chat-attachment:cleanup', async (event, filePaths: readonly string[]) => {
-    assertTrustedAppRendererEvent(event);
-    if (!Array.isArray(filePaths)) return;
-    const ownerScopeKey = activeOwnerScopeKey();
-    const ownerId = getActiveAppSession().dataOwnerId;
-    if (!ownerId || isAppSessionBoundaryPending()) return;
-    const isCurrentOwner = () =>
-      activeOwnerScopeKey() === ownerScopeKey && !isAppSessionBoundaryPending();
-    if (!isCurrentOwner()) return;
-    await cleanupOwnedUnpersistedStagedChatAttachments({
-      ownerId,
-      filePaths,
-      canRemove: isCurrentOwner,
-    });
-  });
-  ipcMain.handle(
-    'chat-attachment:save-as',
-    (event, params: { sourcePath?: unknown; suggestedName?: unknown }) => {
-      assertTrustedAppRendererEvent(event);
-      return saveChatAttachment(params);
-    },
-  );
-
-  // Settings â†’ About: æ‰“å¼€ <userData>/logs åœ¨ç³»ç»Ÿæ–‡ä»¶ç®¡ç†å™¨ã€‚
-  // è·¯å¾„åœ¨ä¸»è¿›ç¨‹æ´¾ç”Ÿï¼ˆrenderer ä¸éœ€è¦ä¹Ÿä¸åº”è¯¥çŸ¥é“ userData å…¨è·¯å¾„ï¼‰ã€‚
-  // ç›®å½•ä¸å­˜åœ¨æ—¶å…ˆåˆ›å»ºï¼Œé¿å…ç©ºå®‰è£…é¦–æ¬¡ç‚¹å‡»å¤±è´¥ã€‚
-  ipcMain.handle('app:open-logs-dir', async (): Promise<{ success: boolean; error?: string }> => {
-    try {
-      const logDir = path.join(app.getPath('userData'), 'logs');
-      fs.mkdirSync(logDir, { recursive: true });
-      const errMsg = await shell.openPath(logDir);
-      if (errMsg) return { success: false, error: errMsg };
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  });
-
-  // Settings â†’ Cindy Make: open Cindy's private managed-tool directory.
-  // The path is derived in main so the renderer cannot choose an arbitrary folder.
-  ipcMain.handle('app:open-cindy-make-tools-dir', async (event): Promise<{ success: boolean }> => {
-    assertTrustedAppRendererEvent(event);
-    return openMakeToolsDirectory(app.getPath('userData'), {
-      openPath: (directory) => shell.openPath(directory),
-    });
-  });
-
-  const readLatestSourceVersion = createLatestSourceVersionReader((url, init) =>
-    net.fetch(url, init),
-  );
-  configureUpstreamMerge((id) => getMakerIfReady()?.getSession(id)?.isTurnRunning() ?? false);
-  ipcMain.handle('app:cindy-make-merge', async (event, input: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    return actUpstreamMerge(input);
-  });
-  ipcMain.handle('app:get-cindy-make-source-status', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    const userData = app.getPath('userData');
-    const root = makeSourceRoot(userData);
-    const channel = !app.isPackaged
-      ? 'dev'
-      : /-beta(?:\.|$)/i.test(app.getVersion())
-        ? 'beta'
-        : 'release';
-    return refreshCindySourceStatus(cindyMakeManager, {
-      readSummary: () => readCurrentCindySourceStatus(root),
-      readLocal: async () => {
-        let env: Awaited<ReturnType<typeof createMakeToolchainEnvironment>> | undefined;
-        try {
-          env = await createMakeToolchainEnvironment(userData);
-        } catch {
-          // The persisted status remains usable when tool discovery is unavailable.
-        }
-        return readCurrentCindySourceStatus(root, env);
-      },
-      readLatest: (source) => readLatestSourceVersion(source, channel),
-    });
-  });
-  // æºç å‡†å¤‡æ˜¯å…¨å±€å•ä¾‹:è¿›åº¦å¹¿æ’­ç»™æ‰€æœ‰çª—å£,ä»»æ„çª—å£éƒ½èƒ½åœæ­¢å®ƒã€‚
-  subscribeCindySourceStatus(broadcastCindyMakeSourceStatus);
-  cindyMakeManager.subscribe(broadcastCindyMakeState);
-  configureCindyMakeTaskManagement({
-    isAlive: (id) => getMakerIfReady()?.isSessionAlive(id),
-    isRunning: (id) => getMakerIfReady()?.getSession(id)?.isTurnRunning() ?? false,
-    isWorkspaceBusy: (workingDir) => cindyMakeTestController.isUsingWorkspace(workingDir),
-    setStatus: patchSessionMetaInDb,
-    recycle: recycleSessionWorktreeForStatusChange,
-  });
-  configureCindyMakeTestRuntime(
-    (id) => getMakerIfReady()?.getSession(id)?.isTurnRunning() ?? false,
-  );
-  configureCindyMakeEditingGuard((id) => cindyMakeTestController.isUsingSession(id));
-  registerMakeRemoteResources((id) => getMakerIfReady()?.getSession(id)?.isTurnRunning() ?? false);
-  configureMakeHistory((id) => getMakerIfReady()?.getSession(id)?.isTurnRunning() ?? false);
-  ipcMain.handle('app:cindy-make-history', async (event, selected?: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    if (
-      selected !== undefined &&
-      (typeof selected !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(selected))
-    )
-      throwIpcError('INVALID_PARAMS', 'Invalid history selection');
-    try {
-      return await getCindyMakeHistory(selected as string | undefined);
-    } catch (error) {
-      const details = error as { name?: unknown; code?: unknown; message?: unknown };
-      const message =
-        typeof details.message === 'string'
-          ? details.message
-              .replace(/[A-Za-z]:[\\/][^\r\n]{0,240}|\\\\[^\r\n]{0,240}/g, '<path>')
-              .slice(0, 240)
-          : String(error).slice(0, 240);
-      createLogger('cindy-make:history').warn('history read failed', {
-        errorName: typeof details.name === 'string' ? details.name : undefined,
-        errorCode: typeof details.code === 'string' ? details.code : undefined,
-        errorMessage: message,
-      });
-      throwIpcError('PRECONDITION_FAILED', 'unavailable');
-    }
-  });
-  ipcMain.handle(
-    'app:cindy-make-history-action',
-    async (event, runId: unknown, action: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      try {
-        return await actCindyMakeHistory(runId, action);
-      } catch (error) {
-        const message = (error as { message?: unknown }).message;
-        const reason =
-          typeof message === 'string'
-            ? /^\[PRECONDITION_FAILED\]\s*(busy|dirty|conflict|cleanupFailed|directoryBusy|unavailable)$/.exec(
-                message,
-              )?.[1]
-            : undefined;
-        throwIpcError('PRECONDITION_FAILED', reason ?? 'unavailable');
-      }
-    },
-  );
-  ipcMain.handle('app:cindy-make-history-build', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      return await generateHistoryPersonalVersion();
-    } catch {
-      throwIpcError('PRECONDITION_FAILED', 'unavailable');
-    }
-  });
-  app.once('will-quit', stopMakeHistoryBuild);
-  ipcMain.handle('app:cindy-make-history-cancel-build', async (event, buildId: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      return await cancelHistoryPersonalVersion(buildId);
-    } catch {
-      throwIpcError('PRECONDITION_FAILED', 'unavailable');
-    }
-  });
-  ipcMain.handle('app:cindy-make-history-open-build', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      await openHistoryPersonalBuild();
-    } catch {
-      throwIpcError('PRECONDITION_FAILED', 'unavailable');
-    }
-  });
-  configureCindyVersions(
-    () => cindyMakeTestController.hasActiveJobs() || cindyMakeManager.hasActiveWork(),
-  );
-  ipcMain.handle('app:cindy-versions-state', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    try {
-      return await getCindyVersions();
-    } catch {
-      throwIpcError('PRECONDITION_FAILED', 'unavailable');
-    }
-  });
-  ipcMain.handle('app:cindy-versions-action', async (event, action: unknown, id: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    return actCindyVersion(action, id);
-  });
-  app.once('will-quit', () => cindyMakeTestController.stopAll());
-  ipcMain.handle(
-    'app:cindy-make-test',
-    async (event, sessionId: unknown, completionId: unknown, action: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      return actCindyMakeTest(sessionId, completionId, action);
-    },
-  );
-  cindyMakeManager.setProjectBusyProbe(
-    (root) =>
-      getMakerIfReady()
-        ?.listActiveSessions()
-        .some((session) => {
-          return (
-            session.isTurnRunning() &&
-            root === makeSourceRoot(app.getPath('userData')) &&
-            isCindyMakeManagedWorktreePath(app.getPath('userData'), session.workDir)
-          );
-        }) ?? false,
-  );
-  ipcMain.handle('app:get-cindy-make-state', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    refreshUpstreamMergeProjection();
-    try {
-      await restoreCindyMakeTaskState();
-      for (const [runId, report] of Object.entries(cindyMakeManager.getState().tasks ?? {})) {
-        if (report.task)
-          cindyMakeManager.projectTaskSession(runId, {
-            executing:
-              getMakerIfReady()?.getSession(report.task.sessionId)?.isTurnRunning() ?? false,
-          });
-      }
-      void refreshCindyMakeTaskIntegration();
-    } catch {
-      throwIpcError('INTERNAL', 'Could not restore Cindy Make preparation state');
-    }
-    return cindyMakeManager.getState();
-  });
-  ipcMain.handle(
-    'app:manage-cindy-make-task',
-    async (event, sessionId: unknown, action: unknown) => {
-      assertTrustedAppRendererEvent(event);
-      await manageCindyMakeTask(sessionId, action).catch((error) => {
-        if (error instanceof Error && error.message.startsWith('[')) throw error;
-        throwIpcError('INTERNAL', 'cleanupFailed');
-      });
-    },
-  );
-  ipcMain.handle('app:cancel-cindy-make-source', async (event): Promise<{ success: boolean }> => {
-    assertTrustedAppRendererEvent(event);
-    return { success: cancelCindySourcePreparation() };
-  });
-
-  ipcMain.handle('app:open-cindy-make-source-dir', async (event): Promise<{ success: boolean }> => {
-    assertTrustedAppRendererEvent(event);
-    return openMakeSourceDirectory(app.getPath('userData'), {
-      openPath: (directory) => shell.openPath(directory),
-    });
-  });
-
-  // ä¸ªäººç‰ˆåˆ¶ä½œä»»åŠ¡çš„ç‹¬ç«‹å¼€å‘ç›®å½•:å…ˆä»Žä¸ªäººç‰ˆåŸºçº¿å»ºä»»åŠ¡åˆ†æ”¯ + worktreeã€‚
-  // åªè®¤ runId å½¢çŠ¶;è·¯å¾„å…¨éƒ¨ç”± main ä»Ž userData æ´¾ç”Ÿ,renderer åªæ‹¿å›žç»“æžœã€‚
-  ipcMain.handle('app:start-cindy-make-task', async (event, input: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    return startCindyMakeTask(input, event.sender.id).catch((error) => {
-      if (error instanceof Error && error.message.startsWith('[')) throw error;
-      throwIpcError('INTERNAL', 'Could not start Cindy Make preparation');
-    });
-  });
-  ipcMain.handle('app:cancel-cindy-make-task', async (event, runId: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    if (typeof runId !== 'string' || !CINDY_MAKE_RUN_ID_PATTERN.test(runId))
-      throwIpcError('INVALID_PARAMS', 'Invalid Cindy Make run');
-    return { success: cindyMakeManager.cancel(runId, event.sender.id) === 'cancelled' };
-  });
-  ipcMain.handle('app:prepare-cindy-make-workspace', async (event, runId: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    if (typeof runId !== 'string' || !CINDY_MAKE_RUN_ID_PATTERN.test(runId))
-      throwIpcError('INVALID_PARAMS', 'Invalid Cindy Make run');
-    const userData = app.getPath('userData');
-    try {
-      return await cindyMakeManager.withProject(makeSourceRoot(userData), async () => {
-        const signal = AbortSignal.timeout(20 * 60_000);
-        const env = await createMakeToolchainEnvironment(userData);
-        const processEnvironment = await resolveMakeToolEnvironment(
-          env,
-          ['git', 'node', 'pnpm', 'python'],
-          signal,
-        );
-        return prepareCindyMakeWorkspace(userData, runId, signal, { processEnvironment });
-      });
-    } catch {
-      throwIpcError('INTERNAL', 'Cindy Make workspace preparation failed');
-    }
-  });
-
-  // Local export bytes stay in memory; never route this to a remote host.
-  ipcMain.handle(COPY_PNG_TO_CLIPBOARD_CHANNEL, (event, params) =>
-    copyPngToClipboard(event, params, {
-      assertTrustedSender: assertTrustedAppRendererEvent,
-      decode: (bytes) => nativeImage.createFromBuffer(bytes),
-      write: (data) => clipboard.write(data),
-    }),
-  );
-
-  // â”€â”€ Native clipboard helpers (media:copy-to-clipboard) â”€â”€
-  //
-  // Electron's `clipboard.writeImage` writes raw bitmap data â€” pastable in
-  // image apps but NOT in Explorer / Finder, which expect a file-list
-  // format (CF_HDROP on Windows, NSPasteboardTypeFileURL on macOS). We
-  // shell out to the OS clipboard helpers to get a real "copy of file"
-  // that paste-into-folder accepts. spawn (no shell) is used to keep the
-  // path argument out of any shell-quote interpretation.
-
-  /** Windows: PowerShell `Set-Clipboard -LiteralPath` writes CF_HDROP. */
-  function copyFileToClipboardWindows(absPath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Single-quoted PS string is literal except for `'` itself; double it
-      // to escape. Path can contain spaces, `$`, backticks, etc. â€” all safe
-      // inside single quotes.
-      const escaped = absPath.replace(/'/g, "''");
-      const psCommand = `Set-Clipboard -LiteralPath '${escaped}'`;
-      const proc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psCommand], {
-        windowsHide: true,
-      });
-      let stderr = '';
-      proc.stderr.on('data', (d) => {
-        stderr += d.toString();
-      });
-      proc.on('error', reject);
-      proc.on('exit', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `Set-Clipboard exited ${code}`));
-      });
-    });
-  }
-
-  /**
-   * macOS: AppleScript `set the clipboard to (POSIX file â€¦)` writes the
-   * NSPasteboardTypeFileURL pasteboard entry. The path is passed as an
-   * AppleScript argv to avoid in-script escaping.
-   */
-  function copyFileToClipboardMacOS(absPath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('osascript', [
-        '-e',
-        'on run argv',
-        '-e',
-        'set the clipboard to (POSIX file (item 1 of argv))',
-        '-e',
-        'end run',
-        absPath,
-      ]);
-      let stderr = '';
-      proc.stderr.on('data', (d) => {
-        stderr += d.toString();
-      });
-      proc.on('error', reject);
-      proc.on('exit', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `osascript exited ${code}`));
-      });
-    });
-  }
-
-  // Right-click â†’ "open file folder". Accepts xdt-image:// / xdt-video:// URLs
-  // (resolved via the matching cache store) or an absolute file path. On
-  // success, reveals the file in the OS file manager (Explorer / Finder).
-  ipcMain.handle(
-    'shell:show-item-in-folder',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { url?: string; filePath?: string },
-    ): Promise<{ success: boolean; error?: string }> => {
-      try {
-        let absPath: string | null = null;
-        if (params?.url?.startsWith('xdt-image://')) {
-          try {
-            absPath = imageCacheStore.resolveSafe(params.url).absPath;
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.url?.startsWith('xdt-video://')) {
-          try {
-            absPath = videoCacheStore.resolveSafe(params.url).absPath;
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.url?.startsWith('cindy-media://')) {
-          // åª’ä½“æ€»ä»“ blob(æ„è¯†äº§ç‰©ç­‰):ä¸Ž xdt-image åŒä¸ºæœ¬æœºç¼“å­˜,èµ°æ€»ä»“è§£æžã€‚
-          try {
-            absPath = cindyMediaBlobStore.resolveSafe(params.url).absPath;
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.filePath && path.isAbsolute(params.filePath)) {
-          absPath = params.filePath;
-        }
-        if (!absPath) {
-          return { success: false, error: 'url æˆ– filePath å¿…é¡»äºŒé€‰ä¸€' };
-        }
-        // Windows Explorer /select ä¸è®¤æ­£æ–œæ è·¯å¾„(showItemInFolder ä¼šé™é»˜æ— ååº”),
-        // å½’ä¸€æˆæœ¬æœºåˆ†éš”ç¬¦;POSIX å¹‚ç­‰ã€‚
-        absPath = path.normalize(absPath);
-        if (!isPathAllowed(absPath)) {
-          return { success: false, error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„' };
-        }
-        if (!fs.existsSync(absPath)) {
-          return { success: false, error: 'æ–‡ä»¶ä¸å­˜åœ¨' };
-        }
-        shell.showItemInFolder(absPath);
-        return { success: true };
-      } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    },
-  );
-
-  // Right-click â†’ "copy image / video". Resolves the URL (xdt-image:// or
-  // xdt-video://) or absolute path to a file and writes it to the system
-  // clipboard as a FILE REFERENCE â€” not raw bytes. The user can then paste
-  // it into Explorer / Finder, chat apps, video editors, etc.
-  // Mirrors the URL-or-absolute-path contract of `shell:show-item-in-folder`.
-  ipcMain.handle(
-    'media:copy-to-clipboard',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { url?: string; filePath?: string },
-    ): Promise<{ success: boolean; error?: string }> => {
-      try {
-        let absPath: string | null = null;
-        let kind: 'image' | 'video' | 'unknown' = 'unknown';
-        if (params?.url?.startsWith('xdt-image://')) {
-          try {
-            absPath = imageCacheStore.resolveSafe(params.url).absPath;
-            kind = 'image';
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.url?.startsWith('xdt-video://')) {
-          try {
-            absPath = videoCacheStore.resolveSafe(params.url).absPath;
-            kind = 'video';
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.url?.startsWith('cindy-media://')) {
-          // åª’ä½“æ€»ä»“ blob:kind æŒ‰è½ç›˜ mime å®š(å›¾/è§†é¢‘å…±ç”¨åŒä¸€åè®®)ã€‚
-          try {
-            const resolved = cindyMediaBlobStore.resolveSafe(params.url);
-            absPath = resolved.absPath;
-            kind = resolved.mimeType.startsWith('video/') ? 'video' : 'image';
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        } else if (params?.filePath && path.isAbsolute(params.filePath)) {
-          absPath = params.filePath;
-        }
-        if (!absPath) {
-          return { success: false, error: 'url æˆ– filePath å¿…é¡»äºŒé€‰ä¸€' };
-        }
-        if (!isPathAllowed(absPath)) {
-          return { success: false, error: 'ä¸å…è®¸è®¿é—®è¯¥è·¯å¾„' };
-        }
-        if (!fs.existsSync(absPath)) {
-          return { success: false, error: 'æ–‡ä»¶ä¸å­˜åœ¨' };
-        }
-        // Copy AS A FILE so the user can paste it into Explorer / Finder
-        // (and image / video apps will still accept the file). Electron's
-        // standard clipboard API only supports image bitmaps â€” that pastes
-        // into chat / docs but Explorer ignores it, and there is no video
-        // equivalent at all. We shell out to the OS-native clipboard helpers
-        // to write the file-list format:
-        //   - Windows  â†’ PowerShell  Set-Clipboard -LiteralPath
-        //   - macOS    â†’ osascript    set the clipboard to (POSIX file ...)
-        //   - Linux    â†’ image: fall back to nativeImage bitmap.
-        //                video: not supported (no portable file-list format
-        //                across DEs without xclip/wl-copy pre-installed).
-        try {
-          if (process.platform === 'win32') {
-            await copyFileToClipboardWindows(absPath);
-          } else if (process.platform === 'darwin') {
-            await copyFileToClipboardMacOS(absPath);
-          } else if (kind === 'image' || kind === 'unknown') {
-            const image = nativeImage.createFromPath(absPath);
-            if (image.isEmpty()) {
-              return { success: false, error: 'æ— æ³•è¯»å–å›¾ç‰‡æ•°æ®' };
-            }
-            clipboard.writeImage(image);
-          } else {
-            return { success: false, error: 'å½“å‰å¹³å°æš‚ä¸æ”¯æŒå¤åˆ¶è§†é¢‘æ–‡ä»¶' };
-          }
-        } catch (err) {
-          return {
-            success: false,
-            error: err instanceof Error ? err.message : String(err),
-          };
-        }
-        return { success: true };
-      } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    },
-  );
-
-  // â”€â”€ å›¾ç‰‡ lightbox åª’ä½“åŠ¨ä½œ(ç”¨é»˜è®¤åº”ç”¨æ‰“å¼€ / å¦å­˜ä¸º / å‘é€åˆ°å¯¹è¯)â”€â”€
-  // ä¸šåŠ¡ä½“åœ¨ lightboxMediaActions.ts(ä¾èµ–æ³¨å…¥,å•æµ‹ç”¨å†…å­˜ fake ç›´æŽ¥è°ƒ handler
-  // body),è¿™é‡Œåªåš Electron æŽ¥çº¿ã€‚
-  {
-    // è¿œç¨‹å›¾ã€Œç”¨é»˜è®¤åº”ç”¨æ‰“å¼€ã€çš„ä¸´æ—¶è½ä»¶æ”¾ä¸“ç”¨å­ç›®å½•:æ–‡ä»¶åæŒ‰ URL å“ˆå¸Œç¨³å®š
-    // (é‡å¼€è¦†ç›–,å¢žé•¿æœ‰ç•Œ),é€€å‡ºæ—¶æ•´ç›®å½•æ¸…æ‰«å…œåº•ã€‚å¤–éƒ¨åº”ç”¨å¯èƒ½ä»å ç”¨æ–‡ä»¶
-    // (å°¤å…¶ Windows æ–‡ä»¶é”),rm å¤±è´¥é™é»˜å¿½ç•¥â€”â€”åŒåè¦†ç›– + ä¸‹æ¬¡é€€å‡ºæ¸…æ‰«ä¼š
-    // ç»§ç»­æ”¶æ•›ã€‚
-    const remoteImagesTmpDir = path.join(app.getPath('temp'), 'xdt-maker-remote-images');
-    app.on('will-quit', () => {
-      try {
-        fs.rmSync(remoteImagesTmpDir, { recursive: true, force: true });
-      } catch {
-        // æ–‡ä»¶è¢«å¤–éƒ¨åº”ç”¨å ç”¨ç­‰:ç•™ç»™ä¸‹æ¬¡è¦†ç›–/æ¸…æ‰«ã€‚
-      }
-    });
-
-    const lightboxMedia = createLightboxMediaHandlers({
-      isPathAllowed,
-      resolveImageCacheUrl: (url) =>
-        url.startsWith('cindy-media://')
-          ? cindyMediaBlobStore.resolveSafe(url)
-          : imageCacheStore.resolveSafe(url),
-      // è§„åˆ™ 25:lightboxã€Œå‘é€åˆ°å¯¹è¯ã€çš„ç¼“å­˜å†™åŒæ ·è¿›åª’ä½“æ€»ä»“(è‰ç¨¿è¯­ä¹‰,
-      // å‘é€æ—¶ç»Ÿä¸€ç”± register.ts æŒ‚å¼•ç”¨),ä¸Ž IPC from-path/from-buffer ä¸€è‡´ã€‚
-      cacheImageFromPath: (params) =>
-        cindyChatAttachments.ingestChatImageFromPath({
-          sourcePath: params.sourcePath,
-          originalName: params.originalName,
-        }),
-      cacheImageFromBuffer: (params) =>
-        cindyChatAttachments.ingestChatImageBuffer({
-          buffer: params.buffer,
-          mimeType: params.mimeType,
-        }),
-      showSaveDialog: async (opts) => {
-        const targetWin = getWindow() ?? BrowserWindow.getFocusedWindow();
-        const result = targetWin
-          ? await dialog.showSaveDialog(targetWin, opts)
-          : await dialog.showSaveDialog(opts);
-        return { canceled: result.canceled, filePath: result.filePath || undefined };
-      },
-      openPath: (absPath) => shell.openPath(absPath),
-      // net.fetch èµ° Chromium ç½‘ç»œæ ˆ(ç»§æ‰¿ä»£ç†è®¾ç½®);30s è¶…æ—¶ + å¤§å°ä¸Šé™é˜²å¾¡ã€‚
-      // é™æµå¿…é¡»**è¾¹è¯»è¾¹æ£€**(collectStreamWithLimit):æ—  / è°ŽæŠ¥ Content-Length
-      // çš„å“åº”è‹¥å…ˆ arrayBuffer å†æ£€æŸ¥,ä¼šåœ¨æ£€æŸ¥å‰åƒæ»¡ main è¿›ç¨‹å†…å­˜(review P1)ã€‚
-      fetchRemoteImage: async (url) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 30_000);
-        try {
-          const response = await net.fetch(url, { signal: controller.signal });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          const contentLength = Number(response.headers.get('content-length') ?? '0');
-          if (contentLength > REMOTE_IMAGE_MAX_BYTES) throw new Error('å›¾ç‰‡è¿‡å¤§,æ— æ³•ä¸‹è½½');
-          if (!response.body) throw new Error('empty response body');
-          let buffer: Buffer;
-          try {
-            buffer = await collectStreamWithLimit(
-              response.body.getReader(),
-              REMOTE_IMAGE_MAX_BYTES,
-            );
-          } catch (err) {
-            controller.abort();
-            throw err;
-          }
-          const rawContentType = response.headers.get('content-type')?.split(';')[0]?.trim();
-          return {
-            buffer,
-            mimeType: rawContentType?.startsWith('image/') ? rawContentType : undefined,
-          };
-        } finally {
-          clearTimeout(timer);
-        }
-      },
-      fetchRemoteMediaImage: (url) => fetchRemoteMediaImageBytes(url),
-      getTempDir: () => {
-        fs.mkdirSync(remoteImagesTmpDir, { recursive: true });
-        return remoteImagesTmpDir;
-      },
-      fileExists: (absPath) => fs.existsSync(absPath),
-      statSize: async (absPath) => (await fs.promises.stat(absPath)).size,
-      copyFile: (src, dest) => fs.promises.copyFile(src, dest),
-      writeFile: (dest, data) => fs.promises.writeFile(dest, data),
-      readFile: (absPath) => fs.promises.readFile(absPath),
-      getDownloadsDir: () => app.getPath('downloads'),
-      now: () => Date.now(),
-    });
-
-    ipcMain.handle('media:open-with-default-app', (_event, params: { url: string }) =>
-      lightboxMedia.openWithDefaultApp(params),
-    );
-    ipcMain.handle('media:save-as', (_event, params: { url: string }) =>
-      lightboxMedia.saveAs(params),
-    );
-    ipcMain.handle(
-      'media:cache-for-session',
-      (_event, params: { url: string; sessionId: string }) => lightboxMedia.cacheForSession(params),
-    );
-    ipcMain.handle('media:read-image-bytes', (_event, params: { url: string }) =>
-      lightboxMedia.readImageBytes(params),
-    );
-  }
-
-  // é™„ä»¶å¡ç¼©ç•¥å›¾:ç³»ç»Ÿç¼©ç•¥å›¾æœåŠ¡(macOS QuickLook / Windows Shell)æŒ‰è·¯å¾„å‡ºå°é¢„è§ˆã€‚
-  // é«˜æƒé™å…¥å£â€”â€”å…ˆè¿‡ sender é—¸,å†ç”± readFileThumbnail åšè·¯å¾„ç­–ç•¥ä¸Ž payload æ ¡éªŒ;
-  // ä»»ä½•å¤±è´¥éƒ½å›ž null,ç”± renderer å›žè½åˆ°è‡ªç»˜æ–‡ä»¶å›¾æ ‡ã€‚
-  ipcMain.handle(
-    'file:thumbnail',
-    async (
-      event: Electron.IpcMainInvokeEvent,
-      params: { path: string; size: number; revalidate?: boolean },
-    ) => {
-      assertTrustedAppRendererEvent(event);
-      return readFileThumbnail(params);
-    },
-  );
-
-  // â”€â”€ CC Agent SDK IPC handlers (Stage 2 C1 å¤§æ‰¹é€€å½¹) â”€â”€
-  // è€ cc-agent:* handler å…¨éƒ¨é€€å½¹ â€”â€” renderer å·²åˆ‡åˆ° maker.* (A4/A5/B/B'/B''/C1/C2)ã€‚
-  // å„é¡¹æ¬è¿åŽ»å‘:
-  //   - send-message / stop-session / close-session / update-permission-mode /
-  //     set-model / set-effort / set-fast-mode / set-thinking-summaries /
-  //     get-context-usage / set-session-visibility / permission-response /
-  //     answer-user-question / plan-review-response â†’ maker.* (C1)
-  //   - generate-title / plan-file-write â†’ maker-ipc/title.ts + plan-write.ts (C1)
-  //   - rewind:preview / rewind:commit â†’ maker-ipc/rewind.ts (C2, æœ¬æäº¤)
-
-  // â”€â”€ Image local cache IPC handlers (image-local-cache M3) â”€â”€
-  // è§„åˆ™ 25:ç²˜è´´/æ‹–æ‹½å†™å…¥èµ° cindy-media åª’ä½“æ€»ä»“,è¿”å›ž
-  // cindy-media:// å†…å®¹å¯»å€åœ°å€ã€‚åŽ†å² draft/committed çŠ¶æ€æœºç”±å¼•ç”¨è®¡æ•°æ›¿ä»£:
-  // æ­¤å¤„åªå†™ blob ä¸æŒ‚å¼•ç”¨(=è‰ç¨¿),å‘é€æ—¶ register.ts æŒ‚ session-attachment
-  // å¼•ç”¨(=æ™‹å‡)ã€‚sessionId å‚æ•°ä¿ç•™å…¼å®¹ renderer ç­¾å,ä¸å†å†³å®šè½ç›˜ä½ç½®ã€‚
-  // F1: drag drop â†’ blob ä»“,returns cindy-media:// url
-  ipcMain.handle(
-    'image-cache:from-path',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { sessionId: string; sourcePath: string; originalName: string },
-    ): Promise<{ url: string; filename: string }> => {
-      return cindyChatAttachments.ingestChatImageFromPath({
-        sourcePath: params.sourcePath,
-        originalName: params.originalName,
-      });
-    },
-  );
-
-  // F1: clipboard paste â†’ blob ä»“,returns cindy-media:// url
-  ipcMain.handle(
-    'image-cache:from-buffer',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: {
-        sessionId: string;
-        buffer: Uint8Array;
-        mimeType: string;
-        suggestedName?: string;
-      },
-    ): Promise<{ url: string; filename: string }> => {
-      return cindyChatAttachments.ingestChatImageBuffer({
-        buffer: params.buffer,
-        mimeType: params.mimeType,
-      });
-    },
-  );
-
-  // Local storage controls never accept a filesystem path from the renderer.
-  ipcMain.handle('worktree-recycle:list', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    return listWorktreeRecycleStatus();
-  });
-  ipcMain.handle('worktree-recycle:control', async (event, input: unknown) => {
-    assertTrustedAppRendererEvent(event);
-    await controlWorktreeRecycle(input);
-  });
-
-  // â”€â”€ å­˜å‚¨ç©ºé—´å¡ç‰‡(å…³äºŽé¡µ)IPC:åª’ä½“æ€»ä»“å›žæ”¶å™¨ + å¯¹è´¦â”€â”€
-  // ä¸šåŠ¡ä½“åœ¨ cindy-media/storageIpc.ts(ä¾èµ–æ³¨å…¥,è§„åˆ™ 14),è¿™é‡ŒåªåšæŽ¥çº¿ã€‚
-  {
-    const fixedDirectoryIpcLog = createLogger('fixed-directory-ipc');
-    const runFixedDirectoryIpcAction = async <T>(
-      actionName: string,
-      action: () => Promise<T>,
-    ): Promise<T> => {
-      try {
-        return await action();
-      } catch (error) {
-        if (isIpcError(error)) throw error;
-        fixedDirectoryIpcLog.warn('fixed directory IPC action failed', {
-          action: actionName,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throwIpcError('INTERNAL', 'fixed cache directory action failed');
-      }
-    };
-    const openFixedDirectory = (
-      rootDir: string,
-      canOpen: () => boolean = () => true,
-    ): Promise<boolean> =>
-      openOrCreateFixedDirectory(rootDir, {
-        canOpen,
-        openPath: (filePath) => shell.openPath(filePath),
-      });
-    // These actions intentionally accept no renderer path. The frozen xdt-image
-    // cache has no owner metadata, so its confirmed cleanup applies to the whole
-    // profile-level legacy root. Chat attachments remain scoped to the active
-    // owner, but live drafts, message history, and the media ledger are not read:
-    // the explicitly confirmed cache is treated as disposable in full.
-    const clearFixedDirectory = async (
-      rootDir: string,
-      canClear: () => boolean = () => true,
-    ): Promise<void> => {
-      if (!canClear()) throw new Error('fixed directory owner changed before cleanup');
-      await fs.promises.rm(rootDir, { recursive: true, force: true });
-    };
-    const confirmFixedDirectoryClear = async (
-      event: Electron.IpcMainInvokeEvent,
-      labels: { title: string; message: string; confirmButton: string },
-    ): Promise<boolean> => {
-      const ownerWindow = BrowserWindow.fromWebContents(event.sender);
-      if (!ownerWindow || ownerWindow.isDestroyed()) {
-        throwIpcError(
-          'PRECONDITION_FAILED',
-          'fixed directory cleanup requires a live owner window',
-        );
-      }
-      const result = await dialog.showMessageBox(ownerWindow, {
-        type: 'warning',
-        title: labels.title,
-        message: labels.message,
-        buttons: [labels.confirmButton, t('settings.about.storage.cancelButton')],
-        defaultId: 1,
-        cancelId: 1,
-        noLink: true,
-      });
-      return result.response === 0 && !ownerWindow.isDestroyed() && !event.sender.isDestroyed();
-    };
-    const captureActiveChatAttachmentRoot = () => {
-      const ownerScopeKey = activeOwnerScopeKey();
-      const ownerId = getActiveAppSession().dataOwnerId;
-      if (!ownerId || isAppSessionBoundaryPending()) {
-        throwIpcError(
-          'PRECONDITION_FAILED',
-          'chat attachment directory requires a stable data owner',
-        );
-      }
-      return {
-        rootDir: getChatAttachmentOwnerCacheRoot(ownerId),
-        isCurrentOwner: () =>
-          activeOwnerScopeKey() === ownerScopeKey && !isAppSessionBoundaryPending(),
-      };
-    };
-    const withActiveChatAttachmentRoot = async <T>(
-      action: (rootDir: string, isCurrentOwner: () => boolean) => Promise<T>,
-      options: { allowOwnerChangeAfterAction?: boolean } = {},
-    ): Promise<T> => {
-      const { rootDir, isCurrentOwner } = captureActiveChatAttachmentRoot();
-      const result = await action(rootDir, isCurrentOwner);
-      if (!options.allowOwnerChangeAfterAction && !isCurrentOwner()) {
-        throwIpcError('PRECONDITION_FAILED', 'chat attachment directory owner changed');
-      }
-      return result;
-    };
-
-    // å„çª—å£è‰ç¨¿é™„ä»¶ URL ä¸ŠæŠ¥(composerDraftStore mutator å°¾éƒ¨æŽ¨é€;å¤šçª—å£
-    // æ—¶æ¸…ç†å–å…¨çª—å£å¹¶é›†,é˜²è¯¯åˆ åˆ«çš„çª—å£çš„è‰ç¨¿å›¾)ã€‚fire-and-forget sendã€‚
-    ipcMain.on('cindy-media:report-draft-urls', (event, urls: string[]) => {
-      registerWindowDraftUrls(event.sender, urls);
-    });
-
-    const storageHandlers = createStorageIpcHandlers({
-      getQueueScanTexts: collectAgentInputQueueScanTexts,
-      loadSnapshotPayloads: loadAllQueueSnapshotPayloads,
-      getRegisteredDraftUrls: getAllRegisteredDraftUrls,
-      openLegacyImagesDir: () => openFixedDirectory(imageCacheStore.getCacheRoot()),
-      clearLegacyImagesDir: () => clearFixedDirectory(imageCacheStore.getCacheRoot()),
-      getLegacyImagesDirStats: () => getFixedDirectoryStats(imageCacheStore.getCacheRoot()),
-      openChatAttachmentsDir: () =>
-        withActiveChatAttachmentRoot((rootDir, isCurrentOwner) =>
-          openFixedDirectory(rootDir, isCurrentOwner),
-        ),
-      clearChatAttachmentsDir: () =>
-        withActiveChatAttachmentRoot(
-          (rootDir, isCurrentOwner) => clearFixedDirectory(rootDir, isCurrentOwner),
-          { allowOwnerChangeAfterAction: true },
-        ),
-      getChatAttachmentsDirStats: () =>
-        !getActiveAppSession().dataOwnerId || isAppSessionBoundaryPending()
-          ? Promise.resolve({ bytes: 0, fileCount: 0 })
-          : withActiveChatAttachmentRoot((rootDir) => getFixedDirectoryStats(rootDir)),
-    });
-    ipcMain.handle('cindy-media:storage-stats', () => storageHandlers.stats());
-    ipcMain.handle('cindy-media:storage-scan', (_event, params: { draftUrls: string[] }) =>
-      storageHandlers.scan(params),
-    );
-    ipcMain.handle(
-      'cindy-media:storage-cleanup',
-      (
-        _event,
-        params: {
-          draftUrls: string[];
-          zeroRefHashes: string[];
-          evictCacheHashes: string[];
-          deadDirNames: string[];
-          cleanTmpFiles: boolean;
-        },
-      ) => storageHandlers.cleanup(params),
-    );
-    ipcMain.handle('cindy-media:storage-reconcile', () => storageHandlers.reconcile());
-    ipcMain.handle('cindy-media:legacy-images-open-dir', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return storageHandlers.openLegacyImagesDir();
-    });
-    ipcMain.handle('cindy-media:legacy-images-clear', (event) =>
-      runFixedDirectoryIpcAction('legacy-images-clear', async () => {
-        assertTrustedAppRendererEvent(event);
-        const confirmed = await confirmFixedDirectoryClear(event, {
-          title: t('settings.about.storage.legacyImagesClearConfirmTitle'),
-          message: t('settings.about.storage.legacyImagesClearConfirmDescription'),
-          confirmButton: t('settings.about.storage.legacyImagesClearConfirmButton'),
-        });
-        if (!confirmed) return { cleared: false };
-        await storageHandlers.clearLegacyImagesDir();
-        return { cleared: true };
-      }),
-    );
-    ipcMain.handle('cindy-media:chat-attachments-open-dir', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return storageHandlers.openChatAttachmentsDir();
-    });
-    ipcMain.handle('cindy-media:chat-attachments-clear', (event) =>
-      runFixedDirectoryIpcAction('chat-attachments-clear', async () => {
-        assertTrustedAppRendererEvent(event);
-        const ownerScope = captureActiveChatAttachmentRoot();
-        const confirmed = await confirmFixedDirectoryClear(event, {
-          title: t('settings.about.storage.chatAttachmentsClearConfirmTitle'),
-          message: t('settings.about.storage.chatAttachmentsClearConfirmDescription'),
-          confirmButton: t('settings.about.storage.chatAttachmentsClearConfirmButton'),
-        });
-        if (!confirmed) return { cleared: false };
-        if (!ownerScope.isCurrentOwner()) {
-          throwIpcError(
-            'PRECONDITION_FAILED',
-            'chat attachment directory owner changed before cleanup',
-          );
-        }
-        await storageHandlers.clearChatAttachmentsDir();
-        return { cleared: true };
-      }),
-    );
-
-    // Native folder selection belongs to this computer; intentionally not exposed via device-link.
-    const dialogueWorkspaceHandlers = createDialogueWorkspaceHandlers({
-      captureScope: () => {
-        if (!getActiveAppSession().dataOwnerId || isAppSessionBoundaryPending()) {
-          throwIpcError('PRECONDITION_FAILED', 'dialogue workspace requires an active owner');
-        }
-        return activeOwnerScopeKey();
-      },
-      isScopeCurrent: (scope) => !isAppSessionBoundaryPending() && activeOwnerScopeKey() === scope,
-      read: readDialogueWorkspaceSettings,
-      write: writeDialogueWorkspaceDirectory,
-      chooseDirectory: async () => {
-        const options: Electron.OpenDialogOptions = {
-          title: t('settings.about.storage.dialogueDirectoryChoose'),
-          properties: ['openDirectory', 'createDirectory'],
-        };
-        const ownerWindow = BrowserWindow.getFocusedWindow() ?? mainWindowRef;
-        const result =
-          ownerWindow && !ownerWindow.isDestroyed()
-            ? await dialog.showOpenDialog(ownerWindow, options)
-            : await dialog.showOpenDialog(options);
-        return result.canceled ? null : (result.filePaths[0] ?? null);
-      },
-      // Dedicated owner subtree prevents unrelated folders from being treated as managed tasks.
-      resolveDirectory: (selected) =>
-        customDialogueWorkspaceRoot(selected, path.basename(ownerScopedUserDataPath())),
-      checkWritable: checkDialogueDirectoryWritable,
-      openDirectory: (directory) => shell.openPath(directory),
-    });
-    for (const action of ['get', 'choose', 'reset', 'open'] as const) {
-      ipcMain.handle('dialogue-workspace:' + action, async (event) => {
-        assertTrustedAppRendererEvent(event);
-        try {
-          return await dialogueWorkspaceHandlers[action]();
-        } catch (error) {
-          if (isIpcError(error)) throw error;
-          dbClientLog.warn('dialogue workspace settings request failed', { action });
-          throwIpcError('INTERNAL', 'dialogue workspace settings request failed');
-        }
-      });
-    }
-
-    const localDbMaintenanceHandlers = createLocalDbMaintenanceIpcHandlers({
-      captureOwner: () => {
-        const ownerId = getActiveAppSession().dataOwnerId;
-        if (!ownerId || isAppSessionBoundaryPending()) return null;
-        return { ownerId, scopeKey: activeOwnerScopeKey() };
-      },
-      isOwnerCurrent: ({ ownerId, scopeKey }) =>
-        !isAppSessionBoundaryPending() &&
-        getActiveAppSession().dataOwnerId === ownerId &&
-        activeOwnerScopeKey() === scopeKey,
-      getDbClient,
-      getDbClientOwnerId: getCurrentDbClientUserId,
-      getCurrentDbPath: () => {
-        const ownerId = getActiveAppSession().dataOwnerId;
-        return ownerId ? getDbPathForUser(ownerId) : null;
-      },
-      getUserDataDir: () => app.getPath('userData'),
-      canSchedule: () => process.env.XDT_PASSIVE_SHARED_USER_DATA !== '1',
-      selectBackupDirectory: async () => {
-        const options = {
-          title: t('settings.about.storage.dbSlimmingBackupDirectoryDialogTitle'),
-          properties: ['openDirectory', 'createDirectory'] as Array<
-            'openDirectory' | 'createDirectory'
-          >,
-        };
-        const ownerWindow = BrowserWindow.getFocusedWindow() ?? mainWindowRef;
-        const result =
-          ownerWindow && !ownerWindow.isDestroyed()
-            ? await dialog.showOpenDialog(ownerWindow, options)
-            : await dialog.showOpenDialog(options);
-        return result.canceled ? null : (result.filePaths[0] ?? null);
-      },
-      confirmActiveTaskCleanup: async ({ backupEnabled }) => {
-        const activeTaskWarning = t(
-          'settings.about.storage.dbSlimmingIncludeActiveConfirmDescription',
-        );
-        const detail = backupEnabled
-          ? activeTaskWarning
-          : `${activeTaskWarning}\n\n${t(
-              'settings.about.storage.dbSlimmingConfirmDescriptionWithoutBackup',
-            )}`;
-        const options: Electron.MessageBoxOptions = {
-          type: 'warning',
-          title: t('settings.about.storage.dbSlimmingIncludeActiveConfirmTitle'),
-          message: t('settings.about.storage.dbSlimmingIncludeActiveConfirmTitle'),
-          detail,
-          buttons: [
-            t('settings.about.storage.dbSlimmingRestartButton'),
-            t('settings.about.storage.cancelButton'),
-          ],
-          defaultId: 1,
-          cancelId: 1,
-          noLink: true,
-        };
-        const ownerWindow = BrowserWindow.getFocusedWindow() ?? mainWindowRef;
-        const result =
-          ownerWindow && !ownerWindow.isDestroyed()
-            ? await dialog.showMessageBox(ownerWindow, options)
-            : await dialog.showMessageBox(options);
-        return result.response === 0;
-      },
-      confirmWithoutBackup: async () => {
-        const options: Electron.MessageBoxOptions = {
-          type: 'warning',
-          title: t('settings.about.storage.dbSlimmingConfirmTitle'),
-          message: t('settings.about.storage.dbSlimmingConfirmTitle'),
-          detail: t('settings.about.storage.dbSlimmingConfirmDescriptionWithoutBackup'),
-          buttons: [
-            t('settings.about.storage.dbSlimmingRestartButton'),
-            t('settings.about.storage.cancelButton'),
-          ],
-          defaultId: 1,
-          cancelId: 1,
-          noLink: true,
-        };
-        const ownerWindow = BrowserWindow.getFocusedWindow() ?? mainWindowRef;
-        const result =
-          ownerWindow && !ownerWindow.isDestroyed()
-            ? await dialog.showMessageBox(ownerWindow, options)
-            : await dialog.showMessageBox(options);
-        return result.response === 0;
-      },
-      revealFile: async (filePath) => {
-        try {
-          if (!(await fs.promises.stat(filePath)).isFile()) return false;
-        } catch {
-          return false;
-        }
-        shell.showItemInFolder(path.normalize(filePath));
-        return true;
-      },
-      relaunch: (requestId) => {
-        dbClientLog.info('database slimming relaunch requested');
-        if (app.isPackaged) {
-          // Do not replay the native startup argv, which may contain an import Key.
-          app.relaunch({ args: process.argv.slice(1) });
-        } else {
-          // Forge owns the Vite server. A bare app.relaunch() outlives Forge,
-          // then opens a white window against a dead localhost renderer. The
-          // repository dev runner observes the durable cleanup marker and
-          // restarts the full Forge/Vite stack after this process exits.
-          const delegated = writeDbSlimmingDevRelaunchSignal(requestId);
-          dbClientLog.info('database slimming dev relaunch delegated to desktop dev runner', {
-            delegated,
-          });
-        }
-        app.quit();
-      },
-    });
-    const invokeLocalDbMaintenanceIpc = async <T>(
-      action: string,
-      operation: () => T | Promise<T>,
-    ): Promise<T> => {
-      try {
-        return await operation();
-      } catch (error) {
-        if (isIpcError(error)) throw error;
-        dbClientLog.error('database slimming IPC failed', {
-          action,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throwIpcError('INTERNAL', 'database maintenance request failed');
-      }
-    };
-    ipcMain.handle('local-db:maintenance:scan', (event, input) => {
-      assertTrustedAppRendererEvent(event);
-      return invokeLocalDbMaintenanceIpc('scan', () => localDbMaintenanceHandlers.scan(input));
-    });
-    ipcMain.handle('local-db:maintenance:choose-backup-directory', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return invokeLocalDbMaintenanceIpc('choose-backup-directory', () =>
-        localDbMaintenanceHandlers.chooseBackupDirectory(),
-      );
-    });
-    ipcMain.handle('local-db:maintenance:schedule', (event, input) => {
-      assertTrustedAppRendererEvent(event);
-      return invokeLocalDbMaintenanceIpc('schedule', () =>
-        localDbMaintenanceHandlers.schedule(input),
-      );
-    });
-    ipcMain.handle('local-db:maintenance:last-result', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return invokeLocalDbMaintenanceIpc('last-result', () =>
-        localDbMaintenanceHandlers.getLastResult(),
-      );
-    });
-    ipcMain.handle('local-db:maintenance:open-last-backup-directory', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return invokeLocalDbMaintenanceIpc('open-last-backup-directory', () =>
-        localDbMaintenanceHandlers.openLastBackupDirectory(),
-      );
-    });
-    ipcMain.handle('local-db:maintenance:startup-progress', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return getDbSlimmingStartupProgress();
-    });
-    ipcMain.handle('local-db:maintenance:cancel-startup', (event) => {
-      assertTrustedAppRendererEvent(event);
-      return { cancelled: cancelDbSlimmingStartupProgress() };
-    });
-    subscribeDbSlimmingStartupProgress((progress) => {
-      const target = mainWindowRef;
-      if (!target || target.isDestroyed() || target.webContents.isDestroyed()) return;
-      target.webContents.send(DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL, progress);
-    });
-  }
-
-  // F5: SDK send-time temporary base64 read (renderer-initiated; main-initiated
-  // is the primary path inside agentManager.buildContentBlocks).
-  // åŒä¸–ç•Œ:cindy-media æ–°åœ°å€èµ° blob ä»“,è€ xdt-image åœ°å€èµ°å†»ç»“çš„è€ storeã€‚
-  ipcMain.handle(
-    'image-cache:read-base64',
-    async (
-      _event: Electron.IpcMainInvokeEvent,
-      params: { url: string },
-    ): Promise<{ base64: string; mimeType: string }> => {
-      if (typeof params?.url === 'string' && params.url.startsWith('cindy-media://')) {
-        const { buffer, mimeType } = await cindyMediaBlobStore.readFile(params.url);
-        return { base64: buffer.toString('base64'), mimeType };
-      }
-      return imageCacheStore.readAsBase64(params.url);
-    },
-  );
-
-  // F7: cleanup an entire session's cache directory (delete session)
-  ipcMain.handle(
-    'image-cache:cleanup-session',
-    async (_event: Electron.IpcMainInvokeEvent, sessionId: string): Promise<void> => {
-      await imageCacheStore.removeSession(sessionId);
-      // cindy-media refs are removed only by the Main-owned, quiesced session
-      // deletion chain. This legacy IPC intentionally cleans xdt-image files
-      // only; deleting ledger refs here could race a late Simulator ingest.
-    },
-  );
-
-  // F7: cleanup a list of files (ç§»é™¤è¾“å…¥æ¡† chip / ä¸¢å¼ƒæˆªå›¾è‰ç¨¿)
-  ipcMain.handle(
-    'image-cache:cleanup-files',
-    async (_event: Electron.IpcMainInvokeEvent, urls: string[]): Promise<void> => {
-      if (!Array.isArray(urls)) return;
-      const cleanupLog = createLogger('image-cache');
-      for (const url of urls) {
-        // cindy-media blob æ˜¯å†…å®¹å¯»å€å…±äº«å­—èŠ‚,chip ç§»é™¤ä¸åˆ ä»»ä½•ä¸œè¥¿â€”â€”
-        // åŒå†…å®¹å¯èƒ½è¢«å…¶å®ƒæ¶ˆæ¯/ç”»å»Šå¼•ç”¨,åˆ å­—èŠ‚å¿…è¯¯ä¼¤;æœªå‘é€çš„æ— å¼•ç”¨ blob
-        // ç”±å›žæ”¶å™¨æ”¶èµ°ã€‚åŽ†å² xdt-image è‰ç¨¿ç»´æŒç‰©ç†åˆ é™¤ã€‚
-        if (typeof url === 'string' && url.startsWith('cindy-media://')) continue;
-        try {
-          await imageCacheStore.removeFile(url);
-        } catch (err) {
-          cleanupLog.warn('cleanup file failed', {
-            url,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-    },
-  );
-};
-
-// â”€â”€ Smoke-test mode (release-*.mjs post-build verification) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// When launched with `--smoke-test`, short-circuit the normal startup flow:
-// skip window creation / OAuth / auto-update / deep link / agent / tokens,
-// just run localDb init with a fake userId (from `--smoke-user=<id>`), query
-// schema_version + core tables, emit JSON to stdout, and exit. Electron's
-// native `--user-data-dir` flag is expected to be passed by the smoke script
-// so the fake DB lives in a scratch directory.
-function parseSmokeArgs(): {
-  enabled: boolean;
-  userId: string;
-  pluginStorage: boolean;
-  resultFile: string | null;
-} {
-  const resultFile = !app.isPackaged
-    ? process.env.XDT_PLUGIN_STORAGE_SMOKE_RESULT_FILE?.trim() || null
-    : null;
-  const enabled = process.argv.includes('--smoke-test') || resultFile !== null;
-  const userFlag = process.argv.find((a) => a.startsWith('--smoke-user='));
-  const userId = userFlag ? userFlag.slice('--smoke-user='.length) : '__smoke_test__';
-  return {
-    enabled,
-    userId,
-    pluginStorage: process.argv.includes('--smoke-plugin-storage') || resultFile !== null,
-    resultFile,
-  };
-}
-
-async function runSmokeTest(
-  userId: string,
-  pluginStorage: boolean,
-  resultFile: string | null,
-): Promise<void> {
-  try {
-    const result = await localDbEnsureReady(userId);
-    if (!result.ready) {
-      process.stderr.write(
-        `${JSON.stringify({ ok: false, error: `ensureReady failed: ${result.error.code} ${result.error.message}` })}\n`,
-      );
-      localDbCloseDb();
-      app.exit(1);
-      return;
-    }
-    const db = localDbGetRawDb();
-    const schemaRow = db
-      .prepare(`SELECT value FROM migration_meta WHERE key='schema_version'`)
-      .get() as { value: string } | undefined;
-    const schemaVersion = schemaRow ? parseInt(schemaRow.value, 10) : -1;
-    const sessionsCount = (db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number })
-      .c;
-    const messagesCount = (db.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number })
-      .c;
-    const metaCount = (
-      db.prepare('SELECT COUNT(*) AS c FROM migration_meta').get() as { c: number }
-    ).c;
-    const pluginStorageResult = pluginStorage ? await runPluginStorageSmoke(userId) : undefined;
-    const payload = {
-      ok: true,
-      schema_version: schemaVersion,
-      tables: {
-        sessions: sessionsCount,
-        messages: messagesCount,
-        migration_meta: metaCount,
-      },
-      ...(pluginStorageResult ? { plugin_storage: pluginStorageResult } : {}),
-    };
-    const serialized = `${JSON.stringify(payload)}\n`;
-    if (resultFile) fs.writeFileSync(resultFile, serialized, { mode: 0o600 });
-    process.stdout.write(serialized);
-    localDbCloseDb();
-    app.quit();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`${JSON.stringify({ ok: false, error: msg })}\n`);
-    try {
-      localDbCloseDb();
-    } catch {
-      /* noop */
-    }
-    app.exit(1);
-  }
-}
-
-async function runPackagedIOSSimulatorReleaseGate(
-  mode: IOSSimulatorReleaseGateMode,
-): Promise<void> {
-  try {
-    const report = await runIOSSimulatorReleaseGate({
-      mode,
-      packaged: app.isPackaged,
-      platform: process.platform,
-      architecture: process.arch,
-      hostOsRelease: os.release(),
-      resourcesPath: process.resourcesPath,
-      version: app.getVersion(),
-    });
-    process.stdout.write(`${JSON.stringify(report)}\n`);
-    app.quit();
-  } catch {
-    process.stderr.write(
-      `${JSON.stringify({
-        schemaVersion: 1,
-        ok: false,
-        errorCode: 'IOS_SIMULATOR_RELEASE_GATE_FAILED',
-      })}\n`,
-    );
-    app.exit(1);
-  }
-}
-
-// AUMID ä¸‰ä½ä¸€ä½“:å¿…é¡»ä¸Ž NSIS appId(forge.config æŒ‰æž„å»ºåŒºåŸŸä»Ž brandAppId() å–)
-// ä¸Žå¿«æ·æ–¹å¼ AUMID é€å­—ç¬¦ä¸€è‡´ã€‚å€¼ç» shared/brandRegion æŒ‰æž„å»ºæœŸåŒºåŸŸçƒ˜ç„™
-// (cn=com.xd.cindycn / global=com.xd.cindyï¼›æœªæ³¨å…¥ region æ—¶é»˜è®¤ global)ã€‚
-const WINDOWS_APP_USER_MODEL_ID = CURRENT_APP_ID;
-
-/**
- * æ¸…ç† Start Menu é‡ŒæŒ‡å‘ dev `node_modules\electron\dist\electron.exe` çš„æ®‹ç•™ .lnkã€‚
- *
- * èƒŒæ™¯ï¼šè¿™ç±» .lnk çš„ target æ˜¯è£¸ dev electron.exeã€Arguments ä¸ºç©ºï¼Œè¢« Windows æ³¨å†Œ
- * æˆ AUMID åŽï¼ˆå¦‚ `XdtMaker.Dev`ã€`electron.app.xdt-maker`ï¼‰ï¼Œä¸€æ—¦ toast ç‚¹å‡»è§¦å‘
- * AUMID æ¿€æ´»æœºåˆ¶ï¼Œå°±ä¼šå¯åŠ¨ä¸€ä¸ªæ²¡æœ‰ app å‚æ•°çš„ electron.exeï¼Œå¼¹å‡º Electron é»˜è®¤
- * æ¬¢è¿Žé¡µ â€”â€” ç”¨æˆ·è§†è§’çœ‹å°±æ˜¯"é€šçŸ¥ç‚¹äº†ä¹‹åŽè·³åˆ°ä¸€ä¸ªç©ºç™½ Electron é¡µ"ã€‚
- *
- * å·²çŸ¥æ¥æºï¼š
- *   - è€ç‰ˆæœ¬ SnoreToast `-install` ç•™ä¸‹çš„ `XdtMakerDev.lnk`ï¼ˆAUMID `XdtMaker.Dev`ï¼‰
- *   - Electron è‡ªèº«æŒ‰ productName è‡ªåŠ¨æ³¨å†Œçš„ `Electron.lnk`ï¼ˆAUMID `electron.app.xdt-maker`ï¼‰ï¼Œ
- *     dev ç¬¬ä¸€æ¬¡å¯åŠ¨åŽå¶çŽ°
- *
- * ç­–ç•¥ï¼š
- *   1. å¿«è·¯å¾„ï¼šæŒ‰å·²çŸ¥æ–‡ä»¶åï¼ˆXdtMakerDev.lnkï¼‰ç›´åˆ 
- *   2. é˜²å¾¡æ‰«æï¼šæžšä¸¾ Start Menu Programs ä¸‹æ‰€æœ‰ .lnkï¼Œå‡¡æ˜¯ target æŒ‡å‘
- *      `node_modules\electron\dist\electron.exe` ä¸” Arguments ä¸ºç©ºçš„ä¸€å¾‹åˆ é™¤
- *
- * é™é»˜ try/catchï¼šç”¨æˆ·æ‰‹åŠ¨åˆ è¿‡ / æ²¡è£…è¿‡ / æƒé™é—®é¢˜ / PowerShell å¼‚å¸¸éƒ½ä¸å½±å“ä¸»æµç¨‹ã€‚
- */
-function cleanupLegacyDevShortcut(): Promise<void> {
-  if (process.platform !== 'win32') return Promise.resolve();
-  const appData = process.env.APPDATA;
-  if (!appData) return Promise.resolve();
-  const startMenuDir = path.join(appData, 'Microsoft\\Windows\\Start Menu\\Programs');
-
-  // å¿«è·¯å¾„
-  const knownLnk = path.join(startMenuDir, 'XdtMakerDev.lnk');
-  try {
-    if (fs.existsSync(knownLnk)) {
-      fs.unlinkSync(knownLnk);
-      console.log('[AUMID] cleaned up legacy dev shortcut: %s', knownLnk);
-    }
-  } catch (err) {
-    console.warn('[AUMID] failed to remove legacy dev shortcut: %s', err);
-  }
-
-  // é˜²å¾¡æ‰«æï¼šè§£æž .lnk target å¿…é¡»èµ° WScript.Shell COMï¼Œæ‰€ä»¥èµ° PowerShellã€‚
-  // å•å¼•å·åŒ…è·¯å¾„å¹¶æŠŠå†…éƒ¨ `'` è½¬æˆ `''`ï¼ˆPS å•å¼•å·å­—ç¬¦ä¸²è½¬ä¹‰ï¼‰ã€‚
-  const psRoot = startMenuDir.replace(/'/g, "''");
-  const ps =
-    `$sh = New-Object -ComObject WScript.Shell; ` +
-    `$root = '${psRoot}'; ` +
-    `if (Test-Path $root) { ` +
-    `Get-ChildItem -Path $root -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object { ` +
-    `try { ` +
-    `$lnk = $sh.CreateShortcut($_.FullName); ` +
-    `if ($lnk.TargetPath -match '(?i)node_modules\\\\electron\\\\dist\\\\electron\\.exe$' -and -not $lnk.Arguments) { ` +
-    `Remove-Item -LiteralPath $_.FullName -Force; ` +
-    `Write-Output ('removed: ' + $_.FullName) ` +
-    `} ` +
-    `} catch {} ` +
-    `} ` +
-    `}`;
-
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', ps],
-      { timeout: 8000, windowsHide: true },
-      (err, stdout) => {
-        if (err) {
-          console.warn('[AUMID] dev shortcut scan failed: %s', err.message);
-        } else if (stdout.trim()) {
-          for (const line of stdout.trim().split(/\r?\n/)) {
-            console.log('[AUMID] %s', line);
-          }
-        }
-        resolve();
-      },
-    );
-  });
-}
-
-app.on('ready', async () => {
-  try {
-    const releaseGate = parseIOSSimulatorReleaseGateArgs(process.argv);
-    if (releaseGate.enabled) {
-      await runPackagedIOSSimulatorReleaseGate(releaseGate.mode);
-      return;
-    }
-  } catch {
-    process.stderr.write(
-      `${JSON.stringify({
-        schemaVersion: 1,
-        ok: false,
-        errorCode: 'IOS_SIMULATOR_RELEASE_GATE_ARGUMENT_INVALID',
-      })}\n`,
-    );
-    app.exit(1);
-    return;
-  }
-
-  // Smoke-test flag short-circuit: skip all normal init paths.
-  const smoke = parseSmokeArgs();
-  if (smoke.enabled) {
-    await runSmokeTest(smoke.userId, smoke.pluginStorage, smoke.resultFile);
-    return;
-  }
-
-  // WebAuthn æ˜¯ app/session çº§èƒ½åŠ›ï¼šåœ¨ä»»ä½• RSB guest æˆ– popup WebContents åˆ›å»º
-  // ä¹‹å‰è£…è´¦æˆ·é€‰æ‹©å›žè°ƒï¼›æ­£å¼ç­¾åçš„ macOS åŒ…åŒæ—¶å¯ç”¨ Touch ID å¹³å°è®¤è¯å™¨ã€‚
-  configureRsbBrowserWebAuthn();
-
-  // safeStorage å¯è§‚æµ‹æ€§(#871):è¿™æ¡é“¾è·¯æ­¤å‰åœ¨æ—¥å¿—é‡Œå®Œå…¨ä¸å¯è§,å‡ºé—®é¢˜(ç”¨æˆ·åœ¨
-  // ç³»ç»Ÿé’¥åŒ™ä¸²å¼¹çª—ç‚¹äº†æ‹’ç» â†’ åŠ è§£å¯†é™é»˜é™çº§å¤±è´¥)åªèƒ½é å¼¹çª—åæŽ¨ã€‚è¿™é‡Œåªè½æ´¾ç”Ÿ
-  // èº«ä»½(æ¡ç›®å = `<app.name> Safe Storage`),**åˆ»æ„ä¸è°ƒ isEncryptionAvailable()**
-  // â€”â€”macOS ä¸ŠæŽ¢æµ‹æœ¬èº«å¯èƒ½è§¦å‘é’¥åŒ™ä¸²æŽˆæƒå¼¹çª—,æŠŠ #871 çš„å¼¹çª—æ—¶æœºæå‰åˆ°å¯åŠ¨;
-  // å¯ç”¨æ€§/å¤±è´¥åœ¨å®žé™…ä½¿ç”¨ç‚¹è®°å½•(authManager çš„ safeStorage helpers)ã€‚ä¸å«å‡­è¯ã€‚
-  createLogger('safe-storage').info('safeStorage identity', {
-    appName: app.getName(),
-    isPackaged: app.isPackaged,
-  });
-
-  // å®¢æˆ·ç«¯ç«¯ç‚¹æ¸…å•:å¯åŠ¨ç¬¬ä¸€æ­¥ã€å…ˆäºŽä¸€åˆ‡æ›´æ–°æ£€æŸ¥,**é˜»æ–­å¼**è§£æž(packaged èµ°
-  // çƒ˜ç„™ hotfix CDN åŸºå€;dev é»˜è®¤è¯»ä»“å†… config/endpoint.json,--endpoints-cdn
-  // æ—¶åŒ packaged;å¤±è´¥ â†’ ç³»ç»Ÿé”™è¯¯æ¡†é‡è¯•/é€€å‡º,æ— ç¼“å­˜ä¸Žçƒ˜ç„™å…œåº•)ã€‚
-  // å¿…é¡»æ—©äºŽä¸€åˆ‡ç«¯ç‚¹æ¶ˆè´¹æ–¹åˆå§‹åŒ–ã€ä¸”åœ¨ createWindow() å‰æ³¨å†Œ sendSync IPC
-  // (preload æ¨¡å—çº§åŒæ­¥è¯»å–ä¾èµ–å®ƒ)ã€‚ç”¨æˆ·åœ¨é”™è¯¯æ¡†é€‰"é€€å‡º"æ—¶ app.exit å·²è°ƒç”¨,
-  // è¿™é‡Œç›´æŽ¥ return ä¸å†ç»§ç»­å¯åŠ¨ã€‚
-  if (!(await initClientEndpoints())) {
-    return; // ç”¨æˆ·åœ¨é”™è¯¯æ¡†é€‰æ‹©é€€å‡º,app.exit å·²è°ƒç”¨
-  }
-  registerClientEndpointsIpc();
-
-  // ç½‘å…³å‡­æ®è‡ªåŠ¨ä¸‹å‘:è®¢é˜…ç™»å½•æ€(ç™»å½•åŽå‘ model-access-server æ‹‰ endpoint +
-  // ç”¨æˆ·ä¸“å±ž key)+ æ³¨å†Œ model-access:* IPCã€‚é¡»åœ¨ initClientEndpoints ä¹‹åŽ
-  // (ä¾èµ– modelAccessApiBaseUrl ç«¯ç‚¹)ã€renderer auth:initialize ä¹‹å‰è£…è®¢é˜…ã€‚
-  initModelAccess();
-
-  initializeUpdatePresentationRecovery();
-
-  // mac dev ä¸‹ Dock æ˜¾ç¤ºçš„æ˜¯ Electron é»˜è®¤å›¾æ ‡â€”â€”macOS å¿½ç•¥ BrowserWindow.icon,
-  // Dock å›¾æ ‡å–è‡ªå¯æ‰§è¡Œ bundle çš„ icns,è€Œ dev è·‘çš„æ˜¯ node_modules é‡Œçš„å®˜æ–¹
-  // Electron äºŒè¿›åˆ¶ã€‚è¿™é‡Œ dev-only æ‰‹åŠ¨è®¾æˆ Cindy å›¾æ ‡;packaged ç‰ˆç”±
-  // resources/icon.icns è‡ªç„¶ç”Ÿæ•ˆ,ä¸éœ€è¦ä¹Ÿä¸è¯¥åŠ¨ã€‚
-  // ä½¿ç”¨ icon-dock.pngï¼ˆgenerate-mac-icns.mjs äº§å‡ºï¼Œå·²å¥— Apple åœ†è§’ç½‘æ ¼ï¼‰ï¼›
-  // setIcon ä¼šåŽŸæ ·æ˜¾ç¤ºèµ„æºï¼Œä¸ä¼šæ›¿åº”ç”¨å›¾æ ‡è‡ªåŠ¨åŠ åœ†è§’ã€‚
-  if (!app.isPackaged && process.platform === 'darwin') {
-    try {
-      app.dock?.setIcon(path.join(__dirname, '../../resources/icon-dock.png'));
-    } catch (err) {
-      // ä»…å½±å“ dev Dock è§‚æ„Ÿ,å¤±è´¥ä¸æŒ¡å¯åŠ¨
-      createLogger('dock-icon').warn('setIcon failed', { error: String(err) });
-    }
-  }
-
-  await ensureMainAppPresence('app-ready');
-
-  // Cindy-owned Skill activation and all home-level projections happen through
-  // one stable-owner boundary. Passive shared-userData instances may consume the
-  // active bundle but cannot switch it or its projections.
-  try {
-    await desktopClaudeAuthAdapter.ensureSharedGlobalSkills();
-  } catch (error) {
-    // A broken optional Skill must not block the desktop from starting.
-    createLogger('built-in-skills').warn('built-in Skill preparation failed', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  // macOS App Translocation fix: when the user launches the app without
-  // dragging it to /Applications first, macOS runs it from a read-only
-  // temporary path, which breaks the in-app auto-updater.  Prompt the
-  // user to move the app before any other init work happens.
-  //
-  // Skipped in dev (`!app.isPackaged`): the dev Electron binary lives in
-  // node_modules, isInApplicationsFolder() always returns false, and
-  // moveToApplicationsFolder() would actually move the dev binary into
-  // /Applications and break the developer's workspace.
-  if (app.isPackaged && process.platform === 'darwin' && !app.isInApplicationsFolder()) {
-    const chosen = dialog.showMessageBoxSync({
-      type: 'info',
-      title: t('update.moveToApplications.title'),
-      message: t('update.moveToApplications.message'),
-      buttons: [t('update.moveToApplications.move'), t('update.moveToApplications.later')],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (chosen === 0) {
-      try {
-        app.moveToApplicationsFolder();
-      } catch (err) {
-        console.error('[main] moveToApplicationsFolder failed:', err);
-      }
-      return;
-    }
-  }
-
-  // image-local-cache M2 â€” must register the protocol handler after ready
-  // (the scheme itself was registered as privileged at module top).
-  // Windows AUMIDï¼šå¿…é¡»å’Œ NSIS å†™åˆ° Start Menu å¿«æ·æ–¹å¼ System.AppUserModel.ID
-  // ä¸Šçš„å€¼ä¸€è‡´ï¼ŒElectron Notification æ‰ä¸ä¼šè¢«é€šçŸ¥ä¸­æž¢é™é»˜ä¸¢å¼ƒã€‚
-  //
-  // è¿™é‡Œå¿…é¡»å›ºå®šä¸º forge.config.ts é‡Œçš„ appIdã€‚ä¸è¦è¿è¡Œæ—¶æ¨¡ç³Šæ‰«æ Get-StartAppsï¼š
-  // å…¶ä»– Start Menu é¡¹çš„ AppID ä¹Ÿå¯èƒ½åŒ…å« "xdt"ï¼Œè¯¯è®¾åŽ Windows ä¼šæŒ‰é”™è¯¯ AUMID
-  // å¯¹ä»»åŠ¡æ åˆ†ç»„å’Œå–å›¾æ ‡ï¼Œå¯¼è‡´ xdt-maker ä¸²åˆ°åˆ«çš„åº”ç”¨å›¾æ ‡ã€‚
-  //
-  // å¿…é¡»åœ¨åˆ›å»ºä»»ä½• Notification ä¹‹å‰è°ƒç”¨ã€‚macOS / Linux ä¸éœ€è¦ã€‚
-  if (process.platform === 'win32') {
-    await cleanupLegacyDevShortcut();
-    app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
-    console.log('[AUMID] runtime=%s', WINDOWS_APP_USER_MODEL_ID);
-  }
-
-  registerImageProtocolHandler();
-  registerVideoProtocolHandler();
-  registerLocalFileProtocolHandler();
-  registerAudioFileProtocolHandler();
-  registerModelProtocolHandler();
-  registerRemoteMediaProtocolHandler();
-  registerCindyMediaProtocolHandler();
-
-  // Inject a Content-Security-Policy response header onto the app's own
-  // top-level document (defaultSession mainFrame) before any window loads.
-  // Blocks an XSS from escalating to preload privileges via inline / eval
-  // script. Dev (Vite dev server) gets a relaxed policy (unsafe-eval + inline
-  // + HMR ws); packaged file:// build gets script-src 'self' 'unsafe-eval'
-  // 'wasm-unsafe-eval' (unsafe-eval for vendored drawio, wasm-unsafe-eval for
-  // 3D model decoders). External URLs (e.g. OAuth pages) are passed through
-  // unmodified. The RSB <webview> uses a
-  // separate BROWSER_PARTITION session and is unaffected.
-  // "isDev" is keyed off the Vite dev-server URL, which is exactly the runtime
-  // condition under which the renderer is served by Vite.
-  const cspDevServerUrl = MAIN_WINDOW_VITE_DEV_SERVER_URL || null;
-  installContentSecurityPolicy(session.defaultSession, {
-    isDev: Boolean(cspDevServerUrl),
-    devServerOrigin: parseOrigin(cspDevServerUrl),
-  });
-
-  registerIpcHandlers();
-  rebindDatabaseSizeWarningSettingsWatcher();
-  startInputDeviceRuntime();
-  startInputDevices();
-  // æœ¬æœº FS ç›®å½•æµè§ˆ(é¡¹ç›®é€‰æ‹©å™¨ã€Œæ·»åŠ è¿œç¨‹é¡¹ç›®ã€é€çº§æµè§ˆ;device-link ç»éš§é“åœ¨è¢«æŽ§ç«¯æ‰§è¡Œ)ã€‚
-  // æ—  DB / æ— ç™»å½•ä¾èµ–,éšå…¶å®ƒé¡¶å±‚ handler ä¸€èµ·æ³¨å†Œå³å¯ã€‚
-  registerFsBrowseIpc();
-  // ã€Œæˆ‘çš„ Issueã€åˆ—è¡¨æŸ¥è¯¢ã€‚åˆ»æ„æ³¨å†Œåœ¨è¿™é‡Œè€Œä¸æ˜¯ registerMakerIpcsAfterSplash:
-  // å®ƒä¸ä¾èµ– Maker ä¸Ž agent äºŒè¿›åˆ¶,è€Œ /issues åœ¨ splash check-environment å®Œæˆå‰
-  // (æˆ–äºŒè¿›åˆ¶ provision å¤±è´¥æ—¶)å°±å¯èƒ½è¢«æ‰“å¼€ â€”â€” æŒ‚åœ¨ splash ä¹‹åŽä¼šè®©é¡µé¢æ‹¿åˆ°
-  // "No handler registered" ä¸”ä¸ä¼šè‡ªåŠ¨æ¢å¤ã€‚
-  registerMyIssuesIpc();
-  // chat-data-localization F2/F5ï¼šæ³¨å†Œ localDb IPC + å¹²å‡€é€€å‡ºå¿«ç…§é’©å­ã€‚
-  // ä¸ç«‹å³å¼€ dbï¼›ensureReady ç”± AuthContext åœ¨ç™»å½•æˆåŠŸåŽé€šè¿‡ IPC è§¦å‘ã€‚
-  // onReady å›žè°ƒæ˜¯ owner DB æƒå¨å°±ç»ªç‚¹ï¼›å®ƒå…ˆæ”¾è¡Œæœ¬åœ°è¯»ï¼Œå†ä¸Ž splash ç«¯çš„
-  // provider coordinator ä¼šåˆï¼ŒåŽå°å®Œæˆè´¦å·è·¯ç”±åˆå§‹åŒ–åŽæ‰å¯åŠ¨ schedulerã€‚
-  // é¦–ç™»è½»é‡æ•°æ®è¿ç§»(mToc)çš„ç¡®è®¤å¼¹çª— IPC â€”â€” å¿…é¡»å…ˆäºŽ registerLocalDbIpc æ³¨å†Œ,
-  // ä¿è¯ beforeEnsureReady æŽ¨é€ confirm æ€æ—¶ renderer å·²èƒ½ invoke ç¡®è®¤é€šé“ã€‚
-  registerLegacyMigrationIpc();
-  setHistoryToolNameReader(getHistoryToolName);
-  registerLocalDbIpc({
-    isSessionTurnPendingCompletion,
-    readHistoryLiveMessages: getSessionThinkingSnapshots,
-    resolveContextWindow: (session) => resolveSessionContextWindow(getActiveCatalog(), session),
-    requestWorktreeRecycle,
-    cancelSessionOperations: cancelIOSSimulatorSessionOperations,
-    cleanupRemovedSession: cleanupIOSSimulatorRemovedSession,
-    closeIdleSessionForMove: async (sessionId) => {
-      const maker = getMakerIfReady();
-      if (maker?.getSession(sessionId)?.isTurnRunning()) return false;
-      if (maker) {
-        await rehydrateCloseSuppression.withSuppressed(sessionId, () =>
-          maker.closeSession(sessionId),
-        );
-      }
-      return true;
-    },
-    reconcilePersistedSessionRuntimes: reconcilePersistedIOSSimulatorOwnership,
-    withSessionLock: withSendToSessionLock,
-    // Mirrors exactly what the resume handler requires (`maker-ipc/register.ts`):
-    // a loaded session for this task whose agent is PI. Without it a finished
-    // run kept advertising `resume` after a restart and the sidebar offered a
-    // follow-up composer that could only ever fail.
-    isParentPiSessionLive: (sessionId) => {
-      try {
-        return getMakerIfReady()?.getSession(sessionId)?.agentKind === 'pi';
-      } catch {
-        return false;
-      }
-    },
-    isOwnerCurrent: (userId) =>
-      isLocalDbOwnerCurrent(authManager.getAuthState(), userId, isAppSessionBoundaryPending()),
-    discardStaleOwner: (userId) =>
-      lifecycleDbClientManager.dispose(`stale-owner-after-ready:${userId}`),
-    beforeEnsureReady: async (userId) => {
-      // Provider discovery is detached from DB read readiness for the same owner, but a
-      // different owner must not replace the DB while the previous account task can still
-      // update owner-scoped catalogs or agent environments.
-      const nextProviderScopeKey = activeOwnerScopeKey();
-      const previousProviderTaskSettled =
-        await accountProviderReadinessBarrier.waitForPreviousScope(nextProviderScopeKey);
-      // The old task may have completed its owner-scoped DB read after teardown cleared the
-      // process-global catalog. Clear once more after joining a *different owner* so a
-      // failed next-owner reload cannot inherit the old snapshot. Same-owner generation
-      // bumps also wait here, but must keep the current account's custom providers.
-      if (
-        shouldClearCatalogAfterJoiningPreviousScope({
-          waited: previousProviderTaskSettled,
-          currentSameOwnerAsNext:
-            accountProviderReadinessBarrier.hasSameOwnerIdentity(nextProviderScopeKey),
-        })
-      ) {
-        setCustomProviders([]);
-      }
-      const user = authManager.getAuthState().user;
-      if (user == null || user.id !== userId) return;
-      if (authManager.isPassiveSharedUserDataInstance()) {
-        const passivePreflight = await inspectPassiveLocalProfileAdoption(
-          user.id,
-          createProductionLocalProfileDataMigrationDeps(
-            app.getPath('userData'),
-            BRAND_IDENTITY.dbFilePrefix,
-            () => hasExclusiveSharedLegacyUserDataAccess(),
-          ),
-        );
-        if (passivePreflight.status === 'required') {
-          throw new Error('local profile database adoption is pending in the primary instance');
-        }
-        if (passivePreflight.status === 'failed') {
-          throw new Error(
-            `local profile database adoption preflight failed: ${passivePreflight.error}`,
-          );
-        }
-        return;
-      }
-      // é¦–ç™»è½»é‡è¿ç§»(è€ xdt-maker userData â†’ Cindy):å†…éƒ¨è‡ªå¸¦ marker é˜²é‡å…¥ä¸Ž
-      // å…¨é‡å…œåº•,ç»ä¸ throw,å¤±è´¥ä¸é˜»å¡žç™»å½•(ensureReady ç…§å¸¸å»ºæ–°åº“)ã€‚
-      await runLegacyUserDataMigrationForUser(user.id);
-      // ç™»å½•å‰ local-v1 ä¸Žç™»å½•åŽçš„ cloud owner ä½¿ç”¨ä¸åŒæ•°æ®åº“æ–‡ä»¶ã€‚ç›®æ ‡åº“ä¸å­˜åœ¨æ—¶
-      // é‡‡ç”¨æœ¬åœ°åº“ï¼Œé¿å…ç”¨æˆ·åˆšç™»å½•å°±çœ‹åˆ°ç©ºçš„ä»»åŠ¡/é¡¹ç›®ç©ºé—´ï¼›ç›®æ ‡åº“å·²å­˜åœ¨åˆ™ä¿æŒåŽŸæ ·ï¼Œ
-      // ç»ä¸è¦†ç›–è´¦å·å·²æœ‰å†…å®¹ã€‚
-      const localProfileMigration = await adoptLocalProfileDatabase(
-        user.id,
-        createProductionLocalProfileDataMigrationDeps(
-          app.getPath('userData'),
-          BRAND_IDENTITY.dbFilePrefix,
-          () => hasExclusiveSharedLegacyUserDataAccess(),
-          process.platform === 'win32'
-            ? () =>
-                acquireWindowsPackagedInstanceBarrier({
-                  userDataDir: app.getPath('userData'),
-                  programName: BRAND_IDENTITY.executableName,
-                })
-            : undefined,
-        ),
-      );
-      if (localProfileMigration.status === 'failed') {
-        dbClientLog.error('local profile database adoption failed; blocking cloud database open', {
-          userId,
-          error: localProfileMigration.error,
-        });
-        throw new Error(`local profile database adoption failed: ${localProfileMigration.error}`);
-      } else if (localProfileMigration.status === 'claimed-by-other-owner') {
-        dbClientLog.warn('local profile database is already reserved for another cloud owner', {
-          userId,
-        });
-      } else if (localProfileMigration.status === 'adopted') {
-        dbClientLog.info('local profile database adopted for first cloud owner', {
-          userId,
-        });
-      }
-    },
-    onReady: async (userId) => {
-      const startupHooksStartedAt = performance.now();
-      let startupPhaseStartedAt = startupHooksStartedAt;
-      const logStartupPhase = (phase: string): void => {
-        const now = performance.now();
-        dbClientLog.info(
-          JSON.stringify({
-            event: 'localDb.startup.phase.done',
-            phase,
-            elapsedMs: Math.round(now - startupPhaseStartedAt),
-            totalElapsedMs: Math.round(now - startupHooksStartedAt),
-          }),
-        );
-        startupPhaseStartedAt = now;
-      };
-      // å¿…é¡»å…ˆ await ensureLifecycleDbClient(å†…éƒ¨ await createDbClient â†’ worker
-      // spawn + db open + migration scan + smoke,çº¦ 1-2s),æŠŠ client ç»
-      // setCurrentDbClient æš´éœ²ç»™å…¨å±€ getDbClient() ä¹‹åŽ,åŽç»­ attemptStartScheduler /
-      // attemptStartEmbeddingHost ç­‰åŽç»­å¯åŠ¨ä»»åŠ¡æ‰èƒ½æ‹¿åˆ° ready çš„ DbClientã€‚
-      //
-      // åŽ†å²:MR2.0 æ—¶è¿™é‡Œæ˜¯ fire-and-forget,scheduler/embedding èµ°è€ getDrizzle/getRawDb
-      // è·¯å¾„ä¸å—å½±å“ã€‚MR2.2 æŠŠ 158 callsite åˆ‡åˆ° DbClient åŽ,fire-and-forget è®©åŽç»­
-      // attempt å…¨éƒ¨æ’ž "DbClient not ready",scheduler/embedding æ°¸ä¸å¯åŠ¨ â†’ renderer
-      // å¡åœ¨ IPC ç­‰å¾… â†’ ç™½å±ã€‚
-      const dbClientTakeover = await ensureLifecycleDbClient(userId);
-      logStartupPhase('db-client-takeover');
-      if (dbClientTakeover.mode === 'failed' || dbClientTakeover.mode === 'skipped') {
-        // Do not expose the previous owner's startup snapshot after a failed
-        // takeover. A later successful takeover will capture a fresh snapshot.
-        startupDatabaseSizeWarningStatus = { databaseBytes: null };
-        startupDatabaseSizeWarningStatusChecked = false;
-        startupDatabaseSizeWarningOwnerScope = null;
-        broadcastDatabaseSizeWarningChanged();
-        dbClientLog.warn('[DbClient] lifecycle client unavailable; skip db-client startup hooks', {
-          userId,
-          mode: dbClientTakeover.mode,
-        });
-        // Teardown already closed the keyboard. The renderer still enters the
-        // main UI, so restore hardware even when the lifecycle client did not.
-        try {
-          await resumeInputDeviceTaskSlots();
-        } catch (error) {
-          dbClientLog.warn('Input device task slot refresh failed (non-fatal)', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        return;
-      }
-      checkDatabaseSizeWarningAtStartup();
-      // Bot recovery is owner-scoped and must start only after DbClient
-      // takeover. registerMakerIpc also invokes this once its services exist,
-      // covering both possible splash/login orderings without duplicate runs.
-      void restoreBotRuntimeForCurrentOwner();
-      startReadyWorktreeMaintenance();
-      if (dbClientTakeover.mode === 'unchanged') {
-        // å‰¯çª—å£ä¼šå†æ¬¡èµ° localDb.ensureReadyï¼›åŒ owner çš„ lifecycle client å·²ç”±é¦–ä¸ª
-        // onReady å®Œæ•´å¯åŠ¨ï¼Œå› æ­¤è¿™é‡Œåªä¿ç•™ DB è¿žæŽ¥äº¤æŽ¥ï¼Œä¸é‡å¤æ‰§è¡Œè´¦å·çº§å¯åŠ¨ç»´æŠ¤ã€‚
-        // worker takeover ä¼šè®© ensureReady ä¸ºæœ¬æ¬¡å‰¯çª—å£é‡æ–°æ‰“å¼€ main DBï¼Œäº¤æŽ¥å®ŒæˆåŽç«‹å³
-        // é‡Šæ”¾è¯¥çŸ­æš‚è¿žæŽ¥ï¼Œé¿å…å®ƒé•¿æœŸå ç”¨æ–‡ä»¶å¥æŸ„å’Œ optimize å®šæ—¶å™¨ã€‚
-        if (dbClientTakeover.shouldReleaseMainDb && process.env.XDT_DB_INPROC !== 'true') {
-          localDbCloseDb({ preserveSchemaMigrationLease: true });
-          dbClientLog.info('[DbClient] duplicate owner ensure released reopened main db', {
-            userId,
-          });
-        }
-        // Same-owner generation bump also lands here. Ensure adopts a settled
-        // discovery task, starts one if it never launched (pending start was
-        // held across a Ghost boundary), and starts consumers if the original
-        // then() skipped them while boundaryPending.
-        void ensureCurrentAccountProviderReadiness();
-        // Logout suspends the keyboard. Relogin of the same owner still lands
-        // here, so restore task slots even when the lifecycle client is reused.
-        try {
-          await resumeInputDeviceTaskSlots();
-        } catch (error) {
-          dbClientLog.warn('Input device task slot refresh failed (non-fatal)', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        return;
-      }
-      try {
-        await resumeInputDeviceTaskSlots();
-      } catch (error) {
-        dbClientLog.warn('Input device task slot refresh failed (non-fatal)', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      try {
-        await resumeDeletedPiSubagentCleanup();
-      } catch (err) {
-        dbClientLog.warn('PI Subagent deleted-task cleanup recovery failed (non-fatal)', {
-          userId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-      logStartupPhase('pi-subagent-cleanup-recovery');
-      // Phase 1.1: file worker æŽ¥ç®¡ DB è¿žæŽ¥åŽ,é‡Šæ”¾ main ç«¯çš„ _db + optimize å®šæ—¶å™¨ã€‚
-      // å¦‚æžœ worker takeover å¤±è´¥å¹¶è¿›å…¥ inproc fallback,main _db å¿…é¡»ç»§ç»­ä¿ç•™,
-      // å¦åˆ™ fallback ä¼šæ‹¿åˆ°å·²å…³é—­çš„è¿žæŽ¥ã€‚
-      if (dbClientTakeover.shouldReleaseMainDb && process.env.XDT_DB_INPROC !== 'true') {
-        // åªæŠŠè¿žæŽ¥äº¤ç»™ workerï¼Œä¸èƒ½é‡Šæ”¾ shared-passive schema reader leaseï¼šworker
-        // è¿˜ä¼šé•¿æœŸæŒæœ‰åŒä¸€ DBï¼›lease å¿…é¡»ç•™åˆ°çœŸæ­£ logout / app quit æ‰é‡Šæ”¾ã€‚
-        localDbCloseDb({ preserveSchemaMigrationLease: true });
-        dbClientLog.info('[DbClient] main-side _db released after worker takeover');
-      }
-      const accountSwitchLog = createLogger('custom-mcp-account-switch');
-      // èº«ä»½ç¿»è½¬é—ç•™çš„ dialogue å·¥ä½œç›®å½•è‡ªæ„ˆ:æŠŠ legacy userData å‰ç¼€çš„
-      // sessions.working_dir æ‰¹é‡æ”¹å†™åˆ°å½“å‰ userData(è¯¦è§ dialogueWorkdirSelfHeal.ts)ã€‚
-      // å¿…é¡» await:ensure-ready IPC è¿”å›žåŽ renderer æ‰æ‹‰ä¼šè¯åˆ—è¡¨,åœ¨æ­¤ä¹‹å‰æ”¹å†™å®Œ
-      // æ‰èƒ½ä¿è¯ renderer æ‹¿åˆ°çš„å°±æ˜¯æ–°è·¯å¾„(æ”¹å†™åŽä¸å†å‘½ä¸­,ç¨³æ€é›¶å¼€é”€)ã€‚
-      try {
-        await sweepLegacyDialogueWorkingDirs({
-          db: getDbClient(),
-          userDataDir: app.getPath('userData'),
-          legacyUserDataDirNames: legacyDialogueUserDataDirNames(CURRENT_CINDY_REGION),
-          currentDialoguesRoot: ownerScopedUserDataPath('dialogues'),
-          additionalLegacyDialogueRoots: [path.join(app.getPath('userData'), 'dialogues')],
-          log: createLogger('dialogue-workdir-self-heal'),
-        });
-      } catch (err) {
-        dbClientLog.warn('legacy dialogue workdir sweep failed (non-fatal)', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-      logStartupPhase('dialogue-workdir-sweep');
-      // æ—§ã€Œèµ„æ–™æœ¬åœ°è¦†å†™ã€æ–¹æ¡ˆé€€å½¹(2026-07)çš„ä¸€æ¬¡æ€§æ¸…ç†:æ¸…å½“å‰è´¦å·åä¸‹çš„
-      // profile-avatar åª’ä½“å¼•ç”¨ä¸Ž override æ¡ç›®(æ–‡ä»¶æ¡ç›®å³å¹‚ç­‰æ ‡è®°,å¤±è´¥ä¸‹æ¬¡ç™»å½•é‡è¯•)ã€‚
-      void (async () => {
-        const overridePath = path.join(app.getPath('userData'), 'profile-override.json');
-        const legacyProfileLog = createLogger('profileEdit');
-        await profileEdit.cleanupLegacyProfileOverride(
-          {
-            readOverrideFile: () => {
-              try {
-                return fs.readFileSync(overridePath, 'utf-8');
-              } catch {
-                return null;
-              }
-            },
-            // tmp+rename åŽŸå­å†™:å†™ä¸€åŠå´©æºƒä¸ä¼šæŠŠå‰©ä½™è´¦å·çš„æ¡ç›®å˜æˆæŸå JSON
-            // (æŸåæ–‡ä»¶ä¼šè¢«æ¸…ç†é€»è¾‘å½“"æ— ä»Žå®šä½"æ•´ä½“åˆ é™¤,å…¶å¼•ç”¨å›žåˆ°æ³„æ¼çŠ¶æ€)ã€‚
-            writeOverrideFile: (content) => {
-              const tmp = `${overridePath}.tmp`;
-              fs.writeFileSync(tmp, content, 'utf-8');
-              fs.renameSync(tmp, overridePath);
-            },
-            deleteOverrideFile: () => fs.unlinkSync(overridePath),
-            removeRefs: removeMediaRefs,
-            logInfo: (message) => legacyProfileLog.info(message),
-            logWarn: (message, err) => legacyProfileLog.warn(message, err),
-          },
-          userId,
-        );
-      })().catch((err) => {
-        dbClientLog.warn('legacy profile override cleanup threw (non-fatal)', err);
-      });
-      // ä»·æ ¼è¡¨ä½œç”¨åŸŸä¾èµ–å½“å‰ localDb ç”¨æˆ·ä¸Ž provider-secret owner;å¿…é¡»ç­‰ç”¨æˆ· DB ready åŽå†é¢„çƒ­ã€‚
-      void prewarmModelPricing();
-      // DB å¯è¯»ä¸Ž Agent å¯å¯åŠ¨æ˜¯ä¸¤ä¸ªä¸åŒçš„ readinessï¼šçŽ°æœ‰ä»»åŠ¡åˆ—è¡¨åªä¾èµ–å‰è€…ï¼Œä¸èƒ½
-      // è¢«ç½‘ç»œæ¨¡åž‹å‘çŽ°é˜»å¡žï¼›æ–°å»º / å‘é€åˆ™ç» registerMakerIpc çš„ä¸­å¿ƒå…¥å£ç­‰å¾…ä¸‹æ–¹ barrierï¼Œ
-      // ä¿ç•™ issue #1196 çš„è·¯ç”±æ­£ç¡®æ€§ï¼ˆAnthropic æ¸…å•å›žæ¥å‰ä¸èƒ½å…ˆæŒ‰ XD é»˜è®¤å»º Opusï¼‰ã€‚
-      //
-      // æ¨¡åž‹å‘çŽ°å¿…é¡»æŽ’åœ¨ Codex é‡å¯åºåˆ—ä¹‹åŽï¼šåŽè€…æœ«å°¾ä¼šæŒ‰ auth è¾¹ç•Œé‡è¯»
-      // models_cacheï¼ˆcache miss å³æ¸…ç©ºé˜²ä¸²å·ï¼‰ï¼Œå¹¶å‘è·‘ä¼šè®©åˆšå‘çŽ°çš„æ¸…å•è¢«ç©ºå¿«ç…§è¦†ç›–ã€‚
-      const resumeIncompleteDiscovery = async (): Promise<void> => {
-        const handle = accountProviderReadinessBarrier.currentHandle();
-        if (
-          !handle ||
-          getActiveAppSession().dataOwnerId !== userId ||
-          !accountProviderReadinessBarrier.needsIncompleteDiscoveryResume(handle.scopeKey)
-        ) {
-          return;
-        }
-        const catalogMayWrite = () =>
-          handle.isLive() &&
-          accountProviderReadinessBarrier.isCurrentAdoptable() &&
-          getActiveAppSession().dataOwnerId === userId;
-        await discoverAccountProviderModels(
-          {
-            loadXaiLkg: loadXaiModelsFromDiskCache,
-            refreshProviderModels: requestProviderModelAutoRefresh,
-            log: accountSwitchLog,
-          },
-          catalogMayWrite,
-        );
-        if (catalogMayWrite()) handle.markDiscoveryComplete();
-      };
-      const startProviderReadiness = (): void => {
-        if (!makerProviderRefreshConfigured) {
-          startPendingAccountProviderReadiness = { ownerId: userId, start: startProviderReadiness };
-          return;
-        }
-        const providerScopeKey = activeOwnerScopeKey();
-        const currentOwnerId = getActiveAppSession().dataOwnerId;
-        if (!currentOwnerId || currentOwnerId !== userId) {
-          return;
-        }
-        if (isAppSessionBoundaryPending()) {
-          startPendingAccountProviderReadiness = {
-            ownerId: userId,
-            start: startProviderReadiness,
-          };
-          return;
-        }
-        if (accountProviderReadinessBarrier.needsIncompleteDiscoveryResume(providerScopeKey)) {
-          void resumeIncompleteDiscovery();
-          return;
-        }
-        if (
-          accountProviderReadinessBarrier.hasScope(providerScopeKey) ||
-          (accountProviderReadinessBarrier.hasAdoptableSameOwner(providerScopeKey) &&
-            accountProviderReadinessBarrier.isDiscoveryComplete())
-        ) {
-          return;
-        }
-        const providerReadiness = accountProviderReadinessBarrier.start(
-          providerScopeKey,
-          async (handle) => {
-            const startedAt = performance.now();
-            try {
-              // è‡ªå®šä¹‰ MCP ä¸Žè‡ªå®šä¹‰ä¾›åº”å•†éƒ½åªæœåŠ¡ Agent è·¯ç”±ï¼Œä¸åº”è¯¥é˜»å¡žä»»åŠ¡åˆ—è¡¨ã€‚
-              // äºŒè€…åœ¨å†…ç½®æ¨¡åž‹å‘çŽ°å‰å®Œæˆï¼Œç¡®ä¿åŽç»­ route consumer åªçœ‹å½“å‰è´¦å·ã€‚
-              try {
-                // åˆ‡å· teardown ä¼š reset Maker å’Œ MCP registryã€‚å…ˆé‡å»º Maker ä»¥é‡æ–°æ³¨å†Œ
-                // provider arraysï¼Œå†ç­‰å®ƒçš„åˆå§‹åˆ·æ–°ï¼›å†·å¯åŠ¨æ—¶åˆå§‹åˆ·æ–°å¯èƒ½æ—©äºŽ
-                // DB ready è€Œç©ºè·‘ï¼Œæ‰€ä»¥éšåŽè¿˜è¦æ˜¾å¼è¡¥åˆ·ä¸€æ¬¡å½“å‰ ownerã€‚
-                getMakerCore();
-                await waitForInitialCustomMcpRefresh();
-                await refreshCustomMcpProviders();
-              } catch (err) {
-                accountSwitchLog.warn('refreshCustomMcpProviders on account switch failed', {
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-              // Cleanup is owed to this start() entry, not the process-wide boundary
-              // flag. Same-owner Ghost repair holds beginAppSessionBoundary() across
-              // teardown + commit; if that flag gated reset/Pi shutdown, an in-flight
-              // Aâ†’B restartCodex would skip shutdownCodexEnvironment forever while
-              // discovery still marked the entry complete and adoptable.
-              const entryStillLive = () => handle.isLive();
-              // Catalog writes die with a real owner teardown (`invalidateAdoption`).
-              // Codex/Pi cleanup stays owed to this entry across a same-owner bump.
-              const catalogMayWrite = () =>
-                handle.isLive() && accountProviderReadinessBarrier.isCurrentAdoptable();
-              await refreshCustomProvidersIntoCatalog(catalogMayWrite);
-              // A new start() is already a new incarnation (same-owner rollover adopts
-              // instead). Bind reset/discovery/Pi teardown to this entry so a later
-              // generation bump cannot skip Aâ†’B cleanup, and a replaced entry cannot
-              // mark the next incarnation complete.
-              if (entryStillLive()) {
-                await resetAccountProviderRuntimes(
-                  {
-                    restartCodex: restartCodexAfterAuthModeChange,
-                    shutdownCodexEnvironment,
-                    log: accountSwitchLog,
-                  },
-                  entryStillLive,
-                );
-              }
-              if (catalogMayWrite()) {
-                await discoverAccountProviderModels(
-                  {
-                    loadXaiLkg: loadXaiModelsFromDiskCache,
-                    refreshProviderModels: requestProviderModelAutoRefresh,
-                    log: accountSwitchLog,
-                  },
-                  catalogMayWrite,
-                );
-                handle.markDiscoveryComplete();
-              }
-              if (!entryStillLive()) return;
-              // Pi bridge ä¸Ž Codex åŒæºï¼ˆHTTP bridge + gateway keyï¼‰ï¼Œè´¦å·åˆ‡æ¢åŽä¹Ÿå¿…é¡»
-              // æ¸…æŽ‰æ—§è´¦å·çŽ¯å¢ƒï¼Œè®©ä¸‹ä¸€æ¬¡ Pi ä¼šè¯æŒ‰æ–°è´¦å·å‡­è¯é‡å»ºã€‚
-              try {
-                await shutdownPiEnvironment();
-              } catch (err) {
-                accountSwitchLog.warn('shutdownPiEnvironment on account switch failed', {
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-            } catch (err) {
-              // ä¸Žæ—§ LocalDbGate å±éšœä¸€è‡´ï¼šprovider readiness æ˜¯ best-effortï¼›æ„å¤–å¤±è´¥åªè®°è´¦ï¼Œ
-              // ä¸æŠŠå·²ç»å¯è¯»çš„æœ¬åœ° DB è¯¯æŠ¥æˆå¯åŠ¨å¤±è´¥ï¼Œä¹Ÿä¸è®©å‘é€å…¥å£æ°¸ä¹…æ‚¬æŒ‚ã€‚
-              accountSwitchLog.warn('account provider readiness task failed (non-fatal)', {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            } finally {
-              accountSwitchLog.info('account provider readiness settled', {
-                elapsedMs: Math.round(performance.now() - startedAt),
-              });
-            }
-          },
-          (err) => {
-            accountSwitchLog.warn('account provider readiness rejected unexpectedly', {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          },
-        );
-        // Hook / personal IM / scheduler can resolve routes before maker.createSession, so arm
-        // them only after discovery settles. The Maker lifecycle hook remains the final guard for
-        // every direct create path. The scope check prevents an old completion from reviving hosts
-        // after an account boundary.
-        const startedHandle = accountProviderReadinessBarrier.currentHandle();
-        void providerReadiness.then(() => {
-          if (
-            !startedHandle?.isLive() ||
-            !shouldStartReadinessConsumers({
-              capturedScopeKey: providerScopeKey,
-              currentScopeKey: activeOwnerScopeKey(),
-              boundaryPending: isAppSessionBoundaryPending(),
-              adoptable: accountProviderReadinessBarrier.isCurrentAdoptable(),
-            }) ||
-            !accountProviderReadinessBarrier.markConsumersStarted()
-          ) {
-            return;
-          }
-          startAccountIntegrationsAfterOwnerDbReady(userId, {
-            isOwnerCurrent: (ownerId) =>
-              isLocalDbOwnerCurrent(
-                authManager.getAuthState(),
-                ownerId,
-                isAppSessionBoundaryPending(),
-              ),
-            startHookControlAccount,
-            startImConnection,
-            log: dbClientLog,
-          });
-          attemptStartScheduler();
-          attemptStartEmbeddingHost();
-        });
-      };
-      // localDb ä¸Ž splash å¯ä»¥ä»»æ„å…ˆåŽå®Œæˆã€‚åè°ƒå™¨å·²é…ç½®å°±ç«‹å³å¼€åŽå°ä»»åŠ¡ï¼›
-      // å¦åˆ™åªç™»è®°å½“å‰ scope çš„å¯åŠ¨é—­åŒ…ï¼Œä¸åˆ›å»ºä¸€ä¸ªå¯èƒ½æ°¸ä¹… pending çš„ Promiseã€‚
-      setAccountProviderReadinessReadyHandler((ownerId) => {
-        startAccountIntegrationsAfterOwnerDbReady(ownerId, {
-          isOwnerCurrent: (id) =>
-            isLocalDbOwnerCurrent(authManager.getAuthState(), id, isAppSessionBoundaryPending()),
-          startHookControlAccount,
-          startImConnection,
-          log: dbClientLog,
-        });
-        attemptStartScheduler();
-        attemptStartEmbeddingHost();
-      });
-      accountProviderReadinessArm.publish(
-        userId,
-        startProviderReadiness,
-        resumeIncompleteDiscovery,
-      );
-      if (makerProviderRefreshConfigured) startProviderReadiness();
-      else
-        startPendingAccountProviderReadiness = { ownerId: userId, start: startProviderReadiness };
-      logStartupPhase('post-db-hooks-scheduled');
-    },
-  });
-  // dev-only IPC for embedding-host smoke testing (status + sync embed). å®‰å…¨:
-  // å†…éƒ¨è‡ªå¸¦ app.isPackaged å®ˆå«, packaged build ä¸‹ register æ˜¯ no-opã€‚
-  registerDevEmbeddingIpc();
-  // worktree-parallel-sessions: æ³¨å†Œ 7 ä¸ª worktree:* channel (åˆ›å»º/æŸ¥è¯¢/åˆ—è¡¨/reveal/...)
-  // åˆ é™¤è·¯å¾„ä¸æš´éœ² IPC; ä»…åœ¨ cc-agent:close-session å†…éƒ¨è°ƒç”¨ removeWorktreeForSessionã€‚
-  registerWorktreeIpc(ipcMain);
-  // session-git-pr-context: git-context:* channel(åˆ†æ”¯æŸ¥è¯¢/HEAD ç›‘å¬/PR å¼•ç”¨/PR çŠ¶æ€)
-  registerGitContextIpc();
-  registerGitReviewIpc({
-    isSessionRunning: (sessionId) => {
-      try {
-        return getMakerCore().getSession(sessionId)?.isTurnRunning() === true;
-      } catch {
-        return false;
-      }
-    },
-  });
-  // device-link è¿œç¨‹ git å®¡æŸ¥(åªè¯»):git-review:remote-op handler(è¢«æŽ§ç«¯è§’è‰²;
-  // invoke-registry æ•èŽ·åŽä¾›æŽ§åˆ¶ç«¯éš§é“è°ƒç”¨,æœ¬æœº renderer ä¸è°ƒç”¨)ã€‚
-  registerGitReviewDeviceOp();
-  registerModelVisibilityOwnerClaimIpc();
-  registerModelVisibilitySyncIpc();
-  registerSidebarSettingsIpc();
-  registerProjectOrderIpc();
-  registerRemotePrecreatedWorktreeLedgerIpc();
-  // RSB terminal tab: PTY backend + 8 ä¸ª terminal:* IPC channels(create/write/resize/dispose/restart
-  // + listAvailableShells / get|setDefaultShellPref)ã€‚owner WebContents destroyed æ—¶:
-  //   - RSB ç‹¬ç«‹å­çª—å£é”€æ¯(æ”¶èµ· / åˆå¹¶å›žä¸»çª—)â†’ PTY è½¬ç§»ç»™ä¸»çª—ä¿æ´»,è¾“å‡º sink æ”¹æŽ¨ä¸»çª—,
-  //     ä¸Žå†…åµŒå½¢æ€"æ”¶èµ·ä¾§æ ä¸æ€ç»ˆç«¯"è¯­ä¹‰ä¸€è‡´;ä¸»çª—é‡æŒ‚ç»ˆç«¯åŽä¼šå¹‚ç­‰ re-attach æŽ¥ç®¡ã€‚
-  //   - ä¸»çª—é”€æ¯(app é€€å‡º)â†’ fallback è§£æžä¸åˆ°æ´» webContents,PtyManager å›žè½ dispose,
-  //     æ— éœ€åœ¨è¿™é‡Œæ‰‹åŠ¨ wire shutdown é’©å­ã€‚
-  registerTerminalHandlers({
-    getFallbackOwner: () =>
-      mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef.webContents : null,
-  });
-  registerLocalThemesIpc();
-  registerVoiceInputIpc();
-  registerGlobalVoiceInputIpc({
-    getMainWindow: () => mainWindowRef,
-    // ä¼šè¯å‰¯çª—å£è·‘åŒä¸€å¥—è·¯ç”±,è®¾ç½®é¡µåœ¨é‡Œé¢ç…§æ ·æ‰“å¾—å¼€,æ‰€ä»¥å¼¹ç³»ç»ŸæŽˆæƒçª—é‚£ä¸¤æ¡ IPC è¦è®¤å®ƒã€‚
-    isSecondaryAppWindow,
-  });
-  // è€ 'usage:get-today-spend' å·²é€€å½¹ â€”â€” renderer èµ° maker:usage:today('claude-code') æ‹‰ã€‚
-  // readTodaySpend ä»åœ¨ main/usageBroadcaster.ts å†…éƒ¨è¢« readAgentTodayUsage ç”¨ã€‚
-  // ä¸»æœºé£žä¹¦ token é“¾å·²é€€å½¹(2026-07-17):é£žä¹¦æŽˆæƒæ”¹ç”± xd-feishu æ„è¯†ç»
-  // OAuth broker è‡ªæŒã€‚è€ç™»å½•é“¾ç•™åœ¨ç£ç›˜çš„é£žä¹¦ refresh token ä¸€æ¬¡æ€§æ¸…æŽ‰
-  // (å‡­è¯å«ç”Ÿ:è¯¥ RT å·²æ— ä»»ä½•æ¶ˆè´¹æ–¹,ä¸ç•™æ­»å‡­è¯)ã€‚å¹‚ç­‰,å¤±è´¥ä»…å‘Šè­¦ã€‚
-  try {
-    fs.unlinkSync(path.join(app.getPath('userData'), 'safe-storage', 'feishu_refresh_token.enc'));
-    createLogger('feishu-legacy-cleanup').info(
-      'legacy feishu refresh token removed (host feishu token chain retired)',
-    );
-  } catch (err) {
-    // ENOENT = ä»Žæœªæœ‰è¿‡æˆ–å·²æ¸…,é™é»˜;å…¶å®ƒé”™è¯¯(Windows EPERM/EBUSY ç­‰)å‘Šè­¦,
-    // ä¸‹æ¬¡å¯åŠ¨é‡è¯•(best-effort,ä¸é˜»æ–­)ã€‚
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      createLogger('feishu-legacy-cleanup').warn(
-        'legacy feishu refresh token removal failed:',
-        err,
-      );
-    }
-  }
-  // IM channels (@cindy/im): å®Œå…¨ç‹¬ç«‹ workspace åŒ…ï¼Œè·Ÿéš app ç”Ÿå‘½å‘¨æœŸã€‚
-  // æ³¨å†Œ IPC handlers å¿…é¡»åœ¨ init ä¹‹å‰â€”â€”init å¤±è´¥æ—¶ emit çš„çŠ¶æ€äº‹ä»¶ä¾èµ– IPC bridge è½¬å‘ã€‚
-  // IPC handlers å¿…é¡»æ— æ¡ä»¶æ³¨å†Œ:ç”¨æˆ·åœ¨ Settings é¡µä¿å­˜å‡­è¯æ—¶, renderer èµ°è¿™äº›
-  // channel è·Ÿ main é€šä¿¡, è·Ÿç”¨æˆ·ç™»å½•æ€æ— å…³ã€‚
-  im.registerIpc();
-  // Telegram ä¸ªäºº bot è¡Œä¸º/äººæ ¼/ç¾¤å‚ä¸Žé…ç½®çš„ IPC(è®¾ç½®å¡æ•°æ®é¢),ä¸Ž im.registerIpc
-  // åŒæœŸæ— æ¡ä»¶æ³¨å†Œ;ä¸èƒ½æ”¾ host.ts æ¨¡å—é¡¶å±‚(mock electron çš„å•æµ‹æ”¶é›†æœŸä¼šç‚¸)ã€‚
-  registerTelegramBotConfigIpc();
-  // æŠŠ telegram transport æ³¨å…¥ device-link çš„è·¨è®¾å¤‡ä¸Šä¸‹çº¿æ‰§è¡Œå™¨ã€‚ç”¨æ³¨å…¥è€Œéž
-  // é™æ€ import: device-link ä¾§ç›´æŽ¥å¼• im/host ä¼šæŠŠæ•´ä¸ª IM å­ç³»ç»Ÿæ‹½è¿›å®ƒçš„ä¾èµ–é“¾
-  // (host.ts æ¨¡å—é¡¶å±‚å°±è°ƒ app.getPath / ipcMain.handle),è€Œ main è¿›ç¨‹åˆç¦æ­¢è¿è¡Œæ—¶
-  // åŠ¨æ€ import(æž¶æž„ä¸å˜å¼ Â§2)â€”â€”æ³¨å…¥æ˜¯å”¯ä¸€åˆè§„ä¸”ä¸ç ´åå•æµ‹æ”¶é›†çš„æŽ¥æ³•ã€‚
-  setTelegramRemoteSource(telegramIm);
-  // æŒ‚ä¸šåŠ¡ orchestrator: è®¢é˜… feishuIm.onMessage / .onCardActionã€‚orchestrator
-  // å¿…é¡»åœ¨ createWindow å‰æŒ‚å¥½,é¿å… renderer èµ·æ¥åŽç¬¬ä¸€æ³¢ IPC / event æ‰¾ä¸åˆ°
-  // handlerã€‚FeishuBot çš„ WS é•¿è¿žæŽ¥å¿…é¡»ç­‰å½“å‰ç”¨æˆ· localDb ready åŽå†å¯åŠ¨ã€‚
-  startImOrchestrators();
-  // Renderer â†’ main çš„ "åº”ç”¨çœŸæ­£å°±ç»ª" å…¼å®¹ä¿¡å·ã€‚LocalDbGate åœ¨
-  // localDb.ensureReady æˆåŠŸä¹‹åŽè°ƒä¸€æ¬¡ã€‚Hook ä¸Ž FeishuBot çš„æƒå¨å¯åŠ¨å·²ç”±
-  // localDb onReady æŽ’åˆ° provider readiness ä¹‹åŽï¼›è¿™é‡ŒåŒæ ·ç­‰å¾…å±éšœï¼Œå†ä¸ºæ—§æ—¶åº
-  // ä¸Žçž¬æ—¶å¤±è´¥ä¿ç•™å¹‚ç­‰é‡è¯•ã€‚
-  ipcMain.handle('app:ready-for-bot', async (event) => {
-    assertTrustedAppRendererEvent(event);
-    await waitForCurrentAccountProviderModelsReady();
-    startHookControlAccount();
-    startImConnection();
-    return { ok: true };
-  });
-  // å¼ºåˆ¶å¼•ç”¨é¿å… tree-shaking å¹²æŽ‰ feishuImï¼ˆimHost å·²é€šè¿‡ im é—´æŽ¥æŒæœ‰ï¼Œä½† main/im ä¹Ÿç›´æŽ¥ç”¨å®ƒï¼‰
-  void feishuIm;
-  // ç«¯ç‚¹æ¸…å•å·²å°±ç»ªã€IPC å·²æ³¨å†Œ,æ­¤åŽ second-instance / activate å…è®¸æŒ‰éœ€å»ºçª—ã€‚
-  // ä½¿ç”¨ç»Ÿè®¡(TapDB)çš„åŒæ„é—¸:å¿…é¡»åœ¨ createWindow **ä¹‹å‰**æ³¨å†Œã€‚renderer çš„
-  // tapdbClient ä¸€æŒ‚è½½å°± invoke analytics:settings-get æ¥å†³å®šæ˜¯å¦åˆå§‹åŒ– SDK,
-  // handler è¿˜æ²¡æ³¨å†Œçš„è¯é‚£æ¬¡ invoke ä¼š reject,è€Œå®ƒæ˜¯ fail closed çš„ â€”â€” å·²åŒæ„
-  // çš„ç”¨æˆ·ä¼šä¸€ç›´ä¸ä¸ŠæŠ¥,ç›´åˆ°æ‰‹åŠ¨åŽ»è®¾ç½®é‡Œæ‹¨ä¸€ä¸‹å¼€å…³ã€‚
-  initAnalyticsSettingsService();
-  // æ—¥å¿—ä¸ŠæŠ¥:åŒæ ·å¿…é¡»åœ¨ createWindow ä¹‹å‰æ³¨å†Œ â€”â€” è®¾ç½®é¡µä¸€æŒ‚è½½å°± invoke
-  // log-upload:settings-get å†³å®šå…¥å£å¯ç”¨æ€§;æ›´é‡è¦çš„æ˜¯å´©æºƒå³æ—¶è·¯å¾„è¦åœ¨
-  // onFatalShutdown ä¸Šå°±ä½,å¦åˆ™ createWindow ä¹‹åŽç«‹åˆ»å´©çš„é‚£ä¸€æ¬¡æ‹¿ä¸åˆ°æ ‡è®°ã€‚
-  initLogUploadService();
-  // Local profiles bypass authManager's cloud claim path. Await the same
-  // asynchronous PID provenance scan before the first BrowserWindow exists so
-  // sidebar's synchronous legacy migration reads can consume an exact proof.
-  if (getActiveAppSession().mode === 'local') {
-    await warmStaleProcessProvenance();
-  }
-  startupWindowCreationAllowed = true;
-  createWindow();
-  // The macOS release watcher stays disarmed until a task drag begins. Start
-  // its tiny helper after the first window exists so drag latency never pays
-  // a dev swiftc compile or process-spawn cost.
-  prewarmSessionDragReleaseHelper();
-  // é¢„çƒ­ä»…æœåŠ¡ dev macOSï¼Œå»¶è¿Ÿæ‰§è¡Œé¿å…å’Œå¯åŠ¨å…³é”®è·¯å¾„äº‰ç”¨ CPUï¼›å¤±è´¥ç”±å…¥å£å†…éƒ¨åžæŽ‰ã€‚
-  setTimeout(() => {
-    prewarmMacComputerPermissionGuideHelper();
-  }, 3_000);
-  initUpdateService();
-  // åœ¨çº¿äººæ•°å¿ƒè·³:App å¯åŠ¨å³ä¸ŠæŠ¥,å†…éƒ¨èµ° deviceId / userId å…œåº•,ç™»å½•å‰åŽéƒ½æ´»
-  initHeartbeatService();
-  // è®¾å¤‡äº’è”(è·¨è®¾å¤‡è¿œç¨‹æŽ§åˆ¶):ç™»å½•åŽè¿ž relay,ç™»å‡ºå³æ–­;å¼€å…³ä¸Žè®¾å¤‡åˆ—è¡¨ IPC ä¸€å¹¶æ³¨å†Œ
-  let updateRelaunchRemoteBusy = false;
-  initDeviceLinkService({
-    onUpdateRelaunchBusyChanged: (busy) => {
-      const transition = decideUpdateRelaunchBusyTransition(updateRelaunchRemoteBusy, busy);
-      updateRelaunchRemoteBusy = transition.nextBusy;
-      if (transition.shouldNotify) notifyUpdateAutoRelaunchBusyStateChanged();
-    },
-  });
-  // ä¸Šæ¬¡ç™»å‡ºæ—¶æ²¡åˆ å¹²å‡€çš„è¿œç¨‹ä¼šè¯é•œåƒç¼“å­˜(æ–‡ä»¶é” / æƒé™å ç”¨),å¼€æœºå†æ¸…ä¸€æ¬¡ã€‚
-  // ä¸é˜»å¡žå¯åŠ¨å…³é”®è·¯å¾„,å¤±è´¥ç•™åœ¨é˜Ÿåˆ—é‡Œç­‰ä¸‹ä¸€æ¬¡(è§ mirrorCachePurgeQueue)ã€‚
-  // ä½†**ç¼“å­˜è¯»**è¦ç­‰å®ƒè½å®š:å¦åˆ™ renderer çš„ hydrate å¯èƒ½è¯»åˆ°æ­£åœ¨è¢«åˆ çš„é‚£ä»½æ˜Žæ–‡,
-  // è€Œ drain å®Œæˆä¹Ÿæ”¶ä¸å›žå·²ç»ç”»åˆ°å±ä¸Šçš„è¡Œ(review: codex P1)ã€‚
-  // é¡ºåºæœ‰è®²ç©¶:drain ä¸Ž gate å¿…é¡»æŽ’åœ¨ registerDeviceLinkIpc() **ä¹‹å‰** â€”â€” handler ä¸€æ³¨å†Œ
-  // renderer å°±å¯èƒ½å‘èµ·ç¼“å­˜è¯»,è€Œ gate é»˜è®¤æ˜¯"å·²æ”¾è¡Œ"(review: copilot)ã€‚
-  const startupPurgeDrain = drainPurgeQueue();
-  setMirrorCacheReadGate(startupPurgeDrain);
-  // Stable module-neutral faÃ§ade. Feature providers were registered with their
-  // owning modules above; future collections/actions do not add tunnel channels.
-  registerRemoteResourcesIpc();
-  registerDeviceLinkIpc();
-  registerFilePeerIpc();
-  registerRemoteDesktopIpc(isGlobalVoiceInputOverlaySender);
-  void startupPurgeDrain
-    .then(({ purged, pending }) => {
-      if (purged > 0 || pending > 0) {
-        createLogger('device-link:mirror-cache-purge').info(
-          `startup purge drain: purged=${purged} pending=${pending}`,
-        );
-      }
-    })
-    .catch(() => undefined);
-  // æ³¨:invoke-capture è‡ªæ£€(assertCaptureHealthy)ä¸åœ¨è¿™é‡Œâ€”â€”maker:create-session / maker:send
-  // ç”± splash åŽçš„ registerMakerIpcsAfterSplash å»¶è¿Ÿæ³¨å†Œ,æ­¤åˆ»å°šæœªæ³¨å†Œã€‚è‡ªæ£€å·²æŒªåˆ°è¯¥å‡½æ•°æœ«å°¾
-  // (è§ä¸Šæ–¹),é‚£é‡Œæ‰€æœ‰ sentinel éƒ½å·²å°±ä½,ç»“æžœæ‰å‡†ç¡®ã€‚
-
-  // ç¡é†’ç™½å±å–è¯:suspend/resume/lock/unlock å…¨éƒ¨è½æ—¥å¿—,ç»™ renderer ä¾§
-  // render-watchdog çš„æ¼‚ç§»/æ— å¸§æ—¥å¿—æä¾›æ—¶é—´é”šç‚¹ã€‚
-  installPowerEventDiagnostics({ powerMonitor });
-
-  // æŒ‚èµ·/é”å±æ—¶é€šçŸ¥ renderer é‡Šæ”¾è¯­éŸ³è¾“å…¥çš„ä¿æ´»éº¦å…‹é£Ž(ç”¨æˆ·å·²ç¦»å¼€,å†å ç€é‡‡é›†
-  // è®¾å¤‡åªå‰©éšç§æŒ‡ç¤ºç¯å¸¸äº®å’Œ idle-sleep assertion çš„ä»£ä»·)ã€‚
-  installVoiceInputPowerRelease({
-    powerMonitor,
-    releaseActiveShortcut: releaseActiveGlobalVoiceInputShortcut,
-    broadcast: (channel, payload) => {
-      broadcastVoiceInputPowerState(
-        BrowserWindow.getAllWindows(),
-        channel,
-        payload,
-        voicePowerBroadcastLog,
-      );
-    },
-  });
-
-  // â”€â”€ System resume: refresh tokens after sleep/hibernate â”€â”€
-  powerMonitor.on('resume', () => {
-    authCredentialRecovery.request();
-    authManager.handleResume();
-    handleProviderModelSystemResume();
-    syncPluginMarketForActiveOwner(30_000);
-    // device-link:ç¡é†’ç«‹å³é‡è¿ž relay,ä¸å¹²ç­‰é€€é¿è®¡æ—¶å™¨ + å¿ƒè·³åˆ¤æ­»(æœ€ååˆè®¡ ~75s)ã€‚
-    handleDeviceLinkSystemResume();
-  });
-  powerMonitor.on('unlock-screen', handleProviderModelScreenUnlock);
-  powerMonitor.on('lock-screen', authCredentialRecovery.onScreenLock);
-  powerMonitor.on('unlock-screen', authCredentialRecovery.onScreenUnlock);
-  onQuit(
-    'auth-credential-recovery',
-    () => {
-      authCredentialRecovery.dispose();
-      powerMonitor.removeListener('lock-screen', authCredentialRecovery.onScreenLock);
-      powerMonitor.removeListener('unlock-screen', authCredentialRecovery.onScreenUnlock);
-    },
-    'sync',
-  );
-  authCredentialRecovery.request();
-
-  // Memory diagnostics â€” dev only, log per-process memory every 30s
-  if (!app.isPackaged) {
-    setInterval(() => {
-      const parts = app
-        .getAppMetrics()
-        .map(
-          (m) =>
-            `${m.type}:${(m.memory.workingSetSize / 1024).toFixed(0)}MB/${m.cpu.percentCPUUsage.toFixed(1)}%`,
-        );
-      console.log(`[mem] ${parts.join(' | ')}`);
-    }, 30_000);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// é€€å‡º / å´©æºƒç»Ÿä¸€ç¼–æŽ’ â€”â€” æ‰€æœ‰æ¸…ç†é€»è¾‘é€šè¿‡ onQuit() æ³¨å†Œåˆ° lifecycle æ¨¡å—çš„
-// å•ä¸€ disposer registry, ç”± installQuitHandler() æŠŠä»¥ä¸‹å…¥å£éƒ½æŽ¥åˆ°åŒä¸€æ¡ chain:
-//
-//   - app.on('before-quit')          â€”â€” ç”¨æˆ·/ä»£ç ä¸»åŠ¨é€€å‡º
-//   - process.on('SIGINT'/'SIGTERM') â€”â€” Ctrl+C / kill PID (dev ç»ˆç«¯å¿…è£…)
-//   - process.on('uncaughtException')â€”â€” main è¿›ç¨‹æœªæ•èŽ·å¼‚å¸¸
-//   - app.on('render-process-gone')  â€”â€” renderer å´© (main è¿˜æ´»)
-//
-// ä¸‰ä¸ªé˜¶æ®µä¸²æˆ sync â†’ async(å¹¶å‘+16s è¶…æ—¶, è§ä¸‹æ–¹ installQuitHandler) â†’ post-async,
-// ç„¶åŽ app.exit(<code>)ã€‚
-// æ•£è½çš„ fire-and-forget å·²ç»æ”¶æŽ‰, è¿›ç¨‹ä¸ä¼šåœ¨ disposer è·‘å®Œä¹‹å‰æ­»ã€‚
-// çœŸç¡¬å´© (segfault / kill -9) JS å±‚æ— èƒ½ä¸ºåŠ›, å­è¿›ç¨‹é  stdin EOF è‡ªæ­»ã€‚
-// ---------------------------------------------------------------------------
-
-// Sync é˜¶æ®µ: åŒæ­¥è§¦å‘, ä¸ç­‰ç»“æžœã€‚åªæ”¾çœŸæ­£åŒæ­¥çš„æ¸…ç† (é‡Šæ”¾æœ¬åœ°å¥æŸ„ / å–æ¶ˆå®šæ—¶å™¨)ã€‚
-//   - reap-claude-children: å¿…é¡»åœ¨ shutdown-maker ä¹‹å‰åŒæ­¥å®Œæˆï¼›SDK abort æŽæŽ‰
-//     claude.exe åŽ Windows ä¸Šå­è¿›ç¨‹ä¼šè¢« reparent åˆ° System, PPID é“¾æ–­äº†å°±æ— æ³•å®‰å…¨è¯†åˆ«ã€‚
-//   - authManager / google auth: åŒæ­¥é‡Šæ”¾å®šæ—¶å™¨+å›žè°ƒå¼•ç”¨ã€‚
-//     æ³¨æ„ token.dispose() åªæ¸…å†…å­˜çŠ¶æ€, ä¸åˆ ç›˜ä¸Šçš„ refresh token (é‚£æ˜¯ logout å¹²çš„)ã€‚
-// interrupted-turn-resume:é€€å‡ºç¼–æŽ’ä¸€å¯åŠ¨å°±å†»ç»“ã€Œturn åœ¨é£žã€æ ‡è®°çš„å†™å…¥ â€”â€” å¦åˆ™
-// ä¸‹æ–¹ shutdown-maker å…³ session è§¦å‘çš„ markSessionTurnEnded ä¼šæŠŠ"é€€å‡ºæ—¶è¿˜åœ¨é£ž
-// çš„ turn"ä¼ªè£…æˆæ­£å¸¸æ”¶å°¾,é‡å¯åŽä¸­æ–­å¡ä¸å‡ºçŽ°(åªå‰©ç¡¬å´©æºƒèƒ½è§¦å‘)ã€‚sync é˜¶æ®µå…ˆäºŽ
-// async çš„ shutdown-maker,é¡ºåºæœ‰ä¿è¯ã€‚
-onQuit(
-  'plugin-market-periodic-sync',
-  () => {
-    if (pluginMarketPeriodicSyncTimer) clearInterval(pluginMarketPeriodicSyncTimer);
-    pluginMarketPeriodicSyncTimer = null;
-  },
-  'sync',
-);
-onQuit(
-  'session-active-turn-freeze',
-  () => {
-    freezeSessionActiveTurnMarkers();
-  },
-  'sync',
-);
-onQuit(
-  'reap-claude-children',
-  () => {
-    reapClaudeOrphansSync();
-  },
-  'sync',
-);
-onQuit('auth-manager', () => authManager.dispose(), 'sync');
-onQuit('windows-process-scan-workers', disposeWindowsProcessScanWorkers, 'sync');
-onQuit('resource-usage-window', () => resourceUsageWindowController.dispose(), 'sync');
-onQuit('rsb-window', () => rsbWindowController.dispose(), 'sync');
-onQuit('ghost-panel-windows', () => ghostPanelWindowsController.dispose(), 'sync');
-onQuit('app-badge-clear', () => clearAllSessionAttention(), 'sync');
-onQuit('session-drag-preview', () => disposeSessionDragPreview(), 'sync');
-onQuit('input-devices', () => disposeInputDevices(), 'async');
-// è‡ªå¸¦ adb çš„å¸¸é©» server å®ˆæŠ¤è¿›ç¨‹éšé€€å‡ºæ”¶æŽ‰(fire-and-forget detached spawn,
-// ä¸é˜»å¡ž)ã€‚ä¸æ”¶ä¼šä¸€ç›´é”å®‰è£…ç›®å½•é‡Œçš„ adb.exe,å¼„æŒ‚å¢žé‡æ›´æ–°(os error 32)ã€‚
-onQuit('android-adb-kill-server', () => disposeAndroidAdb(), 'sync');
-onQuit(
-  'skillhub-auto-sync-listener',
-  () => {
-    disposeSkillhubAutoSyncAuthListener?.();
-    disposeSkillhubAutoSyncAuthListener = null;
-  },
-  'sync',
-);
-onQuit(
-  'provider-access-auth-listener',
-  () => {
-    disposeProviderAccessAuthListener?.();
-    disposeProviderAccessAuthListener = null;
-  },
-  'sync',
-);
-// Async é˜¶æ®µ: å¹¶å‘è·‘, 6s è¶…æ—¶å…œåº•ã€‚
-//   - shutdown-maker:       å¹¶å‘ detach sessions ä¸Ž dispose agentsï¼Œç­‰å¾…è¿›ç¨‹é€€å‡ºã€‚
-//                           fire-and-forget ä¼šè®© app.exit æŠ¢å…ˆç»“æŸ Nodeã€‚
-//   - im.dispose:           wsClient.stop() å†…éƒ¨å…ˆå‘ announce offline (quit path waits 4.5s)
-//                           å† close WSã€‚**æ•´ä¸ªæ”¹é€ çš„æ ¸å¿ƒç›®æ ‡â€”â€”å¿…é¡» awaitã€‚**
-//   - Codex çŽ¯å¢ƒã€proxy å’Œ DB åœ¨ post-async æ”¶å°¾ï¼Œæ­£å¸¸é€€å‡ºæ—¶ä¿ç•™åˆ° Maker å®Œæˆã€‚
-// (clean-exit-snapshot å·²ç§»é™¤ â€” é€€å‡ºæ—¶ä¸å†åš db.backup, å®¹ç¾æ”¹ç”± SQLite WAL crash
-//  recovery å…œåº•, è¯¦è§ localDb/index.ts æ–‡ä»¶å¤´ ADR-FE7 ä¿®è®¢è¯´æ˜Žã€‚)
-/**
- * Launch fence raised by the quit sweep, held across the whole async phase.
- *
- * Released by the post-async final sweep, not by the disposer that raises it:
- * `pi-subagent-runners` and `shutdown-maker` run concurrently, so when the first
- * sweep returns the parent Pi processes may still be alive. Dropping the fence
- * there re-opened durable launches for the rest of the quit, and anything that
- * appeared then had no later sweep to collect it.
- */
-let releaseQuitLaunchFence: (() => Promise<void>) | null = null;
-
-/**
- * Did the quit fence actually go up?
- *
- * Separate from `releaseQuitLaunchFence`, which is also null once the fence has
- * been *lowered*. The final sweep has to tell "never raised" from "raised and
- * released", because its own log used to claim it was holding a fence that had
- * never existed â€” and because "never raised" is the one state that needs a
- * retry and a fallback.
- */
-let quitLaunchFenceRaised = false;
-
-/**
- * How long the final sweep keeps re-scanning when it has no fence and the
- * parent is not provably down.
- *
- * Sized against this phase's 6s per-disposer race, after the ~2.5s the first
- * pass may take: three ~1s rounds fit with headroom. Each round is deliberately
- * tighter than the single conclusive pass â€” the point is to keep narrowing the
- * window in which a surviving parent could publish, not to wait out any one
- * runner.
- */
-const FENCELESS_QUIT_RESWEEP_BUDGET_MS = 2_500;
-const FENCELESS_QUIT_RESWEEP_INTERVAL_MS = 400;
-
-/**
- * Did `shutdownMaker()` run all the way through?
- *
- * Only fulfilment counts, and the distinction is not pedantic: `shutdownMaker`
- * awaits `waitForTurnChangeSetActions()` *before* it ever reaches
- * `maker.shutdown({ reason: 'app-quit' })`, so a rejection can mean the Maker
- * was never shut down at all and every parent Pi process is still running. On
- * fulfilment that await completed, and `Maker.shutdown` in turn awaited every
- * `Session.detach` â€” which for PI ends in `await proc.close()`. That is the
- * proof the quit fence needs before it can be lowered.
- *
- * Residual, stated plainly: `shutdownMaker` swallows an error thrown *by*
- * `maker.shutdown`, and `Maker.shutdown` collects per-session detach failures
- * rather than throwing. So fulfilment does not prove every single Pi process
- * exited â€” only that each was awaited and its failure logged. Those stragglers
- * are what the final sweep is for, and what its error branch reports.
- */
-let makerShutdownSettled = false;
-
-onQuit(
-  'pi-subagent-runners',
-  async () => {
-    const agentHome = path.join(app.getPath('userData'), 'pi-agent-home');
-    // Close the door before scanning, exactly as the update relaunch does.
-    //
-    // This disposer and `shutdown-maker` are both `async`, so they run
-    // concurrently: a parent Pi process can still be alive here and can enter
-    // `launchDurableRun` while this sweep is walking an empty directory. The
-    // sweep would finish clean, the launcher would publish its run directory a
-    // moment later, and that detached runner would outlive the quit holding the
-    // credentials it inherited.
-    //
-    // The mutual exclusion is the same ordering argument as the relaunch, and
-    // needs no serialisation with `shutdown-maker`:
-    //
-    //   quit:     write fence  ->  scan
-    //   launcher: write runDir ->  read fence
-    //
-    // Opposite orders, so if the launcher reads no fence its run directory was
-    // already published and every scan here sees it (waited on, then escalated
-    // to a verified kill); if it reads the fence it refuses and rolls back.
-    try {
-      releaseQuitLaunchFence = await acquirePiSubagentLaunchFence(agentHome);
-      quitLaunchFenceRaised = true;
-    } catch (err) {
-      // Not a reason to hold up the quit, and usually transient I/O: the final
-      // sweep retries before it scans, so the fenceless window is confined to
-      // this phase rather than lasting the whole quit.
-      piSubagentLog.warn('could not raise the Subagent launch fence before the quit sweep:', err);
-    }
-    {
-      // Budget arithmetic against the 6s async phase: 2.5s waiting for the stop
-      // mailbox, then at most 3s of escalation. The reclaims run concurrently and
-      // their identity probe is async, so that 3s is a ceiling for the whole set
-      // rather than a per-runner cost â€” the old serial shape multiplied ~0.8s of
-      // exit confirmation by the number of runners and could overrun the phase on
-      // its own. 2.5 + 3 leaves half a second of headroom; anything still
-      // unconfirmed when the budget expires is reported as unreclaimed, which is
-      // why the failure log below has to stay true.
-      const stopped = await stopAllPiSubagentRunsForExit(agentHome, 2_500, {
-        killBudgetMs: 3_000,
-        // Only our own children (plus unattributable / dead-owner orphans). A
-        // concurrent instance sharing this agent home keeps running.
-        hostPid: process.pid,
-        // Quit is the same credential problem as an account boundary: this
-        // process is about to disappear, and a runner that never consumed its
-        // mailbox keeps spending the BYOM credentials it inherited and keeps
-        // editing the workspace with nobody left to supervise it. Escalate to the
-        // identity-verified kill instead of logging and exiting.
-        killUnresponsiveRunners: true,
-      });
-      if (!stopped) {
-        piSubagentLog.error(
-          'PI Subagent runners survived stop and identity-verified kill on quit â€” ' +
-            'runners this app could not confirm as stopped are still running with their ' +
-            'inherited credentials',
-        );
-      }
-    }
-    // Deliberately no release here: the fence stays up until the post-async
-    // final sweep below, which is the first moment `shutdown-maker` is known to
-    // have finished.
-  },
-  'async',
-);
-onQuit(
-  'shutdown-maker',
-  async () => {
-    // Not try/finally: a rejection here can predate `maker.shutdown` entirely
-    // (see `makerShutdownSettled`), so it must not read as "the parent is down".
-    const { piSessionFailures } = await shutdownMaker();
-    // Fulfilment alone was never quite the proof this claims to be: shutdown
-    // collects per-session detach failures instead of throwing, so a PI session
-    // could have been left with a live process. Now that it reports them, a
-    // failure means the parent is *not* confirmed down and the fence stays up.
-    if (piSessionFailures > 0) {
-      piSubagentLog.error(
-        `${piSessionFailures} PI session(s) failed to detach during quit â€” holding the ` +
-          'launch fence, since a surviving parent could still start a durable runner',
-      );
-      return;
-    }
-    makerShutdownSettled = true;
-  },
-  'async',
-);
-onQuit('review-artifact-snapshots', cleanupActiveReviewArtifactSnapshots, 'async');
-// LSP ä¸å ç”¨ Agent æ­£å¸¸ä¿å­˜å’Œé€€å‡ºçš„æ—¶é—´çª—å£ã€‚
-onQuit('lsp-pool', shutdownLspServerPool, 'async');
-onQuit('orca-idle-watcher', () => stopOrcaIdleWatcher(), 'sync');
-onQuit('im', () => stopImConnection('quit'), 'async');
-// è½® 27 MEDIUM-3:pi-env æŒªåˆ° post-async â€”â€” è‹¥ä¸Ž shutdown-maker åŒ async å¹¶å‘,
-// bridge å¯èƒ½åœ¨ session close çš„ disposeSessionRegistrations(unregisterSessionCtx/
-// Token)ä¹‹å‰å…³é—­, äº§ç”Ÿã€Œpi dispose session registration failed (non-fatal)ã€
-// æ—¥å¿—å™ªå£°ã€‚post-async ä¸²è¡Œåœ¨ shutdown-maker(async)ä¹‹åŽæ‰§è¡Œ, ä¸”æ³¨å†Œé¡ºåºåœ¨
-// remote-ssh-pool ä¹‹å‰(ä¸¤è€…åŒ post-async, æŒ‰æ³¨å†Œåºæ‰§è¡Œ â€”â€” bridge å…ˆäºŽ pool å…³)ã€‚
-/**
- * Conclusive second pass, after the async phase.
- *
- * `runQuitDisposers` only enters post-async once the async phase settled (or hit
- * its budget), so by here `shutdown-maker` has finished and, with it, every
- * `Session.detach` â€” which for PI is `handle.close()` ending in `await
- * proc.close()`. No Pi process remains that could start a durable run, so this
- * pass is conclusive in the ordinary case, and it collects exactly what the
- * first sweep could not see: a run whose directory was published after that
- * sweep had already scanned.
- *
- * That conclusiveness belongs to one branch only, and the release below is
- * gated on it. If the async phase *timed out* instead, `shutdown-maker` may
- * still be in flight and a Pi process may still be alive; this sweep still runs
- * (a best-effort reclaim is worth having) but it proves nothing, so the fence is
- * *not* lowered. In that branch the guarantee is the fence itself standing until
- * the process exits â€” a launcher either refuses, or had already published its
- * run directory before the fence went up, in which case the scan below sees
- * it â€” with the next instance's stale sweep removing the leftover file.
- *
- * Registered ahead of `pi-env` and far ahead of `remote-ssh-pool`: it needs only
- * the local filesystem and local signals, and post-async is serial, so going
- * first keeps its budget clear of a disposer that times out. The pool teardown
- * must stay last, for the reason documented at its own registration.
- *
- * Budget: 1s waiting for the stop mailbox plus a 1.5s ceiling on the escalation
- * â€” ~2.5s against this phase's 6s per-disposer race. Most runners are already
- * gone by now; what is left is the narrow window this pass exists to close.
- */
-onQuit(
-  'pi-subagent-final-sweep',
-  async () => {
-    const agentHome = path.join(app.getPath('userData'), 'pi-agent-home');
-    try {
-      // Retry the fence before scanning, not after. The first attempt runs in
-      // the async phase where a transient I/O failure is likely and nothing is
-      // retried; raising it here restores the ordering the whole argument rests
-      // on â€” fence, then scan â€” and confines the fenceless window to that
-      // earlier phase instead of the rest of the quit.
-      if (!quitLaunchFenceRaised) {
-        try {
-          releaseQuitLaunchFence = await acquirePiSubagentLaunchFence(agentHome);
-          quitLaunchFenceRaised = true;
-        } catch (err) {
-          piSubagentLog.warn(
-            'could not raise the Subagent launch fence before the final quit sweep either:',
-            err,
-          );
-        }
-      }
-      const stopped = await stopAllPiSubagentRunsForExit(agentHome, 1_000, {
-        killBudgetMs: 1_500,
-        hostPid: process.pid,
-        killUnresponsiveRunners: true,
-      });
-      if (!stopped) {
-        piSubagentLog.error(
-          'PI Subagent runners appeared after the first quit sweep and could not be ' +
-            'confirmed stopped â€” they are still running with their inherited credentials',
-        );
-      }
-      // No fence and no proof the parent is down: this pass is not conclusive,
-      // and nothing runs after it. Keep re-scanning while the parent might still
-      // be publishing, so the window a survivor has to slip a run through is the
-      // gap between two scans rather than "everything after the last one".
-      // `shutdown-maker` may simply be slow â€” every round is another chance for
-      // it to finish, and the loop ends the moment it does.
-      if (!quitLaunchFenceRaised && !makerShutdownSettled) {
-        const deadline = Date.now() + FENCELESS_QUIT_RESWEEP_BUDGET_MS;
-        while (!makerShutdownSettled && Date.now() < deadline) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, FENCELESS_QUIT_RESWEEP_INTERVAL_MS).unref?.();
-          });
-          if (makerShutdownSettled) break;
-          // Tighter per-round budgets than the pass above: this is about
-          // repetition, not about waiting any single runner out.
-          await stopAllPiSubagentRunsForExit(agentHome, 300, {
-            killBudgetMs: 700,
-            hostPid: process.pid,
-            killUnresponsiveRunners: true,
-          }).catch(() => false);
-        }
-      }
-    } catch (err) {
-      piSubagentLog.error('final PI Subagent quit sweep failed:', err);
-    } finally {
-      // Lowering the fence is only safe once the parent is provably down. Read
-      // here rather than at the top of this disposer: the async phase may have
-      // been cut off by its budget while `shutdown-maker` kept running, and the
-      // sweep above just gave it more time to finish.
-      if (makerShutdownSettled) {
-        // Leaving it standing would only matter if this process somehow
-        // survived the quit, and then it would refuse this instance's own
-        // durable launches for the rest of its life. A hard-killed process
-        // cannot reach this line; that leftover is collected by the next
-        // instance's stale sweep, which the recorded start identity makes safe
-        // even when the pid is recycled onto it.
-        const release = releaseQuitLaunchFence;
-        releaseQuitLaunchFence = null;
-        await release?.().catch(() => undefined);
-      } else if (quitLaunchFenceRaised) {
-        // The async phase timed out with `shutdown-maker` still in flight, or
-        // it threw before the Maker was shut down. Either way a hung parent Pi
-        // may still be alive, and nothing runs after this to collect what it
-        // could still launch â€” so the fence stays up until the process exits,
-        // and the next instance's stale sweep removes the file.
-        piSubagentLog.error(
-          'parent shutdown was not confirmed complete on quit â€” holding the PI Subagent ' +
-            'launch fence until this process exits so a still-live parent cannot start ' +
-            'a durable runner nothing is left to reclaim',
-        );
-      } else {
-        // Neither guarantee is available: the fence could not be raised on
-        // either attempt, and the parent was never confirmed down. Saying we
-        // are "holding the fence" here â€” which this branch used to â€” described
-        // a door that was never shut. The repeated scans above are the only
-        // thing narrowing the window; state the exposure instead of implying it
-        // is closed.
-        piSubagentLog.error(
-          'quit ended with no PI Subagent launch fence and no proof the parent is down â€” ' +
-            'a surviving parent could still publish a durable runner after the last scan, ' +
-            'and it would keep running with the credentials it inherited',
-        );
-      }
-    }
-  },
-  'post-async',
-);
-onQuit('pi-env', () => shutdownPiEnvironment(), 'post-async');
-// æ­£å¸¸é€€å‡ºæ—¶ä¿ç•™åˆ° Agent å’Œ Session æ”¶å°¾å®Œæˆï¼›async è¶…æ—¶åŽä»æŒ‰é€€å‡ºé¢„ç®—å°½åŠ›æ¸…ç†ã€‚
-onQuit('codex-env', () => shutdownCodexEnvironment(), 'post-async');
-onQuit('codex-proxy', () => disposeCodexProxy(), 'post-async');
-// embedding-host: abort è¯­ä¹‰ â€”â€” ç«‹åˆ»è®©å‡º SQLite å†™è¿žæŽ¥, ä¸ç­‰å½“å‰ tick (é‚£æ‰¹ job ä¿æŒ
-// pending ä¸‹æ¬¡ç»­è·‘, å†™äº‹åŠ¡åŒæ­¥åŽŸå­æ— ä¸­æ–­)ã€‚
-onQuit('embedding-host', () => stopEmbeddingHost(), 'async');
-// Anthropic-compat loopback proxy: ç«‹å³ destroy æ‰€æœ‰ in-flight socket + ç­‰ server.close
-// å›žè°ƒ(~10ms çº§åˆ«)ã€‚è·Ÿ shutdown-maker åŒåœ¨ async é˜¶æ®µå¹¶å‘è·‘ â€” æœ€åæƒ…å†µæ˜¯ proxy å…ˆå…³ã€
-// Claude CLI å­è¿›ç¨‹æ”¶åˆ° ECONNRESET, ä½† session æœ¬æ¥å°±åœ¨ close è·¯å¾„ä¸Š, è¿™ç§ error ç›´æŽ¥
-// è¢«åž, å½±å“å¯æŽ¥å—ã€‚
-onQuit('anthropic-compat-proxy', () => disposeAnthropicCompatProxy(), 'async');
-// browser-runtime: stop the managed Chrome so it doesn't outlive the app (headed
-// browser + locked user-data-dir would otherwise survive quit and force a stale
-// SingletonLock recovery next launch). `stop` is idempotent / no-op if never started.
-onQuit('browser-runtime', () => disposeBrowserRuntime(), 'async');
-// Remote file-service clients: å…ˆäºŽ pool å…³é—­, æŒ‚æ–­è¿œç«¯ daemon çš„ exec channelã€‚
-onQuit('remote-file-browser', () => disposeRemoteFileBrowser(), 'async');
-onQuit('html-previews', disposeHtmlPreviews, 'async');
-// Remote SSH pool: ä¸»åŠ¨æ–­å¼€æ‰€æœ‰æ´»åŠ¨è¿žæŽ¥, é˜²æ­¢ ssh2 å­å¥æŸ„é˜»å¡ž Node è¿›ç¨‹é€€å‡ºã€‚
-// post-async(éž async):shutdown-maker åœ¨ async é˜¶æ®µå…³ sessions æ—¶, PiAgent.close()
-// ä¼šç» pi-manager RPC å‘ kill æ€è¿œç«¯ daemon â€”â€” è‹¥ pool åœ¨ async å¹¶å‘å…ˆ
-// æ–­å¼€ SSH, kill å¤±è´¥, daemon + env-file(å«å‡­è¯)æ®‹ç•™ 30 åˆ†é’Ÿ(R6 å®¡è®¡ M-8/M-11)ã€‚
-// æŒªåˆ° post-async ä¸²è¡Œ, ä¿è¯ session çº§ kill å…ˆå®Œæˆ, pool æœ€åŽæ”¶å°¾ã€‚
-onQuit('remote-ssh-pool', () => disposeRemoteSshPool(), 'post-async');
-// WDA deleteSession may consume longer than the shared async quit budget. Kill
-// detached WDA/Sidecar process groups synchronously before that budget starts;
-// the lightweight seam is a no-op when Simulator was never initialized.
-onQuit('ios-simulator-exit-abort', abortIOSSimulatorOperationsForExit, 'sync');
-// Hook è¿žæŽ¥: åœæŽ‰å…¨éƒ¨ WS transport(å«é‡è¿ž timer), é˜²å¥æŸ„é˜»å¡žé€€å‡ºã€‚
-onQuit('hook-control', () => disposeHookControl(), 'sync');
-// session-git-pr-context: å–æ¶ˆ .git HEAD çš„ parcel watcher è®¢é˜…, é˜²åŽŸç”Ÿå¥æŸ„é˜»å¡žé€€å‡ºã€‚
-onQuit('git-context', () => disposeGitContext(), 'async');
-onQuit('ios-simulator-host', disposeIOSSimulatorHost, 'async');
-onQuit('ios-simulator-ownership-registry', flushIOSSimulatorOwnershipRegistry, 'async');
-
-// Post-async é˜¶æ®µ: ä¸²è¡Œè·‘, ç¡®ä¿ä¾èµ– async é˜¶æ®µäº§ç‰©çš„æ¸…ç† (WAL checkpoint by close)ã€‚
-onQuit('db-client', () => lifecycleDbClientManager.dispose('quit'), 'post-async');
-onQuit('local-db-close', () => localDbCloseDb(), 'post-async');
-
-// A display restore may join an in-flight native mode write (5s), restore the
-// original mode (5s), then await Electron geometry (5s). Keep a margin before
-// the existing 20s hard-exit watchdog; completed disposers never wait this long.
-installQuitHandler(16000);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
-
-app.on('activate', () => {
-  // macOS Dock clicks should restore/create the primary app window, not reason
-  // about every BrowserWindow in the process. Global voice input keeps a hidden
-  // cached overlay window alive after first use; using getAllWindows().length
-  // here made Dock activation a no-op when the main window was closed but the
-  // overlay still existed.
-  //
-  // Do not focus the main window while the global voice overlay is visible.
-  // Clicking overlay controls also activates the Electron app on macOS; treating
-  // that activation like a Dock click makes the main window pop over the
-  // user's target app right after they click "Copy" in the failure fallback.
-  if (isGlobalVoiceInputOverlayVisible()) return;
-  // focusMainWindow() åœ¨ hide-on-close æ¨¡å¼ä¸‹å¤©ç„¶æŠŠè—èµ·æ¥çš„çª—å£ show å›žæ¥,
-  // renderer ä¸é‡è½½;è¿”å›ž false è¡¨ç¤ºä¸»çª—å£çœŸæ²¡äº†(å¼‚å¸¸æˆ–é¦–æ¬¡å¯åŠ¨),æ‰ createWindowã€‚
-  // ç«¯ç‚¹æ¸…å•é˜»æ–­æœŸé—´ç¦æ­¢å»ºçª—(åŒ second-instance,é˜²ç»•è¿‡é˜»æ–­é—¨ + preload ç™½å±)ã€‚
-  if (startupWindowCreationAllowed && !focusMainWindow()) {
-    createWindow();
-  }
-});
-
-function memorySettingsWire() {
-  const state = readMemorySettingsState();
-  return {
-    ...state.value,
-    isCustomized: state.isCustomized,
-    customizedKeys: state.customizedKeys,
-    defaults: state.defaults,
-  };
-}
-
-function imDefaultSettingsWire(channel?: ImDefaultSettingsChannel) {
-  const state = readImDefaultSettingsState(channel);
-  return {
-    ...state.value,
-    isCustomized: state.isCustomized,
-    customizedKeys: state.customizedKeys,
-    defaults: state.defaults,
-  };
-}
-
-function parseImDefaultSettingsChannel(raw: unknown): ImDefaultSettingsChannel | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (!isImDefaultSettingsChannel(raw)) {
-    throwIpcError('INVALID_PARAMS', 'im default settings channel invalid');
-  }
-  return raw;
-}
-
-function subagentModelSettingsWire() {
-  const state = readSubagentModelSettingsState();
-  return {
-    ...state.value,
-    isCustomized: state.isCustomized,
-    customizedKeys: state.customizedKeys,
-    defaults: state.defaults,
-  };
-}
-
-function visionBridgeSettingsWire() {
-  const state = readVisionBridgeSettingsState();
-  return {
-    ...state.value,
-    isCustomized: state.isCustomized,
-    customizedKeys: state.customizedKeys,
-    defaults: state.defaults,
-  };
-}
-
-/** è§£æžè§†è§‰æ¡¥è®¾ç½® patchï¼ˆç™½åå•é”®ï¼Œé€å­—æ®µæ ¡éªŒï¼›éžæ³•æŠ› INVALID_PARAMSï¼‰ã€‚ */
-function parseVisionBridgeSettingsPatch(raw: unknown): Partial<VisionBridgeSettings> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throwIpcError('INVALID_PARAMS', 'vision bridge settings patch required (object)');
-  }
-  const input = raw as Record<string, unknown>;
-  const patch: Partial<VisionBridgeSettings> = {};
-  if ('enabled' in input) {
-    if (typeof input.enabled !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'vision bridge enabled must be boolean');
-    }
-    patch.enabled = input.enabled;
-  }
-  if ('targetModels' in input) {
-    if (!Array.isArray(input.targetModels)) {
-      throwIpcError('INVALID_PARAMS', 'vision bridge targetModels must be a string array');
-    }
-    // trim åŽæ‹’ç»ç©ºç™½å…ƒç´ ï¼Œé¿å…è„å€¼ï¼ˆ" deepseek " / "  "ï¼‰è½ç›˜ã€‚
-    const trimmed = input.targetModels.map((m) => (typeof m === 'string' ? m.trim() : ''));
-    if (trimmed.some((m) => m.length === 0)) {
-      throwIpcError(
-        'INVALID_PARAMS',
-        'vision bridge targetModels must be a non-blank string array',
-      );
-    }
-    patch.targetModels = trimmed;
-  }
-  for (const key of ['primary', 'fallback'] as const) {
-    if (!(key in input)) continue;
-    const value = input[key];
-    if (value === null) {
-      patch[key] = null;
-      continue;
-    }
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throwIpcError(
-        'INVALID_PARAMS',
-        `vision bridge ${key} must be { providerId, modelId } or null`,
-      );
-    }
-    const ref = value as Record<string, unknown>;
-    if (typeof ref.providerId !== 'string' || typeof ref.modelId !== 'string') {
-      throwIpcError(
-        'INVALID_PARAMS',
-        `vision bridge ${key} must be { providerId, modelId } or null`,
-      );
-    }
-    // trim åŽæ‹’ç»çº¯ç©ºç™½ï¼Œé¿å…è„é…ç½®ï¼ˆç©ºç™½ä¸²ï¼‰è½ç›˜ã€‚
-    const providerId = ref.providerId.trim();
-    const modelId = ref.modelId.trim();
-    if (providerId.length === 0 || modelId.length === 0) {
-      throwIpcError('INVALID_PARAMS', `vision bridge ${key} providerId/modelId must not be blank`);
-    }
-    patch[key] = { providerId, modelId };
-  }
-  return patch;
-}
-
-function parseSubagentModelSettingsPatch(raw: unknown): SubagentModelSettingsPatch {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throwIpcError('INVALID_PARAMS', 'subagent model settings patch required (object)');
-  }
-  const input = raw as Record<string, unknown>;
-  const patch: SubagentModelSettingsPatch = {};
-  // providerId ä¸Ž model id åŒçº¦æŸ(çŸ­æ ‡è¯†ä¸²),å…±ç”¨åŒä¸€å¥—æ ¡éªŒ/å½’ä¸€åŒ–ã€‚
-  for (const key of ['claudeCode', 'claudeCodeProviderId'] as const) {
-    if (!(key in input)) continue;
-    const value = input[key];
-    if (!isValidSubagentModelIdInput(value)) {
-      throwIpcError('INVALID_PARAMS', `subagent model ${key} must be a valid string or null`);
-    }
-    patch[key] = normalizeSubagentModelId(value);
-  }
-  if ('codexSmartSubagentRouting' in input) {
-    if (typeof input.codexSmartSubagentRouting !== 'boolean') {
-      throwIpcError('INVALID_PARAMS', 'subagent codexSmartSubagentRouting must be boolean');
-    }
-    patch.codexSmartSubagentRouting = input.codexSmartSubagentRouting;
-  }
-  return patch;
-}
-
-function silentEncryptedRetryWire() {
-  const state = readSilentEncryptedRetrySettingsState();
-  return {
-    enabled: state.value.enabled,
-    isCustomized: state.isCustomized,
-    defaultEnabled: state.defaults.enabled,
-  };
-}
-
-function sessionRuntimeFallbackWire() {
-  const state = readSessionRuntimeFallbackSettingsState();
-  return {
-    enabled: state.value.enabled,
-    isCustomized: state.isCustomized,
-    defaultEnabled: state.defaults.enabled,
-  };
-}
-
-function compactionWire() {
-  const state = readCompactionState();
-  return {
-    pct: state.value.claudeCodeAutoCompactPct,
-    isCustomized: state.isCustomized,
-    defaultPct: state.defaults.claudeCodeAutoCompactPct,
-  };
-}
-
-function piCompactionWire() {
-  const state = readPiCompactionState();
-  return {
-    pct: state.value.piAutoCompactPct,
-    isCustomized: state.isCustomized,
-    defaultPct: state.defaults.piAutoCompactPct,
-  };
-}
-
-function chatEmbeddingWire() {
-  const state = readChatEmbeddingSettingsState(chatEmbeddingDefaultContext());
-  const available = isChatEmbeddingAvailable();
-  return {
-    enabled: available && state.value.enabled,
-    isCustomized: state.isCustomized,
-    defaultEnabled: available && state.defaults.enabled,
-  };
-}
-
-function gitSafetyWire() {
-  const state = readGitSafetySettingsState();
-  return {
-    autoSnapshotEnabled: state.value.autoSnapshotEnabled,
-    isCustomized: state.isCustomized,
-    defaultAutoSnapshotEnabled: state.defaults.autoSnapshotEnabled,
-  };
-}
-
-/**
- * bootstrapElectron - exported entry point for dynamic import from index.ts.
- * The Electron startup code above runs as module top-level side effects when
- * this module is dynamically imported. This function exists only to satisfy
- * the import contract; actual boot sequence is initiated by app.on("ready").
- */
-export async function bootstrapElectron(): Promise<void> {
-  // Side effects already in motion from module-level code above.
-  // Return a promise that resolves when app is ready.
-  return new Promise<void>((resolve) => {
-    if (app.isReady()) {
-      resolve();
-    } else {
-      app.once('ready', () => resolve());
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// CJS ç¼“å­˜è‡ªæ„ˆ(å¿…é¡»æ˜¯æœ¬æ–‡ä»¶æœ€åŽä¸€æ¡é¡¶å±‚è¯­å¥)ã€‚
-// ä¾èµ– conf(electron-store åº•å±‚)çš„æ¨¡å—çº§å‰¯ä½œç”¨ä¼šæ‰§è¡Œ delete require.cache[__filename]
-// â€”â€”æ‰“åŒ…åŽ __filename æŒ‡å‘æ•´ä¸ª bootstrap chunk,ç­‰äºŽæŠŠä¸»è¿›ç¨‹ bundle ä»Ž CJS ç¼“å­˜é‡Œè¸¢æŽ‰ã€‚
-// æ­¤åŽä»»ä½•è¿è¡Œæ—¶åŠ¨æ€ import è‹¥å‘½ä¸­"require æœ¬ chunk çš„åˆ†åŒ…"(å¦‚ drizzle-orm è¢«æ‹†å‡ºçš„
-// ç‹¬ç«‹ chunk),Node ä¼šæŠŠ 18MB bundle ä»Žå¤´é‡æ–°æ±‚å€¼:å¯åŠ¨å‰¯ä½œç”¨å…¨é‡é‡è·‘ â†’ IPC äºŒæ¬¡æ³¨å†Œ
-// æŠ›é”™ â†’ æ±‚å€¼å¤±è´¥ç¼“å­˜ä»ç©º â†’ æ¯æ¬¡é‡è¯•éƒ½æ³„æ¼æ•´å¼ æ¨¡å—å›¾,æ•°åæ¬¡åŽä¸»è¿›ç¨‹ V8 å †è€—å°½ OOM
-// (2026-07-12 å®žäº‹æ•…:æ„è¯†è®¢é˜…é“¾è·¯æ¯ä¸ªä¼šè¯äº‹ä»¶è§¦å‘ä¸€æ¬¡,çº¦ 4 åˆ†é’Ÿä¸€è½® OOM å¾ªçŽ¯)ã€‚
-// conf çš„æ±‚å€¼å…ˆäºŽæœ¬æ–‡ä»¶é¡¶å±‚ä»£ç (å®ƒæ˜¯æœ¬ chunk ä¾èµ–,Rollup æŒ‰ä¾èµ–åºå‰ç½®),æ‰€ä»¥åœ¨é¡¶å±‚
-// æœ«å°¾æŠŠè‡ªå·±å¡žå›žç¼“å­˜å³å¯è‡ªæ„ˆã€‚æž„å»ºäº§ç‰©æ˜¯ CJS,require / module / __filename å‡çœŸå®žå­˜åœ¨;
-// typeof å®ˆå«å…œä½æµ‹è¯•ç­‰éž CJS æ±‚å€¼çŽ¯å¢ƒã€‚
-if (
-  typeof require === 'function' &&
-  typeof module !== 'undefined' &&
-  typeof __filename === 'string' &&
-  require.cache != null &&
-  require.cache[__filename] == null
-) {
-  require.cache[__filename] = module;
-}
-
-let worktreeRuntimeCloseReady = false;
-let lastWorktreeMaintenanceDb: ReturnType<typeof tryGetDbClient> = null;
-
-/** Worktree maintenance needs both storage and runtime-close services. */
-function startReadyWorktreeMaintenance(): void {
-  startWorktreeRecycleMaintenance({
-    isReady: () =>
-      worktreeRuntimeCloseReady && getMakerIfReady() !== null && tryGetDbClient() !== null,
-    recycleCurrentSession: (sessionId, status) =>
-      recycleSessionWorktreeForStatusChange(sessionId, status),
-    onAttemptComplete: auditRegisteredWorktrees,
-  });
-  const db = tryGetDbClient();
-  if (worktreeRuntimeCloseReady && getMakerIfReady() && db && db !== lastWorktreeMaintenanceDb) {
-    lastWorktreeMaintenanceDb = db;
-    void auditRegisteredWorktrees().catch((error) =>
-      dbClientLog.warn('worktree audit postponed', error),
-    );
-    void WorktreePool.recoverPool().catch((error) =>
-      dbClientLog.warn('worktree pool recovery postponed', error),
-    );
-  }
-}
-
-onQuit('remote-desktop-viewer', () => remoteDesktopViewerWindows.reset(), 'sync');
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×ž;óÄèµ©hºÚn¶X§zÍZ[\ÜÈ\ÝÛÜšÝ™YT™XÞXÛTÝ]\ËÛÛ›ÛÛÜšÝ™YT™XÞXÛHHœ›ÛH	Ë‹ÝÛÜšÝ™YKÜ™XÞXÛPÛÛ›ÛÉÎÂš[\ÜÈ™YÚ\Ý\‘š[TY\’\ÈHœ›ÛH	Ë‹Ù]šXÙK[[šËÙš[TY\‰ÎÂš[\ÜÈ™YÚ\Ý\“ÙÚ[’][R\ÈHœ›ÛH	Ë‹ÛÙÚ[‹Z][KZ\ËšœÉÎÂš[\ÜÈÜ™X]S]\ÝÛÝ\˜ÙU™\œÚ[Û”™XY\ˆHœ›ÛH	Ë‹ØÚ[™K[XZÙKÛ]\ÝÛÝ\˜ÙU™\œÚ[Û‹šœÉÎÂš[\ÜÈ™Yœ™\ÚÚ[™TÛÝ\˜ÙTÝ]\ÈHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜÛÝ\˜ÙTÝ]\Ô™Yœ™\ÚšœÉÎÂš[\ÜÂˆÛÛ™šYÝ\™U\Ý™X[SY\™ÙKˆXÝ\Ý™X[SY\™ÙKˆ™Yœ™\Ú\Ý™X[SY\™ÙT›Ú™XÝ[Û‹ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ\Ý™X[SY\™ÙT[[YKšœÉÎÂš[\ÜÂˆÛÛ™šYÝ\™SXZÙR\ÝÜžKˆÙ]Ú[™SXZÙR\ÝÜžKˆXÝÚ[™SXZÙR\ÝÜžKˆÙ[™\˜]R\ÝÜžT\œÛÛ˜[™\œÚ[Û‹ˆØ[˜Ù[\ÝÜžT\œÛÛ˜[™\œÚ[Û‹ˆÜ[’\ÝÜžT\œÛÛ˜[Z[ˆÝÜXZÙR\ÝÜžPZ[ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÚ\ÝÜžT[[YKšœÉÎÂš[\ÜÈ™]Z[”›ÝšY\”™\Ù[][ÛY\]]Ú[™ÙHHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜ›ÝšY\‹\™\Ù[][Û‹\ÝÜ™KšœÉÎÂš[\ÜÈÛÙ^XØÛÝ[Ý]HHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛÙ^XXØÛÝ[X]]šœÉÎÂš[\ÜÈÞ[˜ÔÝXœØÜš\[ÛXØÛÝ[\ØYÙHHœ›ÛH	Ë‹Ý\ØYÙKÜÝXœØÜš\[ÛXØÛÝ[\ØYÙKšœÉÎÂš[\ÜÂˆÛX\”ÝXœØÜš\[ÛXØÛÝ[\ØÛÝ™\™Y[Ù[ËˆÙ]ÝXœØÜš\[ÛXØÛÝ[[˜[Y]Y[™\‹ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÝXœØÜš\[Û‹XXØÛÝ[X]]šœÉÎÂš[\ÜÂˆÝ\ÛÜšÝ™YT™XÞXÛSXZ[[˜[˜ÙKˆÝÜÛÜšÝ™YT™XÞXÛSXZ[[˜[˜ÙKˆ]Y]™YÚ\Ý\™YÛÜšÝ™Y\ËŸHœ›ÛH	Ë‹ÝÛÜšÝ™YKÜ™XÞXÛSXZ[[˜[˜ÙIÎÂš[\ÜÈ™\]Y\ÝÛÜšÝ™YT™XÞXÛHHœ›ÛH	Ë‹ÝÛÜšÝ™YKÛX[˜YÙY™XÞXÛIÎÂš[\ÜÂˆ]ÚÙ\ÜÚ[Û“Y]R[‘‹ˆ™XÞXÛTÙ\ÜÚ[Û•ÛÜšÝ™YQ›Ü”Ý]\ÐÚ[™ÙKŸHœ›ÛH	Ë‹ÛØØ[‹Ú\ËÜÙ\ÜÚ[ÛœÉÎÂš[\ÜÈžQÙ]ÛY[Hœ›ÛH	Ë‹ÛØØ[‹ØÛY[ØÝ\œ™[	ÎÂš[\ÜÂˆ\ˆœ›ÝÜÙ\•Ú[™ÝËˆÛ\›Ø\™ˆX[ÙËˆ\ÓXZ[‹ˆY[Kˆ˜]]™R[XYÙKˆ˜]]™U[YKˆ™]ˆÝÙ\“[Ûš]Ü‹ˆ›ÝØÛÛˆØY™TÝÜ˜YÙKˆØÜ™Y[‹ˆÙ\ÜÚ[Û‹ˆÚ[ˆ˜^Kˆ\HÙXÛÛ[ËŸHœ›ÛH	Ù[XÝ›Û‰ÎÂš[\ÜÈ™\ÛÛ™UšXœ˜[˜ÞPÛÛ™šYÈHœ›ÛH	Ë‹ÝšXœ˜[˜ÞPÛÛ™šYÉÎÂš[\ÜÈÙ]Ù\ÜÚ[Û•[šÚ[™ÔÛ˜\ÚÝËÙ]\ÝÜžUÛÛ˜[YHHœ›ÛH	Ë‹ÛY\ÜØYÙT\œÚ\Ýœ›ØYØ\Ý\‰ÎÂš[\ÜÈ\UšXœ˜[˜ÞUÔÙXÛÛ™\žUÚ[™ÝÜÈHœ›ÛH	Ë‹ÜÙXÛÛ™\žK]Ú[™ÝÜÉÎÂš[\ÜÈ™[Y[X™\”™\ÛÛ™Y\[YK™\ÛÛ™P\[YR\Ñ\šÈHœ›ÛH	Ë‹Ü™\ÛÛ™YX\][YIÎÂš[\ÜÂˆ\œÙUÚ[™ÝÕ[YUšXœ˜[˜ÞT^[ØYˆ™XYÚ[™ÝÕ[YTÛ˜\ÚÝˆÜš]UÚ[™ÝÕ[YTÛ˜\ÚÝŸHœ›ÛH	Ë‹ÝÚ[™ÝË][YK[[ÙK\ÝÜ™IÎÂš[\ÜÂˆÜ™X]UÚ[™ÝÐ˜XÚÙ›ÜX]\šX[\™Ý[Y[ˆÒS‘Õ×ÐPÒÑ“ÔÓPUT’PSÐÒS‘ÑQÐÒS“‘SŸHœ›ÛH	Ë‹‹ÜÚ\™YÝÚ[™ÝÐ˜XÚÙ›ÜšœÉÎÂš[\ÜÈ\Ð[ÝÙYš[[™ÓXZ[Ô™\]Y\ÝHœ›ÛH	Ë‹‹ÜÚ\™YØš[[™ËšœÉÎÂš[\Ü]œ›ÛH	Û›ÙNœ]	ÎÂš[\ÜœÈœ›ÛH	Û›ÙN™œÉÎÂš[\ÜÜÈœ›ÛH	Û›ÙN›ÜÉÎÂš[\ÜÈ\[[™HHœ›ÛH	Û›ÙNœÝ™X[KÜ›ÛZ\Ù\ÉÎÂš[\ÜÈ^XÑš[K^XÑš[TÞ[˜ËÜ]ÛˆHœ›ÛH	Û›ÙN˜Ú[Ü›ØÙ\ÜÉÎÂš[\ÜÈXXÚ[™RYÞ[˜ÈHœ›ÛH	Û›ÙK[XXÚ[™KZY	ÎÂš[\ÜÚ[™ÝÔÝ]RÙY\\ˆœ›ÛH	Ù[XÝ›Û‹]Ú[™ÝË\Ý]IÎÂš[\ÜÈ”S‘ÓSQHHœ›ÛH	ÐÚ[™KÛXZÙ\‹\Ú\™YØœ˜[™[™ÉÎÂš[\ÜÂˆÚÝ[™\]Y\ÝÚ[™ÛR[œÝ[˜ÙSØÚËˆ™\ÛÛ™TÚ[™ÛR[œÝ[˜ÙSØÚÕ\Ù\‘]Q\‹ŸHœ›ÛH	Ë‹Ù]ÛQ›YÜËšœÉÎÂš[\ÜÂˆ™XÛÜ™\ÚÝÜ]]]Ý\\™\Ý[ˆX\šÑ\ÚÝÜ]”Ý\\˜Z[YˆX\šÑ\ÚÝÜ]•Ú[™ÝÔ™XYKŸHœ›ÛH	Ë‹Ù]”Ý\\Ý]\ÉÎÂš[\ÜÂˆ[œÝ[Ú[™ÝÑ[ØÜ™Y[”Ý]Pœ›ØYØ\Ýˆ™XYÚ[™ÝÑ[ØÜ™Y[”Ý]KˆÚÝÓXZ[•Ú[™ÝÐ[™™\ÝÜ™Q[ØÜ™Y[‹ŸHœ›ÛH	Ë‹ÛXZ[•Ú[™ÝÑ[ØÜ™Y[”Ý\\	ÎÂš[\ÜÂˆ[œÝ[XZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žKˆ[œÝ[XZ[•Ú[™ÝÓ˜]]™T™\ÝÜ™R[[ˆ™XY\œÚ\ÝYÚ[™ÝÓX^[Z^™Yˆ\HXZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\‹ŸHœ›ÛH	Ë‹ÛXZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žIÎÂš[\ÜÈ™]Ø\›SXXÐÛÛ\]\”\›Z\ÜÚ[Û‘ÝZYR[\ˆHœ›ÛH	Ë‹ØÛÛ\]\‹\\›Z\ÜÚ[Û‹YÝZYKÓXXÐÛÛ\]\”\›Z\ÜÚ[Û‘ÝZYS˜]]™RÜÝšœÉÎÂš[\ÜÈ[™SÜ[Ú]Ô\Hœ›ÛH	Ë‹ØÚ]ÜX\šœÉÎÂš[\ÜÈ\Ú[™ÝÐœ›ØYØ\ÝHœ›ÛH	Ë‹Ù]šXÙK[[šËØœ›ØYØ\Ý]\šœÉÎÂš[\ÜÂˆØZ]›Ü•\›Ú[™ÙTÙ]XÝ[ÛœËˆØZ]›Ü•\›Ú[™ÙTÙ]\œÚ\Ý[˜ÙKŸHœ›ÛH	Ë‹Ý\›‹XÚ[™ÙK\Ù]ÜÝÜ™KšœÉÎÂ‚›]™]žTT[[YPY\“™]ÛÜšÔ™XÛÝ™\žNˆ
+
+
+HOˆ›ÚY
+H[H[Â›]\ÜÜÙTT[[YT™XÛÝ™\žNˆ
+
+
+HOˆ›ÚY
+H[H[Â‹ËÈÙ™šXÚX[[^š[˜\šY\ÈÝ[[™™YÈÙˆP‹ˆÙY\Û™HÚ\™YXY[™H›Ü‚‹ËÈ›ÝÝÛ›ØYË][ÝÈ›Ü›X[ÛÛœÝ[Y\ˆÛÛ›™XÝ[ÛœÈÈš[š\ÚÚ[HB‹ËÈÜ\Ú\Ü^\È™X[ž]H›ÙÜ™\ÜË‚˜ÛÛœÝS•VÐQÑS•ÒS”ÕSÔÕT•TÑPQS‘WÓTÈHH
+ˆŒÌÂ‹ËÈH9¦+ùcëú`"z ïyb¦øà ºi¥¹d+ùcëù.éyîæyk ù. 9l#ù«­y¥íºeí9.ãˆÑˆ9aá¹i!ûï#9/a¹ïdyîç9o ¹n.9¥í¹.#z ïz+ªB‹ËÈ9¥m9.*ˆÚ[™H9. 9æí9`g9g*9d+ùbª:hm{ï&ùb,9§'ùd#¹cå¹­¢9§+9«(y."ú/oynm¹é yå*9§+9«(Hxà ‚˜ÛÛœÝWÐQÑS•ÒS”ÕSÔÕT•TÑPQS‘WÓTÈHŒÌÂ‚‹ÊŠˆ™\Ù\™HXÝ[Û˜X›HØ]™YXXØÛÝ[˜Z[\™\ÈXÜ›ÜÜÈ[XÝ›ÛˆÙ\šX[^˜][Û‹ˆ
+‹Â™[˜Ý[Ûˆ›ÝÐ]]XØÛÝ[\Ñ\œ›ÜŠ\œ›ÜŽˆ[šÛ›ÝÛŠNˆ™]™\ˆÂˆÛÛœÝÛÙHBˆ\œ›Üˆ	‰ˆ\[Ùˆ\œ›ÜˆOOH	ÛØš™XÝ	È	‰ˆ\[Ùˆ
+\œ›Üˆ\ÈÈÛÙOÎˆ[šÛ›ÝÛˆJK˜ÛÙHOOH	ÜÝš[™ÉÂˆÈ
+\œ›Üˆ\ÈÈÛÙNˆÝš[™ÈJK˜ÛÙBˆˆ[ÂˆÛÛœÝY\ÜØYÙHH\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	ÔØ]™YXØÛÝ[Ü\˜][Ûˆ˜Z[Y	ÎÂˆÝÚ]Ú
+ÛÙJHÂˆØ\ÙH	ÒS•SQÐUUÐPÕSÓ‰Î‚ˆØ\ÙH	ÔTÔÒU‘WÐUUÓUUUSÓ—Ð“ÐÒÑQ	Î‚ˆØ\ÙH	ÐPÐÓÕS•Ó“ÕÑ“ÕS‘	Î‚ˆØ\ÙH	ÐPÐÓÕS•Ô‘PUUÔ‘TURT‘Q	Î‚ˆØ\ÙH	Ô‘QÒSÓ—ÓRTÓPUÒ	Î‚ˆØ\ÙH	ÐÔ‘QS•PSÔÕÔ‘WÕSURSP“IÎ‚ˆØ\ÙH	ÐUUÑ“Õ×ÔÕTT”ÑQQ	Î‚ˆ›ÝÒ\Ñ\œ›ÜŠÛÙKY\ÜØYÙJNÂˆY˜][‚ˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•T“S	Ë	ÔØ]™YXØÛÝ[Ü\˜][Ûˆ˜Z[Y	ÊNÂˆBŸB‚šYˆ
+ˆ›ØÙ\ÜËœ]›Ü›HOOH	Û[^	È	‰‚ˆX\š\ÔXÚØYÙY	‰‚ˆ›ØÙ\ÜË™[‹–ÑU—ÔÐQ‘WÔÕÔQÑWÐTÒPÈOOH	ÌIÂŠHÂˆ\˜ÛÛ[X[™[™K˜\[™ÝÚ]Ú
+	Ü\ÜÝÛÜ™\ÝÜ™IË	Ø˜\ÚXÉÊNÂˆØY™TÝÜ˜YÙKœÙ]\ÙTZ[•^[˜Üž\[ÛŠYJNÂŸB‚‹ËÈ\\XZÙ\ˆ9ëbyêæyà®yæ¡ÐTÓH9i&¹î¯ùê"ùo%y¤ã¹/§z-eˆÚ\™Y\œ˜^PY™™\¸à Ú›ÛZ][H9¢¢ˆÐPˆ:e yg*‹ËÈÜ›ÜÜÓÜšYÚ[’\ÛÛ]Y
+ÓÓÔÐÓÑT9dãyn¥9i-
+y.bùd#‹: #[XÝ›Ûˆ9.#yk§¹ã¬ÓÓÔ:/æùê"úf¥9é®ø %8 %‹ËÈ9clù/¯ùêæyà®ydãyn¥9i-9«hùèk‹œ›ÝÜÙ\•Ú[™ÝÈÈÙXšY]Ï˜:aãÜ›ÜÜÓÜšYÚ[’\ÛÛ]Y9 d¹..ˆ˜[ÙK‹ËÈÐPˆ9¢ïù.#yb,”Ðˆ9a¡yïk¹­cú)â9fj:aã:/æyìnùêæyà®yæí9£©y¢©H¹ï.¹l$z/ä:(c9¥í¹¥+ù£ HŠ[XÝ›ÛˆKŒ‹Œ9k§¹­bË‹ËÈ9ç'ÈÚ›ÛYH9d#:hmzgh¹..ˆYJxà º/æzaã9å*Ú›ÛZ][H9k¦9¥®H™X]\™H9o 9alù¥è9§hy.í¹ h¹i#HÐPˆ9§¡:`(9fj‹ËÈ\\XZÙ\ˆ9¨c:gh¹êëÊ[XZÙ\‹™^Jxà U”ÈÛÙH9d#9«/¹`f¹¬åxà ºhãºfjzgh¹¦+ùd$y¢`9§"yïdzhmya¡yk®y¥/¹o ‹ËÈ:jæ9ì¯¹n©¹aly.ªùa¡ykf:+¨y¥í¹fj
+ÜXÝ™H9ìnÊK9ï$ú)èù/§z-eº/ç9ê"ùa¡yk®ycêº-äyg*ÙXšY]Ë\ÙXÝ\š]KÈ9o.¹b-‚‹ËÈ9b¨9fî¹æ¡ÙXšY]È:aã
+Ø[™›Þ
+ÈÙX”ÙXÝ\š]H
+È:f¥9é®ùb!¹c.‹9¥è›ÙJxà ¹¬ê9¡#È\[™ÝÚ]Ú‹ËÈ9d#Ù^H9d#¹a¦z)¡¹æå¹bcya¦N¹i ºg 9a£yb¨9am¹.å‚‹ËÈ[˜X›KY™X]\™\Ë9oázhnùd"9nmº/æùd#9. 9«(z, ùå*9æ¡:`%ùcíùb!ºf¥9`/9.#z ïycéº-mù. :(c8à ‚˜\˜ÛÛ[X[™[™K˜\[™ÝÚ]Ú
+	Ù[˜X›KY™X]\™\ÉË	ÔÚ\™Y\œ˜^PY™™\‰ÊNÂ‚‹ËÈYÙ[X[˜YÙ\ˆ9mì¹g*™[™Üˆ9i)ù¢júfi9¥íº` 9onxà ˜\:` 9aîˆÈ9m*y® ú-ëùo¡:-lXZÙ\‹œÚ]ÝÛŠ
+B‹ËÈ9. 9b 9b!È8 %Ù\ÜÚ[Ûˆ]XÚ9.#ˆYÙ[\ÜÜÙH9nm¹cä{ï#:`oùacy§ä9.*ˆÙ\ÜÚ[Ûˆ9chy/cùam¹k ú/æùê"ù¥-¹l/¸à ‚‹ËÈ
+Š¹oázhnÈ]ØZ]
+ŠŽˆÛÙ^9/&¹ab:`&º/áÈÝ[ˆSÑˆ9/çykf9nmº` 9aî»ï#:-¡y¥í¹¢cycäy/èycíøà ‚‹ËÈ9i ¹§§9g*Þ[˜È:f-¹«­Hš\™KX[™Y›Ü™Ù]\™^]
+
+H9/&¹g*9¥-¹l/¹bcy¢¢ˆ›ÙH9..ú/æùê"ù£¤9£¢K‹ËÈÚ[™ÝÜÈ9."ˆÛÙ^\\Ù\™\ˆ9kd:/æùê"ù.#y/&ºf£ùâ-¹«nÈ8¡¤ˆ9«¢ùåfyki9a/Ë9£ y§"Hš[˜\žH9¥¡ù.íºe K‹ËÈ9å*9¢-ù."ù«(yd+ùbª9¥í¹¤§ˆP•TÖHÈ9êëùcèùch9å*
+[›ÜXËXÛÛ\]\›ÞH9ëbJxà ‚˜\Þ[˜È[˜Ý[ÛˆÚ]ÝÛ“XZÙ\Š
+Nˆ›ÛZ\ÙOÈTÙ\ÜÚ[Û‘˜Z[\™\Îˆ[X™\ˆOˆÂˆÝÜÛÜšÝ™YT™XÞXÛSXZ[[˜[˜ÙJ
+NÂˆËÈÈ›Ý\›Z[˜]HXZ[ˆÚ[HÛ™HÛÜšÜÜXÙH]ÚÛÛ[X[™\ÈÙ][™Ë‚ˆ]ØZ]ØZ]›Ü•\›Ú[™ÙTÙ]XÝ[ÛœÊ
+NÂˆËÈ:` 9aî¹bcyab9¢¢ˆÛÛÜÙH:aãybkù/g9å*
+ÛÜšÝ™YHÝ\Úùb(:fi8à y.-9¥íºfa9.í¹®!yä!Šy. 9b 9b!ù¢¤yb-¹£¢N‚ˆËÈÚ]ÝÛˆ:)é¹cäyæ¡9¢nzaãÈÛÛÜÙH9¦+Èš\™KX[™Y›Ü™Ù]9æ¡9.#y/&º(ªÈ]ØZ]ÛÜšÝ™YH9fç¹¥-¹/&‚ˆËÈ9d£\™^]9êç¹.¢x %8 %9cëú ïHÝ\Ú9.¡¹. 9cbº/æùê"ùl,y¬¨y.¡‹9åfy."ùcb¹¢á¹æ¡ÛÜšÝ™Yxà º` 9aî¹§'ù.#y`f‚ˆËÈ9.îù/eyfç¹¥-‹ÛÜšÝ™YH9c§ù¨-ùåfyg*9èàyææ9."ù«(yd+ùbª™XÛÝ™\”ÛÛ9kîz-)ŠÛX[ˆ\[Y\˜[:aãy¥¬ˆËÈ9aiy¬h\HÈ9.©9.¤¹o#ùæ¡9/çyåfKÙ\ÜÚ[Ûˆ:aãyo 9cëù¥è9ï'yîëyå*
+xà ‚ˆ™ZY˜]PÛÜÙTÝ\™\ÜÚ[Û‹œÝ\™\ÜÐ[›Ü”Ú]ÝÛŠ
+NÂˆ]TÙ\ÜÚ[Û‘˜Z[\™\ÈHÂˆžHÂˆËÈÜ\Ú9i,z-)y¥íˆXZÙ\ˆ9§*ˆ[š]ÈÙ]XZÙ\ÛÜ™J
+H9¢¦úe&H8 %8 %:gfznæ9ag9n¥K9¬¨y.':)oú) y®!xà ‚ˆÛÛœÝHHÙ]XZÙ\ÛÜ™J
+NÂˆËÈ›ØÙ\ÜÈ^]›Ý[ˆÝÛ™\œÚ\Ú[™ÙNˆ]XÚYHÝX˜YÙ[[›™\œÈ\™BˆËÈÝÜYžHHYXØ]YK\ÝX˜YÙ[\[›™\œØ]Z]Ý\X›Ý™K[™BˆËÈXØÛÝ[	ÜÈ‹ØÜ™Y[X[È\™H›Ý™Z[™È[™YÈ[ž[Û™H[ÙK‚ˆÛÛœÝ™\ÜH]ØZ]KœÚ]ÝÛŠÈ™X\ÛÛŽˆ	Ø\\]Z]	ÈJNÂˆTÙ\ÜÚ[Û‘˜Z[\™\ÈH™\ÜœÙ\ÜÚ[Û‘˜Z[\™\Ë™š[\Š
+ŠHOˆ‹˜YÙ[Ú[™OOH	ÜIÊK›[™ÝÂˆHØ]Ú
+\œŠHÂˆËÈXZÙ\ˆ9§*¹l,yîêˆ
+Ù]XZÙ\ÛÜ™H9¢¦ÊH9¢%ˆÚ]ÝÛˆ:!êº.ªù¢¦È8 %8 %:`ïy.#z ïzf.ù¥«z` 9aî¸à ‚ˆËÈ9¬ê9¡#ÎˆÙ]XZÙ\ÛÜ™H9§*¹l,yîê¹¥í¹¢¦ùæ¡9¦+ÈÞ[˜È\œ›Ü‹]ØZ]KœÚ]ÝÛŠ
+H9.gú-l:/æzaã8à ‚ˆÛÛœÛÛK™\œ›ÜŠ	ÖÛXZ[—HXZÙ\‹œÚ]ÝÛˆ˜Z[Y
+Üˆ›Ý™XYJN‰Ë\œŠNÂˆBˆËÈÙ\ÜÚ[ÛˆÚ]ÝÛˆX^H[œ]Y]YHHš[˜[\›ˆÚYXØ\ˆÜš]Kˆ˜Z[ˆÛ›BˆËÈY\ˆXZÙ\‹œÚ]ÝÛŠ
+H\ÈÛÜÙY]™\žHÙ\ÜÚ[Ûˆ[™[Z]YÜÙHÜš]\Ë‚ˆ]ØZ]ØZ]›Ü•\›Ú[™ÙTÙ]\œÚ\Ý[˜ÙJ
+NÂˆÛÜšÝ™YTÛÛœ\šÐ[
+
+NÂˆËÈ™\ÜYÛÈH]Z]™[˜ÙHØ[ˆ[H\™[\ÈÝÛˆˆœ›ÛHH\™[ˆËÈØ\È\ÚÙYÈÛÈÝÛˆ‹ˆHHÙ\ÜÚ[Ûˆ]˜Z[YÈ]XÚX^HÝ[]™HBˆËÈ]™H›ØÙ\ÜÈX›HÈ][˜ÚH\˜X›H[›™\‹‚ˆ™]\›ˆÈTÙ\ÜÚ[Û‘˜Z[\™\ÈNÂŸB‚™[˜Ý[Ûˆ™XYÚ]^
+\™ÜÎˆÝš[™Ö×JNˆÝš[™È[ÂˆžHÂˆÛÛœÝ˜[YHH^XÑš[TÞ[˜Ê	ÙÚ]	Ë\™ÜËÂˆÝÙˆ\™Ù]\]
+
+Kˆ[˜ÛÙ[™Îˆ	Ý]Ž	ËˆÝ[ÎˆÉÚYÛ›Ü™IË	Ü\IË	ÚYÛ›Ü™I×KˆJKš[J
+NÂˆ™]\›ˆ˜[YH[ÂˆHØ]ÚÂˆ™]\›ˆ[ÂˆBŸB‚š[\™˜XÙH\\Ü^U™\œÚ[Û’[™›ÈÂˆ\Ü^NˆÝš[™ÎÂˆ]Z[ˆÝš[™ÎÂŸB‚™[˜Ý[ÛˆÙ]\\Ü^U™\œÚ[Û’[™›Ê
+Nˆ\\Ü^U™\œÚ[Û’[™›ÈÂˆÛÛœÝ™\œÚ[ÛˆH\™Ù]™\œÚ[ÛŠ
+NÂˆYˆ
+\š\ÔXÚØYÙY
+HÂˆ™]\›ˆÂˆ\Ü^Nˆ™\œÚ[Û‹ˆ]Z[ˆ™\œÚ[Û‹ˆNÂˆB‚ˆÛÛœÝœ˜[˜ÚH™XYÚ]^
+ÉØœ˜[˜Ú	Ë	ËK\ÚÝËXÝ\œ™[	×JNÂˆÛÛœÝÚHH™XYÚ]^
+ÉÜ™]‹\\œÙIË	ËK\ÚÜMÉË	ÒPQ	×JNÂˆÛÛœÝÝ\œ™[Hœ˜[˜Ú	‰ˆÚHÈ	Øœ˜[˜ÚP	ÜÚ_XˆÚNÂˆÛÛœÝ\Ü^HHÝ\œ™[È	Ý™\œÚ[ÛŸH0­È	ØÝ\œ™[Xˆ™\œÚ[ÛŽÂ‚ˆ™]\›ˆÂˆ\Ü^Kˆ]Z[ˆ\Ü^KˆNÂŸB‚š[\ÜÂˆ[š]\]TÙ\šXÙKˆÙ]\]SØÚÔ]ˆ›ÝYžU\]P]]Ô™[][˜Ú\ÞTÝ]PÚ[™ÙYˆÙ]\]P]]Ô™[][˜Ú\ÞT›Ø™KŸHœ›ÛH	Ë‹Ý\]TÙ\šXÙIÎÂš[\ÜÂˆ\ÕÚ[™ÝÜÕ\]SØÚÔÚ\š[™Õš[Û][Û‹ˆÚÝ[ÙY\ØZ][™Ñ›Ü•Ú[™ÝÜÕ\]SØÚËŸHœ›ÛH	Ë‹Ý\]SØÚÕØZ]	ÎÂš[\ÜÂˆÜ™X]U\]T™\Ù[][Û”™XÛÝ™\žPÛÛ›Û\‹ˆXÚYU\]T™[][˜Ú\ÞU˜[œÚ][Û‹ˆ\Õ\]T™[][˜Ú\ÞPXÝ]š]Kˆ\ÓXXÓÔÕ\]T™[][˜Úˆ™XY\]T™[][˜ÚØÚY[P\ÞKŸHœ›ÛH	Ë‹Ý\]T™[][˜ÚØY™]IÎÂš[\ÜÂˆ™\\™H\Èš[˜\žT™\\™KˆYZÓ™YYÑÝÛ›ØY\Èš[˜\žTYZÓ™YYÑÝÛ›ØYˆœ›ØYØ\Ý™\Ù]›Ü”Ý\\Èš[˜\žPœ›ØYØ\Ý™\Ù]›Ü”Ý\ˆ\HYÙ[š[˜\žRÚ[™ˆ\H™\\™T™\Ý[ŸHœ›ÛH	Ë‹ØYÙ[Xš[˜\šY\ÉÎÂš[\ÜÈ™[™\™\›ÛÝÝX\™Hœ›ÛH	Ë‹Ü™[™\™\‹X›ÛÝYÝX\™	ÎÂš[\ÜX[[œ›ÛH	ÚœË^X[[	ÎÂš[\ÜX]\ˆœ›ÛH	ÙÜ˜^K[X]\‰ÎÂš[\Ü\HÈXZÙ\ˆHœ›ÛH	ÐÚ[™KÛXZÙ\‹XÛÜ™IÎÂš[\ÜÂˆ[Kˆ™Z\ÚR[Kˆ[YÜ˜[R[Kˆ™YÚ\Ý\•[YÜ˜[P›ÝÛÛ™šYÒ\ËˆÝ\[SÜ˜Ú\Ý˜]ÜœËˆÝ\[PÛÛ›™XÝ[Û‹ˆÝÜ[PÛÛ›™XÝ[Û‹ŸHœ›ÛH	Ë‹Ú[IÎÂš[\ÜÈÙ][YÜ˜[T™[[ÝTÛÝ\˜ÙHHœ›ÛH	Ë‹Ù]šXÙK[[šËÝ[YÜ˜[T™[[ÝPÛÛ›Û	ÎÂš[\Ü
+ˆ\È]]X[˜YÙ\ˆœ›ÛH	Ë‹Ø]]X[˜YÙ\‰ÎÂš[\ÜÈÜ™X]P]]Ü™Y[X[™XÛÝ™\žHHœ›ÛH	Ë‹Ø]]Ü™Y[X[™XÛÝ™\žIÎÂš[\ÜÂˆ]˜[X]T™[][˜Ú\ÞPXÝ]š]Kˆ\H™[][˜Ú\ÞPXÝ]š]TÛÝ\˜Ù\ËŸHœ›ÛH	Ë‹Ü™[][˜Ú\ÞPXÝ]š]IÎÂš[\ÜÈ\Ô\œÚ\ÝYÙ\ÜÚ[Û’[Hœ›ÛH	Ë‹Ø]]Ù\ÜÚ[Û’[	ÎÂš[\ÜÂˆ\Ñ^Û\Ú]™TÚ\™YYØXÞU\Ù\‘]PXØÙ\ÜËˆØ\›TÝ[T›ØÙ\ÜÔ›Ý™[˜[˜ÙKŸHœ›ÛH	Ë‹ÛÝÛ™\“˜[Y\ÜXÙSZYÜ˜][Û‹šœÉÎÂš[\ÜÈÜ™X]PXØÛÝ[[][Û’\Ò[™\œÈHœ›ÛH	Ë‹ØXØÛÝ[[][Û’\ÉÎÂš[\Ü
+ˆ\È›Ùš[QY]œ›ÛH	Ë‹Ü›Ùš[QY]	ÎÂš[\ÜÈ\ØYX›XÐ\ÜÙ]Hœ›ÛH	Ë‹ÛÜÜÔX›XÕ\ØY	ÎÂš[\ÜÈ™[[Ý™T™YœÈ\È™[[Ý™SYYXT™YœÈHœ›ÛH	Ë‹ØÚ[™K[YYXKÛYÙ\‰ÎÂš[\ÜÂˆ[œÝ[ÙXšY]Ò\™[™\‹ˆÙ]ÙÚ[Ø\ÚSÜšYÚ[”™\ÛÛ™\‹ˆÙ]œØ”Ü\ÜÝ™\ÛÛ™\‹ˆÙ]œØ”Ü\Ü[™\”™\ÜÝXœØÜšX™\‹ˆÙ]œØ”Ü\Ü[™\”™\ÛÛ™\‹ŸHœ›ÛH	Ë‹ÝÙXšY]Ë\ÙXÝ\š]IÎÂš[\ÜÈÛÛ™šYÝ\™TœØœ›ÝÜÙ\•ÙX]]ˆHœ›ÛH	Ë‹ÜœØ‹Xœ›ÝÜÙ\‹]ÙX˜]]‹šœÉÎÂš[\ÜÂˆ[œÝ[Ù[XÝ[ÛÛÛ^Y[KˆÙ]Ù[XÝ[ÛÛÛ^Y[SØØ[KŸHœ›ÛH	Ë‹ÜÙ[XÝ[Û‹XÛÛ^[Y[KšœÉÎÂš[\ÜÈ[œÝ[ÛÛ[ÙXÝ\š]TÛXÞK\œÙSÜšYÚ[ˆHœ›ÛH	Ë‹ÜÙXÝ\š]KØÜÜ	ÎÂš[\ÜÂˆÙ]œØœ›ÝÜÙ\œšYÙKˆ™YÚ\Ý\”œØœ›ÝÜÙ\œšYÙR\Ëˆ™YÚ\Ý\•X“Ü™\Ý[[™\‹ŸHœ›ÛH	Ë‹ÜœØ‹Xœ›ÝÜÙ\‹XœšYÙIÎÂš[\ÜÂˆÙ]œØ“˜]]™TÜ\ÝÛ™\•ÙXÛÛ[Ëˆ\ÐXÝ]™TœØ“˜]]™TÜ\Ý\™˜XÙ\Ëˆ™YÚ\Ý\”œØ“˜]]™TÜ\Ý\™˜XÙR\ËŸHœ›ÛH	Ë‹ÜœØ‹Xœ›ÝÜÙ\‹XœšYÙKÛ˜]]™K\Ü\\Ý\™˜XÙ\ËšœÉÎÂš[\ÜÈ\ÜÜÙP[™›ÚYYˆHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËØ[™›ÚYšœÉÎÂš[\ÜÈÚ]ÝÛÛÙ^[š\›Û›Y[Hœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËØÛÙ^[š\›Û›Y[šœÉÎÂš[\ÜÂˆ[˜[Y]TQ[š\›Û›Y[ˆÚ]ÝÛ”Q[š\›Û›Y[ŸHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËÜQ[š\›Û›Y[šœÉÎÂš[\ÜÈ™]Ú™[[ÝSYYXR[XYÙPž]\ÈHœ›ÛH	Ë‹Ù]šXÙK[[šËÜ™[[ÝSYYXT›ÝØÛÛ	ÎÂš[\Ü
+ˆ\È[XYÙPØXÚTÝÜ™Hœ›ÛH	Ë‹Ú[XYÙPØXÚTÝÜ™IÎÂš[\ÜÂˆÛÛXÝÝ™X[UÚ][Z]ˆÜ™X]SYÚ›ÞYYXR[™\œËˆ‘SSÕWÒSPQÑWÓPVÐ–UTËŸHœ›ÛH	Ë‹ÛYÚ›ÞYYXPXÝ[ÛœÉÎÂš[\ÜÈÜ™X]PÚ]]XÚY[Ø]™R[™\ˆHœ›ÛH	Ë‹ØÚ]]XÚY[Ø]™IÎÂš[\ÜÈÜ™X]PÚ]]XÚY[ÝYÙR[™\ˆHœ›ÛH	Ë‹ØÚ]]XÚY[ÝYÙIÎÂš[\ÜÂˆÛX[\ÝÛ™Y[œ\œÚ\ÝYÝYÙYÚ]]XÚY[ËˆÙ]Ú]]XÚY[ØXÚT›ÛÝˆÙ]Ú]]XÚY[ÝÛ™\ØXÚT›ÛÝˆÙ]™[[ÝQš[PØXÚT›ÛÝˆÝYÙSØØ[š[UÐØXÚKŸHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹Ü™[[ÝKYš[KXØXÚIÎÂš[\ÜÈÝÙY\YØXÞQX[ÙÝYUÛÜšÚ[™Ñ\œÈHœ›ÛH	Ë‹ÛØØ[‹ÙX[ÙÝYUÛÜšÙ\”Ù[’X[	ÎÂš[\ÜÈ”S‘ÒQS•UKYØXÞQX[ÙÝYU\Ù\‘]Q\“˜[Y\ÈHœ›ÛH	ÐÚ[™KÛXZÙ\‹\Ú\™YØœ˜[™ZY[]IÎÂš[\Ü
+ˆ\ÈšY[ÐØXÚTÝÜ™Hœ›ÛH	Ë‹ÝšY[ÐØXÚTÝÜ™IÎÂš[\ÜÈ[XYÙTØÚ[YTš]š[YÙK™YÚ\Ý\’[XYÙT›ÝØÛÛ[™\ˆHœ›ÛH	Ë‹Ú[XYÙT›ÝØÛÛ	ÎÂš[\ÜÈšY[ÔØÚ[YTš]š[YÙK™YÚ\Ý\•šY[Ô›ÝØÛÛ[™\ˆHœ›ÛH	Ë‹ÝšY[Ô›ÝØÛÛ	ÎÂš[\ÜÈ[Ù[ØÚ[YTš]š[YÙK™YÚ\Ý\“[Ù[›ÝØÛÛ[™\ˆHœ›ÛH	Ë‹Û[Ù[›ÝØÛÛ	ÎÂš[\ÜÂˆÚ[™SYYXTØÚ[YTš]š[YÙKˆ™YÚ\Ý\Ú[™SYYXT›ÝØÛÛ[™\‹ŸHœ›ÛH	Ë‹ØÚ[™K[YYXKØÚ[™SYYXT›ÝØÛÛ	ÎÂš[\Ü
+ˆ\ÈÚ[™SYYXP›Ø”ÝÜ™Hœ›ÛH	Ë‹ØÚ[™K[YYXKØ›Ø”ÝÜ™IÎÂš[\Ü
+ˆ\ÈÚ[™PÚ]]XÚY[Èœ›ÛH	Ë‹ØÚ[™K[YYXKØÚ]]XÚY[ÉÎÂš[\ÜÈÙ]š^Y\™XÝÜžTÝ]ËÜ[“ÜÜ™X]Qš^Y\™XÝÜžHHœ›ÛH	Ë‹ØÚ[™K[YYXKÙš^Y\™XÝÜžIÎÂš[\ÜÈÜ[“XZÙTÛÝ\˜ÙQ\™XÝÜžKÜ[“XZÙUÛÛÑ\™XÝÜžHHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝÛÛÑ\™XÝÜžIÎÂš[\ÜÂˆØ[˜Ù[Ú[™TÛÝ\˜ÙT™\\˜][Û‹ˆXZÙTÛÝ\˜ÙT›ÛÝˆ™XYÝ\œ™[Ú[™TÛÝ\˜ÙTÝ]\ËˆÝXœØÜšX™PÚ[™TÛÝ\˜ÙTÝ]\ËŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜÛÝ\˜ÙT™\\˜][Û‹šœÉÎÂš[\ÜÈœ›ØYØ\ÝÚ[™SXZÙTÛÝ\˜ÙTÝ]\ÈHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜÛÝ\˜ÙTÝ]\Ðœ›ØYØ\ÝšœÉÎÂš[\ÜÈÚ[™SXZÙSX[˜YÙ\ˆHœ›ÛH	Ë‹ØÚ[™K[XZÙKÛX[˜YÙ\‹šœÉÎÂš[\ÜÈœ›ØYØ\ÝÚ[™SXZÙTÝ]HHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜÝ]Pœ›ØYØ\ÝšœÉÎÂš[\ÜÂˆÜ™X]SXZÙUÛÛÚZ[‘[š\›Û›Y[ˆ™\ÛÛ™SXZÙUÛÛ[š\›Û›Y[ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝÛÛÚZ[‘[š\›Û›Y[šœÉÎÂš[\ÜÂˆÒS‘WÓPRÑWÔ•S—ÒQÔUT“‹ˆ\ÐÚ[™SXZÙSX[˜YÙYÛÜšÝ™YT]ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜÛÝ\˜ÙT]ËšœÉÎÂš[\ÜÈ™\\™PÚ[™SXZÙUÛÜšÜÜXÙHHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ\ÚÕÛÜšÜÜXÙKšœÉÎÂš[\ÜÈ™\ÝÜ™PÚ[™SXZÙU\ÚÔÝ]KÝ\Ú[™SXZÙU\ÚËÛÛ™šYÝ\™PÚ[™SXZÙQY][™ÑÝX\™Hœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ\ÚÔ[[YKšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙT™[[ÝT™\ÛÝ\˜Ù\ÈHœ›ÛH	Ë‹ØÚ[™K[XZÙKÜ™[[ÝT[[YKšœÉÎÂš[\ÜÂˆÛÛ™šYÝ\™PÚ[™SXZÙU\ÚÓX[˜YÙ[Y[ˆX[˜YÙPÚ[™SXZÙU\ÚËˆ™Yœ™\ÚÚ[™SXZÙU\ÚÒ[YÜ˜][Û‹ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ\ÚÓX[˜YÙ[Y[šœÉÎÂš[\ÜÂˆXÝÚ[™SXZÙU\ÝˆÚ[™SXZÙU\ÝÛÛ›Û\‹ˆÛÛ™šYÝ\™PÚ[™SXZÙU\Ý[[YKŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ\Ý[[YKšœÉÎÂš[\ÜÂˆXÝÚ[™U™\œÚ[Û‹ˆÛÛ™šYÝ\™PÚ[™U™\œÚ[ÛœËˆÙ]Ú[™U™\œÚ[ÛœËŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ™\œÚ[Û”Ù\šXÙKšœÉÎÂš[\ÜÂˆ[]™\Ú[™U™\œÚ[Û“Ü[‘]™[Ëˆ\ÐÚ[™U™\œÚ[Û“][˜Ú[™[™Ëˆ™XÛÜ™Ú[™U™\œÚ[ÛXÝ]™KˆØ]ÚÚ[™U™\œÚ[Û”Ý\\™\Ý[ŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ™\œÚ[Û”Ý\\šœÉÎÂš[\ÜÂˆÙ]Ú[™U™\œÚ[Û“ØÚÔØÛÜKˆ\ÐÚ[™T\œÛÛ˜[[[YKŸHœ›ÛH	Ë‹ØÚ[™K[XZÙKÝ™\œÚ[Û”[[YRY[]KšœÉÎÂš[\ÜÈÜ™X]TÝÜ˜YÙR\Ò[™\œÈHœ›ÛH	Ë‹ØÚ[™K[YYXKÜÝÜ˜YÙR\ÉÎÂš[\ÜÂˆÛÛXÝ]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Ëˆ\H]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ËŸHœ›ÛH	Ë‹Ù]X˜\ÙK\Ú^™K]Ø\›š[™Ë\Ý]\ÉÎÂš[\ÜÂˆÙ][™YÚ\Ý\™Y˜Y\›Ëˆ™\Ü˜Y\›È\È™YÚ\Ý\•Ú[™ÝÑ˜Y\›ËŸHœ›ÛH	Ë‹ØÚ[™K[YYXKÙ˜Y\›™YÚ\ÝžIÎÂš[\ÜÈØY[]Y]YTÛ˜\ÚÝ^[ØYÈHœ›ÛH	Ë‹ÛØØ[‹ØYÙ[[œ]]Y]YTÛ˜\ÚÝÉÎÂš[\ÜÂˆ™[[ÝSYYXTØÚ[YTš]š[YÙKˆ™YÚ\Ý\”™[[ÝSYYXT›ÝØÛÛ[™\‹ŸHœ›ÛH	Ë‹Ù]šXÙK[[šËÜ™[[ÝSYYXT›ÝØÛÛ	ÎÂš[\ÜÈØØ[š[TØÚ[YTš]š[YÙK™YÚ\Ý\“ØØ[š[T›ÝØÛÛ[™\ˆHœ›ÛH	Ë‹ÛØØ[š[T›ÝØÛÛ	ÎÂš[\ÜÈ]Y[Ñš[TØÚ[YTš]š[YÙK™YÚ\Ý\]Y[Ñš[T›ÝØÛÛ[™\ˆHœ›ÛH	Ë‹Ø]Y[Ñš[T›ÝØÛÛ	ÎÂš[\ÜÂˆZ[Þ\Ý[T]›ØÚÛ\ÝˆÙ]Ù[œÚ]]™SYYXP›ØÚÛ\Ýˆ\Ô][ÝÙYYØZ[œÝŸHœ›ÛH	Ë‹Ùš[T]ÛXÞIÎÂš[\ÜÈ™XYš[U[X›˜Z[Hœ›ÛH	Ë‹Ùš[U[X›˜Z[	ÎÂš[\ÜÈÜ™X]SÜ[•Ú][™\œËXÛÙT™YÓÝ]]\œÙPÚÜÛÙ\YÙHHœ›ÛH	Ë‹ÛÜ[•Ú]\ÉÎÂš[\ÜÈ™\ÛÛ™TÚ[Ü[”]\™Ù]Hœ›ÛH	Ë‹ÜÚ[Ü[”]	ÎÂš[\ÜÈ[™SÜ[‘š[R[œ›ÝÜÙ\ˆHœ›ÛH	Ë‹ÛÜ[‘š[R[œ›ÝÜÙ\‰ÎÂš[\ÜÈÜ™X]UÚ[™ÝÜÑš[U\›Ü[™\ˆHœ›ÛH	Ë‹ÝÚ[™ÝÜÑš[U\›Ü[™\‰ÎÂš[\ÜÈÚ[™QÚÜÝØÚ[YTš]š[YÙHHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹Ü[[YKÙ[XÝ›Û”Ø[™›ÞY\\‰ÎÂš[\ÜÈ™]Ú™[X\ÙS›Ý\Ë™]Ú™[X\ÙS›Ý\Ò[™^Hœ›ÛH	Ë‹Ü™[X\ÙS›Ý\ÔÙ\šXÙIÎÂš[\ÜÈ™\ÛÛ™UÛÜšÜÜXÙT]ØXÚY™\ÛÛ™UÛÜšÜÜXÙT]˜]ÚØXÚYHœ›ÛH	Ë‹Ü]™\ÛÛ™\‰ÎÂš[\ÜÈ™YÚ\Ý\“ØØ[’\ÈHœ›ÛH	Ë‹ÛØØ[‹Ú\ËÜ™YÚ\Ý\[	ÎÂš[\ÜÈÙ]XÝ]™PØ][ÙÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXÝ]™KXØ][ÙÉÎÂš[\ÜÈ™\ÛÛ™TÙ\ÜÚ[ÛÛÛ^Ú[™ÝÈHœ›ÛH	Ë‹‹ÜÚ\™YÜÙ\ÜÚ[ÛÛÛ^Ú[™ÝÉÎÂš[\ÜÈÙ]Ù\ÜÚ[Û”›ÝÔÛ˜\ÚÝ™\Ý[YQ[]YTÝX˜YÙ[ÛX[\Hœ›ÛH	Ë‹ÛØØ[‹Ú\ËÜÙ\ÜÚ[ÛœÉÎÂš[\ÜÂˆ™YÚ\Ý\“YØXÞSZYÜ˜][Û’\Ëˆ[“YØXÞU\Ù\‘]SZYÜ˜][Û‘›Ü•\Ù\‹ŸHœ›ÛH	Ë‹ÛYØXÞU\Ù\‘]SZYÜ˜][Û‰ÎÂš[\ÜÂˆYÜØØ[›Ùš[Q]X˜\ÙKˆÜ™X]T›ÙXÝ[Û“ØØ[›Ùš[Q]SZYÜ˜][Û‘\Ëˆ[œÜXÝ\ÜÚ]™SØØ[›Ùš[PYÜ[Û‹ŸHœ›ÛH	Ë‹ÛØØ[›Ùš[Q]SZYÜ˜][Û‰ÎÂš[\ÜÈXÜ]Z\™UÚ[™ÝÜÔXÚØYÙY[œÝ[˜ÙP˜\œšY\ˆHœ›ÛH	Ë‹ÝÚ[™ÝÜÔXÚØYÙY[œÝ[˜ÙP˜\œšY\‰ÎÂš[\ÜÈ™YÚ\Ý\‘œÐœ›ÝÜÙR\ÈHœ›ÛH	Ë‹ÙœÐœ›ÝÜÙKÚ\ÉÎÂš[\ÜÂˆ[œÝ\™T™XYH\ÈØØ[‘[œÝ\™T™XYKˆÙ]˜]Ñˆ\ÈØØ[‘Ù]˜]Ñ‹ˆÛÜÙQˆ\ÈØØ[ÛÜÙQ‹ˆÙ]Ý\œ™[”]\ÈØØ[‘Ù]Ý\œ™[”]ˆÙ]”]›Ü•\Ù\‹ŸHœ›ÛH	Ë‹ÛØØ[‹Ú[™^	ÎÂš[\ÜÈÜ™X]QÛY[Ü™X]R[œ›ØÑÛY[Hœ›ÛH	Ë‹ÛØØ[‹ØÛY[ÑÛY[	ÎÂš[\ÜÈÜ™X]SY™XÞXÛQÛY[X[˜YÙ\ˆHœ›ÛH	Ë‹ÛØØ[‹ØÛY[ÛY™XÞXÛQÛY[	ÎÂš[\ÜÂˆÛX\Ý\œ™[ÛY[ˆÙ]Ý\œ™[ÛY[\Ù\’YˆÙ]ÛY[ˆÙ]Ý\œ™[ÛY[ŸHœ›ÛH	Ë‹ÛØØ[‹ØÛY[ØÝ\œ™[	ÎÂš[\ÜÂˆ™XY]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔÝ]Kˆ\œÙQ]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔ]ÚˆÜš]Q]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜËˆ™\Ù]]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜËˆQUSÑUPTÑWÔÒV‘WÕÐT“’S‘×Õ‘TÒÓÑÒP‹ˆÙ]]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÑš[T]ŸHœ›ÛH	Ë‹Ù]X˜\ÙK\Ú^™K]Ø\›š[™Ë\Ù][™ÜÉÎÂš[\ÜÈÜ™X]Q]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\ˆHœ›ÛH	Ë‹Ù]X˜\ÙK\Ú^™K]Ø\›š[™Ë\Ù][™ÜË]Ø]Ú\‹šœÉÎÂš[\ÜÈÜ™X]SØØ[“XZ[[˜[˜ÙR\Ò[™\œÈHœ›ÛH	Ë‹ÛØØ[‹Ú\ËÛXZ[[˜[˜ÙIÎÂš[\ÜÂˆÜ™X]QX[ÙÝYUÛÜšÜÜXÙR[™\œËˆÚXÚÑX[ÙÝYQ\™XÝÜžUÜš]X›KˆÝ\ÝÛQX[ÙÝYUÛÜšÜÜXÙT›ÛÝŸHœ›ÛH	Ë‹ÙX[ÙÝYK]ÛÜšÜÜXÙKZ\ËšœÉÎÂš[\ÜÂˆ™XYX[ÙÝYUÛÜšÜÜXÙTÙ][™ÜËˆÜš]QX[ÙÝYUÛÜšÜÜXÙQ\™XÝÜžKŸHœ›ÛH	Ë‹ÙX[ÙÝYK]ÛÜšÜÜXÙK\Ù][™ÜËšœÉÎÂš[\ÜÈÜš]Q”Û[[Z[™Ñ]”™[][˜ÚÚYÛ˜[Hœ›ÛH	Ë‹ÛØØ[‹Ù]‘”Û[[Z[™Ô™[][˜Ú	ÎÂš[\ÜÂˆØ[˜Ù[”Û[[Z[™ÔÝ\\›ÙÜ™\ÜËˆÙ]”Û[[Z[™ÔÝ\\›ÙÜ™\ÜËˆÝXœØÜšX™Q”Û[[Z[™ÔÝ\\›ÙÜ™\ÜËŸHœ›ÛH	Ë‹ÛØØ[‹Ù”Û[[Z[™ÔÝ\\Ý]IÎÂš[\ÜÈ—ÔÓSSRS‘×ÔÕT•TÔ“ÑÔ‘TÔ×ÐÒS‘ÑQÐÒS“‘SHœ›ÛH	Ë‹‹ÜÚ\™YÛØØ[“XZ[[˜[˜ÙIÎÂš[\ÜÂˆ™\ÛÛ™P™]\”Ü[]S[Ù[Q[žKˆ™\ÛÛ™P™]\”Ü[]S˜]]™Pš[™[™ËŸHœ›ÛH	Ë‹ÛØØ[‹Ø™]\”Ü[]Q˜XÝÜžIÎÂš[\ÜÂˆ™YÚ[”Ù\ÜÚ[Û•\›‘[™YÝ\™\ÜÚ[Û‹ˆœ™Y^™TÙ\ÜÚ[ÛXÝ]™U\›“X\šÙ\œËŸHœ›ÛH	Ë‹ÛØØ[‹ÜÙ\ÜÚ[ÛXÝ]™U\›‰ÎÂš[\ÜÈÙ]š^ž›Q\ˆHœ›ÛH	Ë‹ÛØØ[‹ÛZYÜ˜]IÎÂš[\ÜÈ™\ÛÛ™TÜ[]U™XÑ^]Hœ›ÛH	Ë‹ÛØØ[‹ÜÜ[]U™XÓØY\‰ÎÂš[\ÜÂˆÝ\[X™Y[™ÒÜÝˆÝÜ[X™Y[™ÒÜÝˆÝÜ[X™Y[™ÒÜÝY“›ÔYÚ[•™XÝÜÛÛœÝ[Y\‹ˆ\Ñ[X™Y[™ÒÜÝÝ\YˆÙ][X™Y[™ÔÙ\šXÙKˆ\ÔYÚ[•™XÝÜÛÛœÝ[Y\XÝ]™Kˆ™YÚ\Ý\‘[X™Y[™ÒÜÝ^žTÝ\ˆÙ][X™Y[™ÔÛÝ\˜ÙTÝ\Ü[™Yˆ\H[X™Y[™ÔÙ\šXÙKŸHœ›ÛH	Ë‹Ù[X™Y[™ËZÜÝ	ÎÂš[\ÜÈ™XYÛ]YP\RÙ^HHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØ]]XY\\œÉÎÂš[\ÜÈÝ]›Ý[™™]ÚHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛÝ]›Ý[™Y™]Ú	ÎÂš[\ÜÈ™YÚ\Ý\‘]‘[X™Y[™Ò\ÈHœ›ÛH	Ë‹Ú\ËÙ]‹Ù[X™Y[™ÉÎÂš[\ÜÂˆXÜ]Z\™TTÝX˜YÙ[][˜Ú™[˜ÙKˆÛX\”Ý[TTÝX˜YÙ[][˜Ú™[˜ÙKˆ\ÐXÝ]™TTÝX˜YÙ[[œÔÞ[˜ËˆÝÜ[TÝX˜YÙ[[œÑ›Ü‘^]ŸHœ›ÛH	ÐÚ[™KÛXZÙ\‹XÛÜ™KÜK\ÝX˜YÙ[\[œÉÎÂ‚š[\ÜÈÛ”]Z][œÝ[]Z][™\ˆHœ›ÛH	Ë‹ÛY™XÞXÛIÎÂš[\ÜÂˆØ[˜Ù[SÔÔÚ[][]Ü”Ù\ÜÚ[Û“Ü\˜][ÛœËˆÛX[\SÔÔÚ[][]Ü”™[[Ý™YÙ\ÜÚ[Û‹ˆ\ÜÜÙRSÔÔÚ[][]Ü’ÜÝˆ›\ÚSÔÔÚ[][]Ü“ÝÛ™\œÚ\™YÚ\ÝžKˆÙ]SÔÔÚ[][]Ü”Ù\ÜÚ[Û”Ý]\Ëˆ™XÛÛ˜Ú[T\œÚ\ÝYSÔÔÚ[][]Ü“ÝÛ™\œÚ\ŸHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËÚ[ÜË\Ú[][]Ü‰ÎÂš[\ÜÈX›ÜSÔÔÚ[][]Ü“Ü\˜][ÛœÑ›Ü‘^]Hœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËÚ[ÜË\Ú[][]Ü‹Y^]	ÎÂš[\ÜÂˆÛX\’SÔÔÚ[][]Ü”™[™\™\XØÙ\ÜËˆÛÛ™šYÝ\™RSÔÔÚ[][]ÜYÙ[ÛÛ›ÛÛÛ™š\›X][Û‹ˆÛÛ™šYÝ\™RSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÐÛÛ™š\›X][Û‹ˆÛÛ™šYÝ\™RSÔÔÚ[][]Ü”™[™\™\•\™Ù]Ëˆ[š\š]SÔÔÚ[][]Ü”™[™\™\”Ù\ÜÚ[ÛXØÙ\ÜËˆÞ[˜ÒSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÑ›Ü”Ù\ÜÚ[ÛÚ[™ÙKŸHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËÚ[ÜË\Ú[][]Ü‹\™[™\™\‹XXØÙ\ÜÉÎÂš[\ÜÂˆ\œÙRSÔÔÚ[][]Ü”™[X\ÙQØ]P\™ÜËˆ[’SÔÔÚ[][]Ü”™[X\ÙQØ]Kˆ\HSÔÔÚ[][]Ü”™[X\ÙQØ]S[ÙKŸHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËÚ[ÜË\Ú[][]Ü‹\™[X\ÙKYØ]IÎÂš[\ÜÈ[š]Ý\\XYÛ›ÜÝXÜÈHœ›ÛH	Ë‹ÜÝ\\YXYÛ›ÜÝXÜÉÎÂš[\ÜÂˆ[œÝ[ÝÙ\‘]™[XYÛ›ÜÝXÜËˆ[œÝ[Ú[™ÝÔ™\ÜÛœÚ]™[™\ÜÑXYÛ›ÜÝXÜËŸHœ›ÛH	Ë‹ÜÝÙ\•ØZÙQXYÛ›ÜÝXÜÉÎÂš[\ÜÂˆœ›ØYØ\Ý›ÚXÙR[œ]ÝÙ\”Ý]Kˆ[œÝ[›ÚXÙR[œ]ÝÙ\”™[X\ÙKŸHœ›ÛH	Ë‹Ý›ÚXÙKZ[œ]ÜÝÙ\”™[X\ÙS›ÝYšY\‰ÎÂš[\ÜÈ™X\Û]YSÜœ[œÔÞ[˜ÈHœ›ÛH	Ë‹ØÛ]YK[Üœ[‹\™X\\‰ÎÂš[\ÜÈÝ\YÙ[›ØÙ\ÜÔš[Üš]UØ]Ú\ˆHœ›ÛH	Ë‹ØYÙ[\›ØÙ\ÜË\š[Üš]IÎÂš[\ÜÈ™YÚ\Ý\”›ØÙ\ÜÓ[Ûš]Ü’\ÈHœ›ÛH	Ë‹Ü›ØÙ\ÜË[[Ûš]Ü‹Ú\ËšœÉÎÂš[\ÜÈ\ÜÜÙUÚ[™ÝÜÔ›ØÙ\ÜÔØØ[•ÛÜšÙ\œÈHœ›ÛH	Ë‹Ü›ØÙ\ÜË[[Ûš]Ü‹ÝÚ[™ÝÜÔ›ØÙ\ÜÔØØ[•ÛÜšÙ\ÛY[šœÉÎÂš[\ÜÂˆ[š]\˜YÙTÙ\šXÙKˆÛX\[Ù\ÜÚ[Û][[Û‹ˆ™Yœ™\ÚÚ[™ÝÜÐ\˜YÙKŸHœ›ÛH	Ë‹Ø\˜YÙTÙ\šXÙIÎÂš[\ÜÈ[š]›ÝYšXØ][Û”Ù\šXÙHHœ›ÛH	Ë‹Û›ÝYšXØ][Û”Ù\šXÙIÎÂš[\ÜÈ[š]ÙXÛÛQÜ›Ý\›ÝYšXØ][Û’\ÈHœ›ÛH	Ë‹ÝÙXÛÛQÜ›Ý\›ÝYšXØ][Û‰ÎÂš[\ÜÈÙ]YÙ[\Û[™Ù\šXÙK[š]YÙ[\Û[™Ù\šXÙHHœ›ÛH	Ë‹ØYÙ[Z\Û[™ÜÙ\šXÙKšœÉÎÂš[\ÜÈ]XÚÛÜšÓÝY\ÛÙ^Ú[™ÝÔ™]™X[Hœ›ÛH	Ë‹ÝÛÜšÛÝY\‹XÛÙ^Ú[™^šœÉÎÂš[\ÜÂˆ\ÜÜÙR[œ]]šXÙ\Ëˆ™\Ý[YR[œ]]šXÙU\ÚÔÛÝËˆÝ\[œ]]šXÙT[[YKˆÝ\[œ]]šXÙ\ËˆÝ\Ü[™[œ]]šXÙU\ÚÔÛÝËˆ\]R[œ]]šXÙTÙ\ÜÚ[ÛXÝ]š]KŸHœ›ÛH	Ë‹Ú[œ]Y]šXÙ\ËÚ[™^šœÉÎÂš[\ÜÂˆ\Ð\ÛÛ[Ú[™ÝËˆ\Ñ›ØÝ\ÙY\ÛÛ[Ú[™ÝËˆX\šÐ\ÛÛ[Ú[™ÝËŸHœ›ÛH	Ë‹ÝÚ[™ÝÑ›ØÝ\ÐÛ\ÜÚYšY\‹šœÉÎÂš[\ÜÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[ˆ\Õ\ÝY\™[™\™\‘]™[ˆ\Õ\ÝYÚ[™T™[™\™\•Ú[™ÝËˆ\Õ\ÝY\™[™\™\•Ú[™ÝËŸHœ›ÛH	Ë‹ÜÙXÝ\š]KÝ\ÝY\™[™\™\‹šœÉÎÂš[\ÜÈ\ÓXZ[”Ú[Ú[™ÝÕ\›Hœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹ÜØÚY[TÛÝšœÉÎÂš[\ÜÈØ[š]^™QÚÜÝ›ÝXÙU^Hœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹Û›ÝYžTÛÝšœÉÎÂš[\ÜÈ\Ò\Ñ\œ›ÜˆHœ›ÛH	Ë‹‹ÜÚ\™YÚ\ËY\œ›ÜœÉÎÂš[\ÜÈ™XYš[Pž]\Ñ›Ü”™]šY]ÈHœ›ÛH	Ë‹Ùš[T™XYž]\ËšœÉÎÂš[\ÜÈÛÜT™ÕÐÛ\›Ø\™Hœ›ÛH	Ë‹Ü™ÐÛ\›Ø\™šœÉÎÂš[\ÜÈÓÔWÔ‘×Õ×ÐÓT“ÐT‘ÐÒS“‘SHœ›ÛH	Ë‹‹ÜÚ\™YÜ™ÐÛ\›Ø\™šœÉÎÂš[\ÜÈ[š]X\™X]Ù\šXÙHHœ›ÛH	Ë‹ÚX\™X]Ù\šXÙIÎÂš[\ÜÈ™YÚ\Ý\”™[[ÝQ\ÚÝÜ\ÈHœ›ÛH	Ë‹Ü™[[ÝKY\ÚÝÜ	ÎÂš[\ÜÈ[š][˜[]XÜÔÙ][™ÜÔÙ\šXÙK›ÝP]]ÛÛÝ\Ý]HHœ›ÛH	Ë‹Ø[˜[]XÜÔÙ][™ÜÔÙ\šXÙIÎÂš[\ÜÈ[š]ÙÕ\ØYÙ\šXÙKØÚY[TÝ\\˜XÚÙš[Hœ›ÛH	Ë‹ÛÙË]\ØY	ÎÂš[\ÜÈ™YÚ\Ý\•š\ÚX›U^˜[œÛ][Û’\ÈHœ›ÛH	Ë‹Ýš\ÚX›U^˜[œÛ][Û”Ù\šXÙKšœÉÎÂš[\ÜÈÚ[™ÝÓX[X[˜YÐÛÛ›Û\ˆHœ›ÛH	Ë‹ÝÚ[™ÝÓX[X[˜YÉÎÂš[\ÜÈ\ÜÝYUÜš]X›Q\™XÝÜžTXÚÙ\‘Ü˜[Hœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÝÜš]X›Q\™XÝÜžTXÚÙ\‘Ü˜[šœÉÎÂ‹ËÈ:+¯¹i!ù.¤º e
+:-ê:+¯¹i!ú/ç9ê"ù£©ùb-ŠNˆ™[^H:/ç¹£©HÜÝ
+È9o 9alËú+¯¹i!ùb%ú(jTÂš[\ÜÂˆ[š]]šXÙS[šÔÙ\šXÙKˆ™[X\ÙQ]šXÙS[šÓÝÛ™\œÚ\™Y›Ü™SÙÛÝ]ˆ[™Q]šXÙS[šÔÞ\Ý[T™\Ý[YKŸHœ›ÛH	Ë‹Ù]šXÙK[[šÉÎÂš[\ÜÂˆÙ]\]T™[][˜ÚÛÛ›Û\œËˆ\Ò[‘›YÚ™[[ÝR[›ÚÙ\ËˆÙ]\ÝÜžUÛÛ˜[YT™XY\‹ˆ\ÚÙ\ÜÚ[ÛXÝ]š]UÐÛÛ›Û\‹ˆÙ]Ù\ÜÚ[ÛœÔÝXœØÜšX™Y\Ý[™\‹ŸHœ›ÛH	Ë‹Ù]šXÙK[[šËÙ\Ü]Ú	ÎÂš[\ÜÂˆ™YÚ\Ý\‘]šXÙS[šÒ\ËˆY˜][\È\È]šXÙS[šÒ\Ñ\Ëˆ[™R[›ÚÙH\È]šXÙS[šÒ[™R[›ÚÙKˆÙ]Z\œ›ÜØXÚT™XYØ]KŸHœ›ÛH	Ë‹Ù]šXÙK[[šËÚ\ÉÎÂš[\ÜÈÙ]Z\œ›ÜØXÚKZ\œ›ÜØXÚT\™ÙQ\œ›ÜˆHœ›ÛH	Ë‹Ù]šXÙK[[šËÛZ\œ›ÜØXÚTÝÜ™IÎÂš[\ÜÈ˜Z[”\™ÙT]Y]YK[œ]Y]YT\™ÙHHœ›ÛH	Ë‹Ù]šXÙK[[šËÛZ\œ›ÜØXÚT\™ÙT]Y]YIÎÂš[\ÜÈ\ÜÙ\Ø\\™RX[HHœ›ÛH	Ë‹Ù]šXÙK[[šËÚ[›ÚÙK\™YÚ\ÝžIÎÂš[\ÜÈ™YÚ\Ý\”™[[ÝT™\ÛÝ\˜Ù\Ò\ÈHœ›ÛH	Ë‹Ù]šXÙK[[šËÜ™[[ÝT™\ÛÝ\˜Ù\Ò\ÉÎÂ‹ËÈÛÜšÝ™YK\\˜[[\Ù\ÜÚ[ÛœÎˆTÈ9¬ê9a£
+ÈÛÜÙK\Ù\ÜÚ[Ûˆ9a¡yæ¡š\™KX[™Y›Ü™Ù]9b(:fi:dªykdš[\ÜÂˆ™YÚ\Ý\•ÛÜšÝ™YR\ËˆÛÜšÝ™YTÛÛˆ™XÛÛ˜Ú[T[™[™ÔØY™Q\™XÝÜžPÛX[\ËŸHœ›ÛH	Ë‹ÝÛÜšÝ™YIÎÂ‹ËÈÚYÝÈØ]™\Ú[:dï¹æ¡9d+ùbª9§'ùkîz-)Š9ki9a/È™YœËØÚ[™KÜØ]™\Ú[ËÊˆ9®!yä!ŠBš[\ÜÈ™XÛÛ˜Ú[TØ]™\Ú[™YœÑ›Ü‘[]YÙ\ÜÚ[ÛœÈHœ›ÛH	Ë‹ÙÚ]\Û˜\ÚÝÜØ]™\Ú[ÛX[\	ÎÂ‹ËÈÙ\ÜÚ[Û‹YÚ]\‹XÛÛ^ˆ9/&º+çyb!¹¥+ù¡'ùçéH
+Èˆ9alú e9â­¹  HTÂš[\ÜÈ™YÚ\Ý\‘Ú]ÛÛ^\Ë\ÜÜÙQÚ]ÛÛ^Hœ›ÛH	Ë‹ÙÚ]XÛÛ^	ÎÂš[\ÜÈ™YÚ\Ý\‘Ú]™]šY]Ñ]šXÙSÜ™YÚ\Ý\‘Ú]™]šY]Ò\ÈHœ›ÛH	Ë‹ÙÚ]\™]šY]ÉÎÂš[\ÜÈ™YÚ\Ý\”›Ú™XÝÜ™\’\ÈHœ›ÛH	Ë‹Ü›Ú™XÝÜ™\”ÝÜ™IÎÂš[\ÜÈ™YÚ\Ý\”ÚYX˜\”Ù][™ÜÒ\ÈHœ›ÛH	Ë‹ÜÚYX˜\”Ù][™ÜÔÝÜ™IÎÂš[\ÜÈ™YÚ\Ý\“[Ù[š\ÚXš[]SÝÛ™\ÛZ[R\ÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[]š\ÚXš[]K[ÝÛ™\‹XÛZ[KšœÉÎÂš[\ÜÈ™YÚ\Ý\”™[[ÝT™XÜ™X]YÛÜšÝ™YSYÙ\’\ÈHœ›ÛH	Ë‹Ü™[[ÝT™XÜ™X]YÛÜšÝ™YSYÙ\‰ÎÂš[\ÜÈ™YÚ\Ý\•\›Z[˜[[™\œÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÝ\›Z[˜[Z[™\œÉÎÂš[\ÜÈ™YÚ\Ý\“ØØ[[Y\Ò\ÈHœ›ÛH	Ë‹ÛØØ[][Y\ËÜ™YÚ\Ý\‰ÎÂš[\ÜÂˆ™YÚ\Ý\”™[[ÝTÜÚ\Ëˆ\ÜÜÙT™[[ÝTÜÚÛÛˆÝ\]]ÐÛÛ›™XÝÜÝÐ˜XÚÙÜ›Ý[™ˆ\ÐØÓYÜ•\Ü˜YR[‘›YÚŸHœ›ÛH	Ë‹Ü™[[ÝK\ÜÚ	ÎÂš[\ÜÂˆ™YÚ\Ý\’ÛÚÐÛÛ›Û\ËˆÝ\ÛÚÐÛÛ›ÛXØÛÝ[ˆÝÜÛÚÐÛÛ›ÛXØÛÝ[ˆ™\Ù]ÛÚÐÛÛ›ÛÝÛ™\›Ý[™\žKˆ\ÜÜÙRÛÚÐÛÛ›ÛŸHœ›ÛH	Ë‹ÚÛÚËXÛÛ›Û	ÎÂš[\ÜÈÝ\XØÛÝ[[YÜ˜][ÛœÐY\“ÝÛ™\‘”™XYHHœ›ÛH	Ë‹ØXØÛÝ[[YÜ˜][Û”Ý\\	ÎÂš[\ÜÈ™YÚ\Ý\”ÚÚ[X’\ÈHœ›ÛH	Ë‹ÜÚÚ[X‹Ü™YÚ\Ý\’\ÉÎÂš[\ÜÈ\Ý[ÝÙYÚÚ[X”›Ú™XÝ›ÛÝÈHœ›ÛH	Ë‹ÜÚÚ[X‹Ø[ÝÙY›Ú™XÝ›ÛÝÉÎÂš[\ÜÈÚÚ[X“X\šÙ]Ù\šXÙHHœ›ÛH	Ë‹ÜÚÚ[X‹ÛX\šÙ]Ù\šXÙIÎÂš[\ÜÈÚÚ[X]]ÔÞ[˜ÔÙ\šXÙHHœ›ÛH	Ë‹ÜÚÚ[X‹Ø]]ÔÞ[˜ÔÙ\šXÙIÎÂš[\ÜÈ™ZY˜]PÛÜÙTÝ\™\ÜÚ[ÛˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜ™ZY˜]PÛÜÙTÝ\™\ÜÚ[Û‹šœÉÎÂš[\ÜÂˆZ[[”ÚÚ[\ØÜš\ÜœËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØZ[Z[‹\ÚÚ[ËšœÉÎÂš[\ÜÈ\ÐÚ[™SX\›”ÚÚ[[˜X›YHœ›ÛH	Ë‹ÜÚÚ[X‹ØXÝ]˜][Û”™Y™\™[˜Ù\ÉÎÂ‹ËÈXZÙ\ˆÛÜ™H9. :f-¹«­zaãy§¡;ï"9¥¬:dïº-ëûï"x %8 %:gfy  H[\Ü:`oùacH[˜[ZXÈ[\Ü:)é¹cäHš]HÚ[šÚ[™Â‹ËÈ:+ªH[XYÙT›ÝØÛÛ9ëbzg :) H\œ™XYH9bcy¬ê9a£9æ¡9ª(ygeú-äyg*:e&z+ëù¥í¹§.¸à ™Ù]XZÙ\Š
+H9¦+È^žH9æ¡;ï#‹ËÈ:gfy  H[\Ü9.#y/&º)é¹cäHXZÙ\ˆÈYÙ[9æ¡9k§¹/¢ùc%¸à ‚š[\ÜÂˆ\ÚÝÜÛ]YP]]Y\\‹ˆÙ]XZÙ\ˆ\ÈÙ]XZÙ\ÛÜ™KˆÙ]XZÙ\’Y”™XYKˆ™\Ù]XZÙ\‹ˆÚ]ÝÛ“ÜÙ\™\”ÛÛˆ™\\™PÛÙ^›Ü]][ÙPÚ[™ÙKˆØ[˜Ù[ÛÙ^]][ÙPÚ[™ÙKˆš[˜[^™PÛÙ^Y\]][ÙPÚ[™ÙKˆ™XYÛÙ^[[YT›Ý]Kˆœ›ØYØ\ÝÛ]YP]]Ý]PÚ[™ÙYˆ™Yœ™\ÚÙ[XÝX›S[Ù[Ð[™œ›ØYØ\Ýˆœ›ØYØ\ÝZP]]Ý]PÚ[™ÙYˆ™Yœ™\Ú›ÝšY\XØÙ\ÜÐY\]]Ú[™ÙKˆÙ]›ÝšY\XØÙ\ÜÔ[[YT™Yœ™\Ú\Ý[™\‹ˆ™\Ý\ÛÙ^Y\]][ÙPÚ[™ÙKˆØZ]›Ü’[š]X[Ý\ÝÛSXÜ™Yœ™\Úˆ™YÚ\Ý\”PYÙ[Y]˜Z[X›KŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÚ[™^šœÉÎÂš[\ÜÈÜ™X]TT[[YT™XÛÝ™\žHHœ›ÛH	Ë‹ØYÙ[Xš[˜\šY\ËÜK\[[YK\™XÛÝ™\žKšœÉÎÂš[\ÜÈÜ™X]Q[˜[ZXÓXZÙ\ˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÙ[˜[ZXË[XZÙ\‹šœÉÎÂš[\ÜÈ[œÝ\™P[™Yš\Ü™\™XYHHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜ[[YKXÛÛ™šYÜËšœÉÎÂš[\ÜÂˆ[œÝ\™PXÝ]™PØ][ÙÓØYYˆÙ]\ÚÝÜÙ[XÝX›PØ][ÙËˆ™Yœ™\ÚÝ\ÝÛT›ÝšY\œÒ[ÐØ][ÙËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÜ™X]Q\ÚÝÜ›ÝšY\”Ù\šXÙKšœÉÎÂš[\ÜÈ\ÐÚ[™Q[X™Y[™Ó[Ù[]˜Z[X›HHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜ›ÝšY\‹XXØÙ\ÜË\ÛXÞKšœÉÎÂš[\ÜÈÙ]Ý\ÝÛT›ÝšY\œÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXÝ]™KXØ][ÙËšœÉÎÂš[\ÜÈÛX\“[Ù[š\ÚXš[]SZ\œ›ÜˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[]š\ÚXš[]K[Z\œ›Ü‹šœÉÎÂš[\ÜÈÙ]Û]YTÝ\ÜY[Ù[Ó\Ý[™\ˆHœ›ÛH	ÐÚ[™KÛXZÙ\‹XÛÜ™IÎÂš[\ÜÂˆ›ÝP[›ÜXÔÙÔÝ\ÜY[Ù[Ëˆ™Yœ™\Ú[›ÜXÓ[Ù[Ñœ›ÛRˆÛX\[›ÜXÑ\ØÛÝ™\™Y[Ù[ËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[Y\ØÛÝ™\žKØ[›ÜXËšœÉÎÂš[\ÜÂˆÛX\–ZQ\ØÛÝ™\™Y[Ù[Ëˆ\ØØ\™ZS[Ù[Ñ\ÚÐØXÚKˆØYZS[Ù[Ñœ›ÛQ\ÚÐØXÚKˆ™Yœ™\ÚZS[Ù[Ñœ›ÛRŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[Y\ØÛÝ™\žKÞZKšœÉÎÂš[\ÜÈ›ÝYžSÜ[ZSYYXPÜ™Y[X[Ú[™ÙYHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[Y\ØÛÝ™\žKÛÜ[˜ZK[YYXKšœÉÎÂš[\ÜÈ™Yœ™\ÚÝ\ÝÛSXÜ›ÝšY\œÈHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËØÝ\ÝÛK[XÜ\™YÚ\ÝžKšœÉÎÂš[\ÜÂˆÛX\–ZT˜]S[Z]Û˜\ÚÝˆÛX\–ZTÝXœØÜš\[Û•\ØYÙTÛ˜\ÚÝŸHœ›ÛH	Ë‹Ý\ØYÙPœ›ØYØ\Ý\‹šœÉÎÂš[\ÜÂˆ[œÝ\™P[›ÜXÐÛÛ\]›ÞT™XYKˆ\ÜÜÙP[›ÜXÐÛÛ\]›ÞKŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØ[›ÜXËXÛÛ\]\›ÞKZÜÝšœÉÎÂš[\ÜÂˆÛÛ]YTÙ\ÜÚ[Û”›Ý]PÚ[™ÙKˆ™XYÛ]YTÙ\ÜÚ[Û”›Ý]KŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛ]YK\Ù\ÜÚ[Û‹\›Ý]K\™YÚ\ÝžKšœÉÎÂš[\ÜÂˆ\ÜÜÙPÛÙ^›ÞKˆÙ]ÛÙ^›ÞP]][š™XÝ[Û”Ý]KŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛÙ^\›ÞKZÜÝšœÉÎÂš[\ÜÂˆ\ÜÜÙPœ›ÝÜÙ\”[[YKˆ™YÚ\Ý\œ›ÝÜÙ\˜XÚÙ[™\ËˆÙ]œ›ÝÜÙ\”Ù\ÜÚ[Û•\ØY›ÛÝ™\ÛÛ™\‹ˆÙ]XZ[•Ú[™ÝÐXØÙ\ÜÛÜ‘›Ü˜XÚÙ[™ˆÙ][œÝ\™RÜÝ›Ü˜XÚÙ[™ˆÙ]\Ñ]XÚY›Ü˜XÚÙ[™ŸHœ›ÛH	Ë‹ÛXÜZ[YÜ˜][ÛœËØœ›ÝÜÙ\‹šœÉÎÂš[\ÜÈœØ•Ú[™ÝÐÛÛ›Û\ˆHœ›ÛH	Ë‹ÜšYÚ\ÚYX˜\‹]Ú[™ÝËØÛÛ›Û\‹šœÉÎÂš[\ÜÈ™\ÛÛ™TœØ’ÜÝÛÛ^œ›ÛTÙ\ÜÚ[ÛˆHœ›ÛH	Ë‹ÜšYÚ\ÚYX˜\‹]Ú[™ÝËÜ™\ÛÛ™RÜÝÛÛ^šœÉÎÂš[\ÜÈÜ™X]TšYÚÚYX˜\•Ú[™ÝÈHœ›ÛH	Ë‹ÜšYÚ\ÚYX˜\‹]Ú[™ÝËÝÚ[™ÝËšœÉÎÂš[\ÜÈ™YÚ\Ý\”œØ•Ú[™ÝÒ\ÈHœ›ÛH	Ë‹ÜšYÚ\ÚYX˜\‹]Ú[™ÝËÚ\ËšœÉÎÂš[\ÜÈ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜÈHœ›ÛH	Ë‹Ü™[[ÝKY\ÚÝÜ]šY]Ù\‹ÝÚ[™ÝÜËšœÉÎÂš[\ÜÈ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\ˆHœ›ÛH	Ë‹Ü™\ÛÝ\˜ÙK]\ØYÙK]Ú[™ÝËØÛÛ›Û\‹šœÉÎÂš[\ÜÈÜ™X]T™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÈHœ›ÛH	Ë‹Ü™\ÛÝ\˜ÙK]\ØYÙK]Ú[™ÝËÝÚ[™ÝËšœÉÎÂš[\ÜÈ™YÚ\Ý\”™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÒ\ÈHœ›ÛH	Ë‹Ü™\ÛÝ\˜ÙK]\ØYÙK]Ú[™ÝËÚ\ËšœÉÎÂš[\ÜÈ\Ô™\ÛÝ\˜ÙU\ØYÙSÜ[”Ù[™\ˆHœ›ÛH	Ë‹Ü™\ÛÝ\˜ÙK]\ØYÙK]Ú[™ÝËÛÜ[‹\Ù[™\‹šœÉÎÂš[\ÜÈÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\ˆHœ›ÛH	Ë‹ÙÚÜÝ\[™[]Ú[™ÝËØÛÛ›Û\‹šœÉÎÂš[\ÜÈÜ™X]QÚÜÝ[™[Ú[™ÝÈHœ›ÛH	Ë‹ÙÚÜÝ\[™[]Ú[™ÝËÝÚ[™ÝËšœÉÎÂš[\ÜÈ™YÚ\Ý\‘ÚÜÝ[™[Ú[™ÝÒ\ÈHœ›ÛH	Ë‹ÙÚÜÝ\[™[]Ú[™ÝËÚ\ËšœÉÎÂš[\ÜÂˆ]ÚÚÜÝ[™[Ú[™ÝÑ[žKˆ™XYÚÜÝ[™[Ú[™ÝÜÔÙ][™ÜËˆ™[[Ý™QÚÜÝ[™[Ú[™ÝÑ[žKˆ™\Ù]ÚÜÝ[™[Ú[™ÝÔÙ][™ÜÑ›Ü”Ý\\ŸHœ›ÛH	Ë‹ÙÚÜÝ\[™[]Ú[™ÝËÜÙ][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆ™XYœØ•Ú[™ÝÔÙ][™ÜËˆ™\Ù]œØ•Ú[™ÝÔÙ][™ÜÑ›Ü”Ý\\ˆÜš]TœØ•Ú[™ÝÔÙ][™ÜÔ]ÚŸHœ›ÛH	Ë‹ÜšYÚ\ÚYX˜\‹]Ú[™ÝËÜÙ][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆ[žTÙ\ÜÚ[Û’[•\›‹ˆ\PÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙUÚ]™\Ý\ˆÛX\‘Y™\œ™YÛÙ^™\Ý\›Ü“ÝÛ™\›Ý[™\žKˆØÚY[QY™\œ™YÛÙ^™\Ý\ˆÛX\•ÛÜšÚ[™Ñ\™XÝÜžT™XÛÝ™\žQ›Ü“ÝÛ™\›Ý[™\žKˆÛÛXÝYÙ[[œ]]Y]YTØØ[•^ËˆÜ™X]P]]ÛX][Û•\Ù\•\›‘Ú]˜\Ù[[™RÛÚÜËˆ™YÚ\Ý\“[Ù[š\ÚXš[]TÞ[˜Ò\Ëˆ™YÚ\Ý\“XZÙ\’\È\È™YÚ\Ý\“XZÙ\ÛÜ™R\Ëˆ™\ÝÜ™P›Ý[[YQ›ÜÝ\œ™[ÝÛ™\‹ˆ\ÔÙ\ÜÚ[Û•\›”[™[™ÐÛÛ\][Û‹ˆÝÜÜ˜ØRYUØ]Ú\‹ˆÙ]ÛØ[ÛX\“ØœÙ\™\‹ˆÙ]ÛØ[Y™\œ™Y™\Ý[YPØ[˜Ù[ØœÙ\™\‹ˆÙ]ÛØ[YSØœÙ\™\‹ˆÙ]ÛØ[ÝÜØœÙ\™\‹ˆÙ]ÛØ[\ÚÐ[œÝÙ\“ØœÙ\™\‹ˆÚ]Ù[™ÔÙ\ÜÚ[Û“ØÚËŸHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜ™YÚ\Ý\‹šœÉÎÂš[\ÜÈÛX[\XÝ]™T™]šY]Ð\Y˜XÝÛ˜\ÚÝÈHœ›ÛH	Ë‹Ü™]šY]Ù\‹Ü™]šY]Ð\Y˜XÝÛ˜\ÚÝšœÉÎÂš[\ÜÈPRÑT—ÒS•“ÒÑH\ÈPRÑT—ÒT×ÒS•“ÒÑKPRÑT—ÔTÒPRÑT—ÔÑS‘Hœ›ÛH	Ë‹ÛXZÙ\‹Z\ËØÚ[›™[ËšœÉÎÂš[\ÜÂˆ™\Ù\™SYØXÞSXZÙ\“Y[[ÜžQ\ØX›Yˆ™XYY[[ÜžTÙ][™ÜËˆ™XYY[[ÜžTÙ][™ÜÔÝ]KŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛY[[ÜžK\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆÜ™X]P\›ØÝ\Ð]]Ô™Yœ™\Ú˜XÚÙ\‹ˆ™Yœ™\Ú›ÝšY\“[Ù[ÓX[X[Kˆ™\]Y\Ý›ÝšY\“[Ù[]]Ô™Yœ™\Úˆ™\Ù]›ÝšY\“[Ù[]]Ô™Yœ™\ÚÛÛÛÝÛœËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜ›ÝšY\‹[[Ù[X]]Ë\™Yœ™\ÚšœÉÎÂš[\ÜÂˆ\ØÛÝ™\XØÛÝ[›ÝšY\“[Ù[Ëˆ™\Ù]XØÛÝ[›ÝšY\”[[Y\ËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXØÛÝ[\›ÝšY\‹[[Ù[\™Yœ™\ÚšœÉÎÂš[\ÜÂˆXØÛÝ[›ÝšY\”™XY[™\ÜÐ˜\œšY\‹ˆÚÝ[ÛX\Ø][ÙÐY\’›Ú[š[™Ô™]š[Ý\ÔØÛÜKŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXØÛÝ[\›ÝšY\‹\™XY[™\ÜËX˜\œšY\‹šœÉÎÂš[\ÜÂˆXØÛÝ[›ÝšY\”™XY[™\ÜÐ\›KˆÚÝ[š\™T[™[™Ô™XY[™\ÜÔÝ\ˆÚÝ[ÙY\[™[™Ô™XY[™\ÜÔÝ\ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXØÛÝ[\›ÝšY\‹\™XY[™\ÜËX\›KšœÉÎÂš[\ÜÂˆ[œÝ\™PÝ\œ™[XØÛÝ[›ÝšY\”™XY[™\ÜËˆÙ]XØÛÝ[›ÝšY\”™XY[™\ÜÔ™XYR[™\‹ˆÚÝ[Ý\™XY[™\ÜÐÛÛœÝ[Y\œËŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØXØÛÝ[\›ÝšY\‹\™XY[™\ÜËY[œÝ\™KšœÉÎÂš[\ÜÂˆ™XY[QY˜][Ù][™ÜÔÝ]Kˆ™\Ù][QY˜][Ù][™ÜËˆ™\Ù][QY˜][Ù][™ÜÑÛØ˜[ˆ™\Ù][QY˜][Ù][™ÜÐÚ[›™[ˆÜš]R[QY˜][Ù][™ÜÔ]ÚŸHœ›ÛH	Ë‹Ú[KÙY˜][Ù][™ÜÔÝÜ™KšœÉÎÂš[\ÜÈ\ÐÛ]YPZSÐ]]Hœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛ]YKXÜ™Y[X[Ë\ÝÜ™KšœÉÎÂš[\ÜÂˆ\ØÛÛ›™XÝÛ]YPZSÐ]]ˆ™XÛÛ›™XÝÛ]YPZSÐ]]ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛ]YK[Ø]]\™Yœ™\ÚšœÉÎÂš[\ÜÈ™YÚ[Û]YSØØ[ÙÚ[‹Ø[˜Ù[Û]YSÐ]]ÙÚ[ˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛ]YK[Ø]][ÙÚ[‹šœÉÎÂš[\ÜÂˆ[‘Ü›ÚÓÐ]]ÙÚ[‹ˆØ[˜Ù[Ü›ÚÓÐ]]ÙÚ[‹ˆÙÛÝ]Ü›ÚËˆ\ÑÜ›ÚÓÐ]]ÙÚ[‹ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÙÜ›ÚË[Ø]][ÙÚ[‹šœÉÎÂš[\ÜÈÙ]ZP]][˜[Y]Y[™\ˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÞZKX]]Z[˜[Y][Û‹ZÜÝšœÉÎÂš[\ÜÈÛX\–ZSYYXS[Ù[ÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛ[Ù[Y\ØÛÝ™\žKÞZK[YYXKšœÉÎÂš[\ÜÂˆÙ]Ú]ÜœšYÙP]]ˆ[˜[Y]PÚ]ÜœšYÙP]]ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØ[›ÜXË\™\ÜÛœÙ\ËXœšYÙKZÜÝšœÉÎÂš[\ÜÂˆ™XYÚ[[[˜Üž\Y™]žTÙ][™ÜÔÝ]Kˆ™\Ù]Ú[[[˜Üž\Y™]žTÙ][™ÜËˆÜš]TÚ[[[˜Üž\Y™]žQ[˜X›YŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÚ[[Y[˜Üž\Y\™]žK\ÝÜ™KšœÉÎÂš[\ÜÂˆ™XYÙ\ÜÚ[Û”[[YQ˜[˜XÚÔÙ][™ÜÔÝ]Kˆ™\Ù]Ù\ÜÚ[Û”[[YQ˜[˜XÚÔÙ][™ÜËˆÜš]TÙ\ÜÚ[Û”[[YQ˜[˜XÚÑ[˜X›YŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÙ\ÜÚ[Û‹\[[YKY˜[˜XÚË\ÝÜ™KšœÉÎÂš[\ÜÈÛX\[Ù\ÜÚ[Û”›ÝšY\œÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÙ\ÜÚ[Û‹\›ÝšY\‹\ÝÜ™KšœÉÎÂš[\ÜÈÛX\[Ù\ÜÚ[Û”[[YP^\ÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÙ\ÜÚ[Û‹YY™›Ü\ÝÜ™KšœÉÎÂš[\ÜÈÛX\[Ù\ÜÚ[Û”[[YPÛÛ›ÛÝ]\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜÙ\ÜÚ[Û”[[YPÛÛ›ÛšœÉÎÂš[\ÜÂˆ™\ÛÛ™SÝÛ™\”ØÛÜYÙXÜ™]ÝÜ˜YÙRÙ^KˆÙ]›ÝšY\”ÙXÜ™]ÝÜ™KŸHœ›ÛH	Ë‹ÜÙXÜ™]ËÜ›ÝšY\”ÙXÜ™]ÝÜ™KšœÉÎÂš[\ÜÂˆZ[[\RÙ^R\ËˆZ[[\RÙ^T™[[Ý™KˆZ[[\RÙ^TÝÜ™KˆZ[[\RÙ^T™\Ù[][Û’Yˆ\HZ[[\RÙ^PœšYÙQ\ËŸHœ›ÛH	Ë‹ÜÙXÜ™]ËØZ[[\RÙ^PœšYÙKšœÉÎÂš[\ÜÂˆ\ÐÝ\ÝÛT›ÝšY\”[[YRÙ^TÝÜ˜YÙRÙ^Kˆ\Ô™[™\™\XØÙ\ÜÚX›TØY™TÝÜ˜YÙRÙ^Kˆ\H›ÝšY\”ÙXÜ™]YŸHœ›ÛH	Ë‹‹ÜÚ\™YÜ›ÝšY\”ÙXÜ™]ËšœÉÎÂš[\ÜÂˆ™XYÛÛ\XÝ[Û”Ýˆ™XYÛÛ\XÝ[Û”Ý]Kˆ™\Ù]ÛÛ\XÝ[Û”ÝˆÜš]PÛÛ\XÝ[Û”Ýˆ™XYPÛÛ\XÝ[Û”Ýˆ™XYPÛÛ\XÝ[Û”Ý]Kˆ™\Ù]PÛÛ\XÝ[Û”ÝˆÜš]TPÛÛ\XÝ[Û”ÝŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛÛ\XÝ[Û‹\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆ™XYÝX˜YÙ[[Ù[Ù][™ÜËˆ™XYÝX˜YÙ[[Ù[Ù][™ÜÔÝ]Kˆ™\Ù]ÝX˜YÙ[[Ù[Ù][™ÜËˆÜš]TÝX˜YÙ[[Ù[Ù][™ÜÔ]ÚŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÜÝX˜YÙ[[[Ù[\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆ™XYš\Ú[ÛœšYÙTÙ][™ÜËˆ™XYš\Ú[ÛœšYÙTÙ][™ÜÔÝ]Kˆ™\Ù]š\Ú[ÛœšYÙTÙ][™ÜËˆÜš]Uš\Ú[ÛœšYÙTÙ][™ÜËŸHœ›ÛH	Ë‹Ýš\Ú[Û‹XœšYÙKÝš\Ú[Û‹XœšYÙK\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\Ü\HÈš\Ú[ÛœšYÙTÙ][™ÜÈHœ›ÛH	Ë‹‹ÜÚ\™YÝš\Ú[ÛœšYÙTÙ][™ÜËšœÉÎÂš[\ÜÈ™XYÜ[ÙTÙ][™ÜËÜš]SÜ[ÙQ[˜X›YHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛÜ[[ÙK\ÝÜ™KšœÉÎÂš[\ÜÂˆ™XYÚ][X™Y[™ÔÙ][™ÜËˆ™XYÚ][X™Y[™ÔÙ][™ÜÔÝ]Kˆ™\Ù]Ú][X™Y[™ÔÙ][™ÜËˆÜš]PÚ][X™Y[™Ñ[˜X›YŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÚ]Y[X™Y[™Ë\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆ\ÐÚ][X™Y[™ÓÝÛ™\”Ý[\Ý\œ™[ˆ\œÙPÚ][X™Y[™ÓÝÛ™\”Ý[\ŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÚ]Y[X™Y[™Ë[ÝÛ™\‹\Ý[\šœÉÎÂš[\ÜÈ™]›ÝÐÚ][X™Y[™Ô\œÚ\Ý\œ›ÜˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÚ]Y[X™Y[™Ë\\œÚ\ÝY\œ›Ü‹šœÉÎÂš[\ÜÈÜ™X]PÚ][X™Y[™ÔÙ][™ÜÕØ]Ú\ˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÚ]Y[X™Y[™Ë\Ù][™ÜË]Ø]Ú\‹šœÉÎÂš[\ÜÂˆ™XYÚ]ØY™]TÙ][™ÜÔÝ]Kˆ™\Ù]Ú]ØY™]TÙ][™ÜËˆÜš]QÚ]ØY™]P]]ÔÛ˜\ÚÝ[˜X›YŸHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÙÚ]\ØY™]K\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆÒUÑSP‘QÓSÑSÒQˆÙ]\Ú]\ÝÜžQ[X™Y\‹ˆÙ]Ú][X™Y[™Ñ[˜X›Yˆ™\Ù]ØXÚQ›Ü“™]Ñˆ\È™\Ù]Ú][X™Y\ØXÚKŸHœ›ÛH	Ë‹Ù[X™Y\œËØÚ]Z\ÝÜžKY[X™Y\‹šœÉÎÂš[\ÜÈ™YÚ\Ý\•ÛÜšÚ[™ÔÝ]\Ò\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÝÛÜšÚ[™ÔÝ]\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\•]R\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÝ]KšœÉÎÂš[\ÜÈ™YÚ\Ý\]^[X\žS[Ù[Ù][™ÜÒ\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËØ]^[X\žK[[Ù[\Ù][™ÜËšœÉÎÂš[\ÜÈ™YÚ\Ý\ÛÛXÝÒ\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËØÛÛXÝËZ\ËšœÉÎÂš[\ÜÈ\ÜÜÙQ\ÚÝÜÛÛXÝÓX[˜YÙ\ˆHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝÛXZÙ\‹XÛÛXÝËZÜÝšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\’[\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÚ[šœÉÎÂš[\ÜÈ™YÚ\Ý\’[™YY˜XÚÒ\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÚ[Y™YY˜XÚËšœÉÎÂš[\ÜÈ™YÚ\Ý\“^R\ÜÝY\Ò\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÛ^KZ\ÜÝY\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\”[•Üš]R\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜ[‹]Üš]KšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\”™]Ú[™\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜ™]Ú[™šœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\‘›ÜšÒ\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÙ›ÜšËšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\]]\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËØ]]šœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\”Ý]\Ò\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜÝ]\ËšœÉÎÂš[\ÜÂˆ™YÚ\Ý\“XZÙ\•\ØYÙR\ËˆÞ[˜ÐÛ]YTÝXœØÜš\[Û•\ØYÙQ›Ü]]Ú[™ÙKˆÞ[˜ÖZTÝXœØÜš\[Û•\ØYÙQ›Ü]]Ú[™ÙKŸHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÝ\ØYÙKšœÉÎÂš[\ÜÈ™]Ø\›S[Ù[šXÚ[™ÈHœ›ÛH	Ë‹Ý\ØYÙKÛ[Ù[šXÚ[™ËšœÉÎÂš[\ÜÈ™YÚ\Ý\“XZÙ\š[˜\žU™\œÚ[Û’\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËØš[˜\žK]™\œÚ[Û‹šœÉÎÂš[\ÜÈ™YÚ\Ý\Ü›ÜÜÐYÙ[ÛÛ™\\ÈHœ›ÛH	Ë‹ØÜ›ÜÜËXYÙ[XÛÛ™\Ú\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\‘š[Pœ›ÝÜÙ\’\ÈHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹Ú[™^šœÉÎÂš[\ÜÈ\ÜÜÙR[™]šY]ÜÈHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹Ú[\™]šY]ËZ\ËšœÉÎÂš[\ÜÈ\ÜÜÙT™[[ÝQš[Pœ›ÝÜÙ\ˆHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹Ü™[[ÝKY\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\‘š[Pœ›ÝÜÙ\‘]šXÙSÜHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹Ù]šXÙK[ÜšœÉÎÂš[\ÜÈ™YÚ\Ý\”ÙX\˜Ú\ÈHœ›ÛH	Ë‹Ùš[KXœ›ÝÜÙ\‹ÜÙX\˜ÚÚ[™^šœÉÎÂš[\ÜÈ™YÚ\Ý\•›ÚXÙR[œ]\ÈHœ›ÛH	Ë‹Ý›ÚXÙKZ[œ]Ú[™^šœÉÎÂš[\ÜÈ[œÝ[Ú[™ÝÒY[œ›ØYØ\ÝHœ›ÛH	Ë‹ÝÚ[™ÝÒY[œ›ØYØ\ÝšœÉÎÂš[\ÜÂˆ\ÔÙXÛÛ™\žP\Ú[™ÝËˆÜ[”Ù\ÜÚ[Û’[“™]ÕÚ[™ÝËˆÜ[”Ù\ÜÚ[Û’[“™]ÕÚ[™ÝÒY‘›ÜYÝ]ÚYKŸHœ›ÛH	Ë‹ÜÙXÛÛ™\žK]Ú[™ÝÜËšœÉÎÂš[\ÜÂˆ™YÚ[”Ù\ÜÚ[Û‘˜YÔ™]šY]ËˆÛÛœÝ[YS˜]]™TÙ\ÜÚ[Û‘˜YÓÜ[”™\Ý[ˆ\ÜÜÙTÙ\ÜÚ[Û‘˜YÔ™]šY]Ëˆ[™Ù\ÜÚ[Û‘˜YÔ™]šY]Ëˆ™]Ø\›TÙ\ÜÚ[Û‘˜YÔ™[X\ÙR[\‹ŸHœ›ÛH	Ë‹ÜÙ\ÜÚ[Û‹Y˜YË\™]šY]ËšœÉÎÂš[\ÜÂˆ\œÙTÙ\ÜÚ[Û‘˜YÔ™]šY]Ô[]Kˆ[˜Ø]TÙ\ÜÚ[Û‘˜YÔ™]šY]ÓX™[ŸHœ›ÛH	Ë‹ÜÙ\ÜÚ[Û‘˜YÔ™]šY]Ò[šœÉÎÂš[\ÜÂˆ\ÑÛØ˜[›ÚXÙR[œ]Ý™\›^Uš\ÚX›Kˆ\ÑÛØ˜[›ÚXÙR[œ]Ý™\›^TÙ[™\‹ˆ™[X\ÙPXÝ]™QÛØ˜[›ÚXÙR[œ]ÚÜÝ]ˆ™YÚ\Ý\‘ÛØ˜[›ÚXÙR[œ]\ËŸHœ›ÛH	Ë‹Ý›ÚXÙKZ[œ]ÙÛØ˜[šœÉÎÂš[\ÜÈ[œÝ\™SXZ[\™\Ù[˜ÙHHœ›ÛH	Ë‹Ø\™\Ù[˜ÙKšœÉÎÂš[\ÜÂˆ™YÚ\Ý\‘Y\[šÔ›ÝØÛÛˆ[™R[˜ÛÛZ[™ÑY\[šËˆ[™R[˜ÛÛZ[™ÓÜ[‘›Û\‹ˆ[™R[˜ÛÛZ[™ÔÚ\™Qš[Kˆš[™Y\[šÒ[\™Ý‹ˆ™YXÝÛÛœÝ[YYY\[šÒ[\™Ý‹ˆš[™Ü[‘›Û\’[\™Ý‹ˆš[™Ü[”Ú\™Qš[R[\™Ý‹ˆÙ]Y\[šÓXZ[•Ú[™ÝËˆZÙT[™[™ÑY\[šËŸHœ›ÛH	Ë‹ÙY\[šËšœÉÎÂš[\ÜÈ™YÚ\Ý\‘›Û\ÛÛ^Y[HHœ›ÛH	Ë‹Ù›Û\ÛÛ^Y[KšœÉÎÂš[\ÜÈX[Ú[™ÝÜÔÚÜÝ]ÈHœ›ÛH	Ë‹ÝÚ[™ÝÜÔÚÜÝ]Ù[’X[šœÉÎÂš[\ÜÈÕT”‘S•ÐTÒQÕT”‘S•ÐÒS‘WÔ‘QÒSÓˆHœ›ÛH	Ë‹‹ÜÚ\™YØœ˜[™™YÚ[Û‹šœÉÎÂš[\ÜÂˆ™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜËˆÜš]S[^ÛÜÙP™Z]š[Ü‹ˆÜš]TÝØ[ÝÐXÝ]˜][ÛÛXÚËˆÜš]UÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ŸHœ›ÛH	Ë‹ÝÚ[™ÝËX™Z]š[Ü‹\Ù][™ÜË\ÝÜ™KšœÉÎÂš[\ÜÂˆYUÚ[™ÝÕÕÚ[™ÝÜÕ˜^KˆÜ\Ú[™ÝÜÕ˜^SY[Kˆ™\]Y\ÝÚ[™ÝÜÕ˜^T]Z]ŸHœ›ÛH	Ë‹ÝÚ[™ÝÜÕ˜^SY™XÞXÛKšœÉÎÂš[\ÜÂˆ\S[^XZ[•Ú[™ÝÐÛÜÙP™Z]š[Ü‹ˆÜ™X]PÛÜÙP™Z]š[Ü”›Û\˜[˜XÚÐÛÛ›Û\‹ˆ™\]Y\ÝXZ[•Ú[™ÝÐÛÜÙP™Z]š[Ü‹ŸHœ›ÛH	Ë‹ÛXZ[•Ú[™ÝÐÛÜÙP™Z]š[Ü‹šœÉÎÂš[\ÜÂˆ\Ó[^ÛÜÙP™Z]š[Ü‹ˆ\ÕÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ˆÒS‘Õ×Ð‘RU’SÔ—ÑÑUÓS•VÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÑÑUÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÓS•VÐÓÔÑWÐ‘RU’SÔ—Ô‘TUQTÕQÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÓS•VÐÓÔÑWÐ‘RU’SÔ—ÔÒÕÓ—ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÓS•VÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÔÕÐSÕ×ÐPÕUUSÓ—ÐÓPÒ×ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—Ô‘TUQTÕQÐÒS“‘SˆÒS‘Õ×Ð‘RU’SÔ—ÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÔÒÕÓ—ÐÒS“‘Sˆ\H[^ÛÜÙP™Z]š[Ü‹ˆ\HÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ŸHœ›ÛH	Ë‹‹ÜÚ\™YÝÚ[™ÝÐ™Z]š[Ü‹šœÉÎÂš[\ÜÈÙ]\ÚÝÜÛÛ[X[™™YÚ\ÝžK™YÚ\Ý\Z[[‘\ÚÝÜÛÛ[X[™ÈHœ›ÛH	Ë‹ØÛÛ[X[™ËÚ[™^šœÉÎÂš[\ÜÈ™YÚ\Ý\”™[[ÝPÛY\ÈHœ›ÛH	Ë‹ØÛÛ[X[™ËÜ™[[ÝPÛY\ËšœÉÎÂš[\ÜÈ™\ÛÛ™T™Y™\œ™YÞ\Ý[SØØ[K™\ÛÛ™TÞ\Ý[SØØ[HHœ›ÛH	Ë‹‹ÜÚ\™YÛØØ[KšœÉÎÂš[\ÜÂˆ\Ò[QY˜][Ù][™ÜÐÚ[›™[ˆ\H[QY˜][Ù][™ÜÐÚ[›™[ŸHœ›ÛH	Ë‹‹ÜÚ\™YÚ[QY˜][Ù][™ÜËšœÉÎÂš[\ÜÈ\œÙR[QY˜][Ù][™ÜÔ]ÚHœ›ÛH	Ë‹Ú[KÜ\œÙQY˜][Ù][™ÜÔ]ÚšœÉÎÂš[\ÜÂˆÕPQÑS•ÓSÑSÔÑUS‘Ô×ÑQUSËˆÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙYˆ\Õ˜[YÝX˜YÙ[[Ù[Y[œ]ˆ›Ü›X[^™TÝX˜YÙ[[Ù[Yˆ™XÛÛ˜Ú[TÝX˜YÙ[[Ù[Ù][™ÜÔ]Úˆ\HÝX˜YÙ[[Ù[Ù][™ÜÔ]ÚŸHœ›ÛH	Ë‹‹ÜÚ\™YÜÝX˜YÙ[[Ù[Ù][™ÜËšœÉÎÂš[\ÜÈ\Ðœ›ÝÜÙ\“Ü[˜X›T]Hœ›ÛH	Ë‹‹ÜÚ\™YØœ›ÝÜÙ\“Ü[˜X›Q^ËšœÉÎÂš[\ÜÂˆÙ]ÛY[[™Ú[ˆÙ]ÛY[[™Ú[›Ü”™X[Kˆ[š]ÛY[[™Ú[Ëˆ™YÚ\Ý\ÛY[[™Ú[Ò\ËŸHœ›ÛH	Ë‹ØÛY[[™Ú[ÔÙ\šXÙKšœÉÎÂš[\ÜÂˆ\P\X\˜[˜ÙUÕÚ[™ÝËˆ\P\X\˜[˜ÙUÕÚ[™ÝÜËˆÙ]\œÚ\ÝYÚ[™ÝÖ›ÛÛKˆ™YÚ\Ý\\X\˜[˜ÙTÙ][™ÜÒ\Ëˆ\]T\œÚ\ÝYÚ[™ÝÖ›ÛÛKŸHœ›ÛH	Ë‹Ø\X\˜[˜ÙK\Ù][™ÜËZ\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\š[[™Ò\ÈHœ›ÛH	Ë‹Øš[[™ËÚ[™^šœÉÎÂš[\ÜÂˆ[š][Ù[XØÙ\ÜËˆ›ÝSX[X[Ù^TØ]™Yˆ›ÝSX[X[Ù^T™[[Ý™Yˆ™Yœ™\ÚØ]]Ø^S[Ù[ËŸHœ›ÛH	Ë‹Û[Ù[XXØÙ\ÜËÚ[™^šœÉÎÂš[\ÜÈY™™XÝ]™VØ]]Ø^P˜\ÙU\›Hœ›ÛH	Ë‹Û[Ù[XXØÙ\ÜËÙY™™XÝ]™Q[™Ú[šœÉÎÂš[\ÜÈ\ÓØØ[“ÝÛ™\Ý\œ™[Hœ›ÛH	Ë‹Ø\Ù\ÜÚ[Û”ÛXÞKšœÉÎÂš[\ÜÈÙ]\Ø\Xš[]Y\Ë™\]Z\™P\Ø\Xš[]HHœ›ÛH	Ë‹Ø\Ø\Xš[]Y\ËšœÉÎÂš[\ÜÂˆXÝ]™SÝÛ™\”ØÛÜRÙ^Kˆ™YÚ[\Ù\ÜÚ[Û›Ý[™\žKˆÙ]XÝ]™P\Ù\ÜÚ[Û‹ˆÙ]XÝ]™Q]SÝÛ™\”\ÚÝ[\ˆ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™ËˆÝÛ™\”ØÛÜY\Ù\‘]T]ˆÙ]\Ù\ÜÚ[ÛÛÛ[Z]›Ý[™\žRÛÚËŸHœ›ÛH	Ë‹Ø\Ù\ÜÚ[Û”Ý]KšœÉÎÂš[\ÜÂˆ™\ÛÛ™S™]ÓXZÙ\“Y[PÛÛ[X[™ˆ\H\XØ][Û“Y[PÛÛ[X[™ŸHœ›ÛH	Ë‹‹ÜÚ\™YØ\XØ][Û“Y[PÛÛ[X[™ËšœÉÎÂš[\ÜÂˆÛÛX›ÕÑ[XÝ›ÛXØÙ[\˜]Ü‹ˆX]Ú\Ñ[XÝ›Û’[œ]ˆ\H\ÚÜÝ]YŸHœ›ÛH	Ë‹‹ÜÚ\™YØ\ÚÜÝ]ËšœÉÎÂš[\ÜÂˆÙ]\ÚÜÝ]ÝÜ™Kˆ\Ð\ÚÜÝ]™XÛÜ™[™ÐXÝ]™Kˆ™YÚ\Ý\\ÚÜÝ]\ËˆÝXœØÜšX™P\ÚÜÝ]™XÛÜ™[™ËŸHœ›ÛH	Ë‹Ø\\ÚÜÝ]ËÚ[™^šœÉÎÂš[\ÜÈ[œÝ[™]ÓXZÙ\•Ú[™ÝÔÚÜÝ]Hœ›ÛH	Ë‹Ø\\ÚÜÝ]ËÛ™]Ë[XZÙ\‹]Ú[™ÝË\ÚÜÝ]šœÉÎÂš[\ÜÈ™YÚ\Ý\“^[Ý]\ÈHœ›ÛH	Ë‹Û^[Ý]Ú[™^šœÉÎÂš[\ÜÂˆÙ]ÚÜÝÚ[™TÛÝˆÙ]ÚÜÝX[˜YÙ\‹ˆÙ]ÚÜÝÙ\ÜÚ[ÛXÝ]š]U˜XÚÙ\‹ˆ[\œ\ÚÜÝØ[Ñ›ÜXØÛÝ[›Ý[™\žKˆ\ÑÚÜÝ]˜Z[X›Q›ÜXÝ]™TÙ\ÜÚ[Û‹ˆ™XÛÛ˜Ú[QÚÜÝØ]]XØÛÝ[Ñ›ÜXÝ]™SÝÛ™\‹ˆ™Yœ™\ÚÚÜÝØØ[^˜][Û‹ˆ™YÚ\Ý\‘ÚÜÝ\Ëˆ[”ÝX›SÝÛ™\”ÜÝÛÛ[Z]\ÚËˆÙ]ÚÜÝ›ÙT[[YTÝ\][\ÛÛ^™XY\‹ˆÙ]ÚÜÝÐÚ[™ÙYØœÙ\™\‹ˆÝ\Ü[™[ÚÜÝËˆØZ]›Ü‘ÚÜÝ]]][ÛœËŸHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹Ú[™^šœÉÎÂš[\ÜÈÙ]ÛÙ^[XYÙP]]š[™[™ÈHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹ØÛÙ^[XYÙP]]š[™[™ËšœÉÎÂš[\ÜÈ\ÝXÝ]™PÛ]YP˜XÚÙÜ›Ý[™XÝ]š]TÙ\ÜÚ[ÛœÈHœ›ÛH	Ë‹ÛXZÙ\‹ZÜÝØÛ]YK\Ù\ÜÚ[Û‹X˜XÚÙÜ›Ý[™XXÝ]š]KšœÉÎÂš[\ÜÈ™YÚ\Ý\”™[][˜Ú\ÞPXÝ]š]R\ÈHœ›ÛH	Ë‹Ü™[][˜Ú\ÞPXÝ]š]R\ËšœÉÎÂš[\ÜÈÙ]ÚÜÝÙ]\Ú[™ÙP\ÈHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹ÙÚÜÝÙ]\Ú[™ÙP\ËšœÉÎÂš[\ÜÈÙ]ÚÜÝÙ]\[\˜XÝ[ÛœšYÙHHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹ÙÚÜÝÙ]\[\˜XÝ[ÛœšYÙKšœÉÎÂš[\ÜÈ™YÚ\Ý\”YÚ[“X\šÙ]\ËÞ[˜ÑY˜][X\šÙ]YÚ[œÈHœ›ÛH	Ë‹ÜYÚ[‹[X\šÙ]Ü™YÚ\Ý\’\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\”YÚ[”X›\Ú\’\ÈHœ›ÛH	Ë‹ÜYÚ[‹\X›\Ú\‹Ü™YÚ\Ý\’\ËšœÉÎÂš[\ÜÈš[™Ú[™Qš[R[\™ÝˆHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹Ø\™Ý‹šœÉÎÂš[\ÜÈ[™R[˜ÛÛZ[™ÐÚ[™Qš[HHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹ÛÜ[‘š[R[œÝ[šœÉÎÂš[\ÜÈ™YÚ\Ý\Ú[™Qš[P\ÜÛØÚX][ÛˆHœ›ÛH	Ë‹ØÚ[™KXœ˜Z[‹Ùš[P\ÜÛØÚX][Û‹šœÉÎÂš[\ÜÈ[”YÚ[”ÝÜ˜YÙTÛ[ÚÙHHœ›ÛH	Ë‹ÜÛ[ÚÙKÜYÚ[”ÝÜ˜YÙTÛ[ÚÙKšœÉÎÂš[\ÜÈ[ÛÛ\]\•\ÙTÛ[ÚÙRY”™\]Y\ÝYHœ›ÛH	Ë‹ÜÛ[ÚÙKØÛÛ\]\•\ÙTÛ[ÚÙKšœÉÎÂš[\ÜÈÙ]XZ[“ØØ[KHœ›ÛH	Ë‹ÚLN‹šœÉÎÂš[\ÜÈ™\]Z\™SØš™XÝ›ÝÒ\Ñ\œ›ÜˆHœ›ÛH	Ë‹Ý][ËÚ\Õ˜[Y]KšœÉÎÂš[\ÜÈXÚÓ˜]]™P]™\ÛÝ\˜ÙHHœ›ÛH	Ë‹Û˜]]™P]™\ÛÝ\˜ÙTXÚÙ\‹šœÉÎÂ‹ËÈØÚY[\ˆ
+\ÙHÊH8 %9d+ùbª9cey/¢úg :) HXZÙ\ˆÈØØ[ˆÈXZ[•Ú[™ÝÈ:`ïH™XY{ï#9/a‚‹ËÈÜ\ÚÚXÚËY[š\›Û›Y[È\Ù\ˆÙÚ[ˆ
+:)é¹cäH[œÝ\™T™XYJH:, yab9b,9.#yfî¹k¦¸à ‚‹ËÈ:`&º/áÈ][\Ý\ØÚY[\ˆ9g*9.)9.*¹l,yîê¹.¢ù.í¹®¤9d!:, ù. 9«(yn`¹ëbHÝ\ØÚY[\»ï#9§ 9d#¹b,9æ¡‹ËÈ:`¨ù«(yç'ù«hùd+ùbª;ï&ùbczgh¹æ¡9i,z-)y/&º(ªÈžKØØ]Ú9d'¹£¢ycêº+¬Ùøà ‚š[\ÜÂˆÝ\ØÚY[\‹ˆ™\Ù]ØÚY[\‹ˆÙ]ØÚY[\’Y’[š]X[^™YˆÙ]ØÚY[TÝÜ˜YÙKˆÙ]ØÚY[TÝÜ˜YÙRY’[š]X[^™YˆÙ]›Ú™XÝ]]ÛX][Û“ØY\‹ŸHœ›ÛH	Ë‹ÜØÚY[\‹ZÜÝÚ[™^šœÉÎÂš[\ÜÈÛÛ™šYÝ\™T›Ý][™RÜÝHœ›ÛH	Ë‹Ü›Ý][™\ËÜÙ\šXÙKšœÉÎÂš[\ÜÈÙ]›Ý™[[ÝT™\ÛÝ\˜ÙTÛÝ\˜ÙHHœ›ÛH	Ë‹ÛØØ[‹Ú\ËØ›ÝËšœÉÎÂš[\ÜÂˆ™YÚ\Ý\”ØÚY[R[™\œËˆ]XÚØÚY[\‘]™[\Ý[™\œËˆ™\Ù]ØÚY[\”™XYKŸHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜØÚY[KšœÉÎÂš[\ÜÈ™YÚ\Ý\”›Ú™XÝ]]ÛX][Û’\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÜ›Ú™XÝX]]ÛX][Û‹šœÉÎÂš[\ÜÂˆÝ\ÛØ[ÛÛ›Û\‹ˆÙ]ÛØ[ÛÛ›Û\‹ˆ™\Ù]ÛØ[ÛÛ›Û\‹ˆÙ]ÛØ[X\™ÝÛ‘Ù[™\˜][Û‹ŸHœ›ÛH	Ë‹ÙÛØ[ZÜÝÚ[™^šœÉÎÂš[\ÜÈÝ\X\›’ÜÝÙ]X\›ÛÛ›Û\‹™\Ù]X\›ÛÛ›Û\ˆHœ›ÛH	Ë‹ÛX\›‹ZÜÝÚ[™^šœÉÎÂš[\ÜÈ™]ÚX”ÚÚ[™Y™\™[˜ÙHHœ›ÛH	Ë‹ÛX\›‹ZÜÝÚX”™Y™\™[˜ÙKšœÉÎÂš[\ÜÈ™YÚ\Ý\“X\›’\Ëœ›ØYØ\ÝX\›‘]™[Hœ›ÛH	Ë‹ÛX\›‹ZÜÝÜ™YÚ\Ý\’\ËšœÉÎÂš[\ÜÈ™YÚ\Ý\‘ÛØ[[™\œËœ›ØYØ\ÝÛØ[Ý]\ÈHœ›ÛH	Ë‹ÛXZÙ\‹Z\ËÙÛØ[šœÉÎÂš[\ÜÈÜ™X]SÙÙÙ\ˆ\ÈÜ™X]TØÚY[\“ÙÙÙ\ˆHœ›ÛH	Ë‹ÛÙÙÙ\‹šœÉÎÂ‚›]XZÙ\”›ÝšY\”™Yœ™\ÚÛÛ™šYÝ\™YH˜[ÙNÂ›]Ý\[™[™ÐXØÛÝ[›ÝšY\”™XY[™\ÜÎˆÈÝÛ™\’YˆÝš[™ÎÈÝ\ˆ
+
+HOˆ›ÚYH[H[Â‚™[˜Ý[ÛˆX\šÓXZÙ\”›ÝšY\”™Yœ™\ÚÛÛ™šYÝ\™Y
+
+Nˆ›ÚYÂˆXZÙ\”›ÝšY\”™Yœ™\ÚÛÛ™šYÝ\™YHYNÂˆÛÛœÝÝ\[™[™ÈHÝ\[™[™ÐXØÛÝ[›ÝšY\”™XY[™\ÜÎÂˆÝ\[™[™ÐXØÛÝ[›ÝšY\”™XY[™\ÜÈH[ÂˆYˆ
+\Ý\[™[™ÊH™]\›ŽÂˆÛÛœÝXÚ\Ú[ÛˆHÂˆ[™[™ÓÝÛ™\’YˆÝ\[™[™Ë›ÝÛ™\’YˆÝ\œ™[ÝÛ™\’YˆÙ]XÝ]™P\Ù\ÜÚ[ÛŠ
+K™]SÝÛ™\’Yˆ›Ý[™\žT[™[™Îˆ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+KˆNÂˆYˆ
+ÚÝ[š\™T[™[™Ô™XY[™\ÜÔÝ\
+XÚ\Ú[ÛŠJHÂˆÝ\[™[™ËœÝ\
+
+NÂˆ™]\›ŽÂˆBˆËÈØ[YK[ÝÛ™\ˆÚÜÝ™\Z\ˆÛÈH›Ý[™\žHÚ[H\ÈÛ™K\ÚÝØ[˜XÚÂˆËÈš\™\Ëˆ]H[™[™ÈÝ\˜XÚÈÛÈH]\ˆ[˜Ú[™ÙY[œÝ\™T™XYHÈ\›BˆËÈÝ\Ø[ˆÝ[][˜Ú\ØÛÝ™\žHY\ˆHÚ[™ÝÈÛÜÙ\Ë‚ˆYˆ
+ÚÝ[ÙY\[™[™Ô™XY[™\ÜÔÝ\
+XÚ\Ú[ÛŠJHÂˆÝ\[™[™ÐXØÛÝ[›ÝšY\”™XY[™\ÜÈHÝ\[™[™ÎÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆØZ]›ÜÝ\œ™[XØÛÝ[›ÝšY\“[Ù[Ô™XYJ
+Nˆ›ÛZ\ÙO›ÚYˆÂˆÛÛœÝ™XYHH]ØZ][œÝ\™PÝ\œ™[XØÛÝ[›ÝšY\”™XY[™\ÜÊ
+NÂˆYˆ
+\™XYJHÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	Ô‘PÓÓ‘USÓ—ÑRSQ	Ëˆ	ÐXØÛÝ[›ÝšY\ˆ[Ù[È\™H›Ý™XYH›Üˆ\È\Ù\ÜÚ[ÛŽÈ™]žK‰Ëˆ
+NÂˆBŸB‚‹ËÈ]™HÙ]\œÈ™\Ù\™HXØÛÝ[ÜØÚY[\ˆ™\XÙ[Y[Ú]Ý]ØY[™ÈXZ[ˆ[Ù[\È]\Ü]Ú[YK‚˜ÛÛ™šYÝ\™T›Ý][™RÜÝ
+ÂˆÙ]›ÝˆÙ]›Ý™[[ÝT™\ÛÝ\˜ÙTÛÝ\˜ÙKˆÙ]ØÚY[\ŽˆÙ]ØÚY[\’Y’[š]X[^™YˆÙ]ØÚY[TÝÜ˜YÙKŸJNÂ‚‹ÊŠ‚ˆ
+ˆ\ÙHˆ9.#ya£yå*ÜØÚY[\”Ý\Y›YÈ8 %8 %Ý\ØÚY[\Š
+X9a¡z`ê9.éHÜØÚY[\˜ˆ
+ˆ9cey/¢ù..¹§`ùj HÛÝ\˜ÙHÙˆ];ï"9mìˆÙ]9¥í¹æí9£©z/å9fç¹c§ùk§¹/¢ûï"xà ¹§+9aïy¥l9cêº-'ú-(È¹.)9.*¹bcyïk¹l,yîê‚ˆ
+ˆ:`ïy®èz-¬ù¥í¹l'z+åyd+ùbª»ï#9n`¹ëby )ùå,HÝ\ØÚY[\ˆ:!ê¹mìy/çz+à{ï&ùb!ú-)¹cíùg.¹¦kÈ™\Ù]ØÚY[\Š
+Xˆ
+ˆ9¢¢ˆÜØÚY[\˜9ïkˆ[;ï#9."ù«(z/æù§iz!ê¹á-¹/&ºaãy¥¬9d+ùbª8à ‚ˆ
+‚ˆ
+ˆTÈ9¬ê9a£9ª(yg¢Ê:aãy§¡
+N›XZÙ\ŽœØÚY[NŠˆ[™\ˆ9g*™YÚ\Ý\“XZÙ\’\ÜÐY\”Ü\Ú9a¡Bˆ
+ˆ:`&º/áÈ™YÚ\Ý\”ØÚY[R[™\œÊ
+X9£ä9bcy. 9«(y )ù¬ê9a£
+Š¹.#y/§z-eˆØÚY[\ˆ9k§¹/¢ÊŠŽÂˆ
+ˆ9§+9aïy¥l9¢ïùb,ØÚY[\ˆ9d#¹cêº, È]XÚØÚY[\‘]™[\Ý[™\œÊØÚY[\‹ÝÜ˜YÙJXˆ
+ˆ9¢¢ˆØÚY[\‹›Ûˆ9£ ¹."ˆ
+ÈÙ]ØÚY[\”™XYH9e ¹aiyk§¹/¢È
+Èœ›ØYØ\Ý	Ü™XYIøà ‚ˆ
+‚ˆ
+ˆ:aãyi#H][\9c®úaãN›ØØ[ˆÛ”™XYH9cëùfè:aãz+åy¢%¹d#ØÛÜH9i#yå*9a£y«(z)é¹cä{ï#ˆ
+ˆÝ\ØÚY[\ˆ:/å9fç¹d#9. 9k§¹/¢ûï#ÙXZÔÙ]:f,¹«hˆØÚY[\‹›Ûˆ:aãyi#y£ ˆ\Ý[™\¸à ¹b!ú-)¹cíùd#‚ˆ
+ˆ™\Ù]ØÚY[\ˆ9¢¢ˆÜØÚY[\ˆ9ïkˆ[;ï#9¥¬9k§¹/¢ù.#yg*ÙXZÔÙ]:aã;ï#9/&ºaãy¥¬]XÚ9. 9«(xà ‚ˆ
+‹Â‹ËÈ›ÝšY\‹Ñˆ™XY[™\ÜÈØ[ˆšYÙÙ\ˆ\È[žHœ›ÛHÙ]™\˜[XÙ\ËˆÙ\šX[^™B‹ËÈÛÛ\]HXØÛÝ[ZÜÝ][\Ë›ÝÛ›HØÚY[\ˆÛÛœÝXÝ[ÛŽˆÚ[ˆ[‚‹ËÈXØÛÝ[X›Ý[™\žH™\Ù]Ý\\œÙY\È[ˆÛ\ˆ][\]ÈÛX[\]\Ýš[š\Ú‹ËÈ™Y›Ü™H[ˆX›Ü™XÛÝ™\žHÝ\ÈØÚY[\‹ÛØ[ÛÛ›Û\‹[™X\›ˆYØZ[‹‚›]][\Ý\ØÚY[\˜\œšY\Žˆ›ÛZ\ÙO›ÚYˆH›ÛZ\ÙKœ™\ÛÛ™J
+NÂ‚™[˜Ý[Ûˆ][\Ý\ØÚY[\Š
+Nˆ›ÛZ\ÙO›ÚYˆÂˆÛÛœÝ][\H][\Ý\ØÚY[\˜\œšY\‹[Š
+
+HOˆ][\Ý\ØÚY[\“Û˜ÙJ
+JNÂˆ][\Ý\ØÚY[\˜\œšY\ˆH][\˜Ø]Ú
+
+
+HOˆ[™Yš[™Y
+NÂˆ™]\›ˆ][\ÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ][\Ý\ØÚY[\“Û˜ÙJ
+Nˆ›ÛZ\ÙO›ÚYˆÂˆËÈ9.)9.*¹bcyïk¹§hy.í¹oázhnù®èz-¬ù¢cz ïyd+ùbª;ï&‚ˆËÈKˆXZÙ\ˆ9cey/¢ùmì¹§¡:`(
+Ü\ÚÚXÚËY[š\›Û›Y[9k£9¢$8¡¤ˆ™YÚ\Ý\“XZÙ\’\ÜÐY\”Ü\Ú
+BˆËÈ‹ˆÛY[9mìˆÛ[ÚÙH:`&º/áÈ
+\Ù\ˆÙÚ[ˆ8¡¤ˆ™[™\™\ˆ:)é¹cäH	ÛØØ[YŽ™[œÝ\™K\™XYIÈTÊBˆËÈ9.îù. 9§*¹®èz-¬ù¥íˆÙ]XZÙ\ÛÜ™J
+HÈÙ]ÛY[
+
+H9¢¦úe&{ï#9¥m9/dÈžKØØ]Ú9ag9/cûï#9ëby."ù«(z)é¹cäxà ‚ˆ]XZÙ\ŽˆXZÙ\ŽÂˆžHÂˆXZÙ\ˆHÙ]XZÙ\ÛÜ™J
+NÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\ØÚY[\ŽˆXZÙ\ˆ›Ý™XYHY]Ú[™]žHÛˆ™^šYÙÙ\Ž‰Ëˆ\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠKˆ
+NÂˆ™]\›ŽÂˆBˆžHÂˆÙ]ÛY[
+
+NÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\ØÚY[\ŽˆÛY[›Ý™XYHY]Ú[™]žHÛˆ™^šYÙÙ\Ž‰Ëˆ\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠKˆ
+NÂˆ™]\›ŽÂˆBˆËÈ:"éy§+:, ùå*9¦+ÈÙ]XZÙ\ÛÜ™J
+H9æ¡:i¥¹«(z, ùå*;ï"Û”™XYH9g*™YÚ\Ý\“XZÙ\’\ÜÐY\”Ü\Ú9.bùbcBˆËÈ:)é¹cäy¥í¹cëú ïycäyå'ûï"{ï#Ú[š]X[Ý\ÝÛSXÜ™Yœ™\Ú9b&¹d+ùbª9/a¹l&¹§*º$/yg,;ï&ùg*Ý\ØÚY[\ˆ9bcBˆËÈ]ØZ];ï#9èk¹/çyë+9. 9.*ˆØÚY[\ˆXÚÈ: ïyç"ùb,9å*9¢-ùmì¹/çykf9æ¡:!ê¹k¦¹.bHPÔ:acyïk¸à ‚ˆËÈ:"éHXZÙ\ˆ9mìº(ªÈ™YÚ\Ý\“XZÙ\’\ÜÐY\”Ü\Ú9§¡:`(:/áûï#›ÛZ\ÙH9¥êymìˆ™\ÛÛ™{ï#›Ë[Ü8à ‚ˆÛÛœÝÛØ[Ù[™Y›Ü™HHÙ]ÛØ[X\™ÝÛ‘Ù[™\˜][ÛŠ
+NÂˆ]ØZ]ØZ]›Ü’[š]X[Ý\ÝÛSXÜ™Yœ™\Ú
+
+NÂˆËÈYˆHX\™ÝÛˆ˜XÙYH]ØZ]˜Z[Ý]8 %H™^XØÛÝ[	ÜÈXÝ]˜][Û‚ˆËÈ\ÜÈÚ[™K]šYÙÙ\ˆ][\Ý\ØÚY[\ˆÚ]œ™\ÚÝ]K‚ˆYˆ
+Ù]ÛØ[X\™ÝÛ‘Ù[™\˜][ÛŠ
+HOOHÛØ[Ù[™Y›Ü™JHÂˆÛÛœÛÛK›ÙÊ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\ØÚY[\ŽˆX\™ÝÛˆ˜XÙY]ØZ]X›Ü[™ÉÊNÂˆ™]\›ŽÂˆBˆÛÛœÝ]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜÈHÜ™X]P]]ÛX][Û•\Ù\•\›‘Ú]˜\Ù[[™RÛÚÜÊ
+NÂˆžHÂˆÛÛœÝØÚY[\ˆH]ØZ]Ý\ØÚY[\ŠÂˆXZÙ\‹ˆÙ]Žˆ
+
+HOˆÙ]ÛY[
+
+K™š^ž›KˆÙ]XZ[•Ú[™ÝÎˆ
+
+HOˆXZ[•Ú[™ÝÔ™Y‹ˆ™Z\ÚR[KˆÙÙÙ\ŽˆÜ™X]TØÚY[\“ÙÙÙ\Š	ÜØÚY[\‹ZÜÝ	ÊKˆ‹‹˜]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜËˆJNÂˆËÈÝ\ØÚY[\ˆ™[˜Ù\È™\Ù]ÈÚ[H]È\Þ[˜ÈÝ\\\È[ˆ›YÚˆÙY\ˆËÈH›Ý[™\žHÚXÚÈ[[YYX][H™Y›Ü™H\Ý[™\ˆX›XØ][Ûˆ\ÈHÙXÛÛ™ˆËÈÝX\™ÛÈHÝ[HÙ[™\˜][ÛˆØ[ˆ™]™\ˆXZÙH™XY[™\ÜÈš\ÚX›K‚ˆYˆ
+Ù]ÛØ[X\™ÝÛ‘Ù[™\˜][ÛŠ
+HOOHÛØ[Ù[™Y›Ü™JHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\ØÚY[\ŽˆX\™ÝÛˆ˜XÙYØÚY[\ˆÝ\X›Ü[™ÈÝ[HØÚY[\ˆ]XÚ	Ëˆ
+NÂˆ]ØZ]™\Ù]ØÚY[\Š
+NÂˆ™]\›ŽÂˆBˆËÈØÚY[\ˆ9ç'ù«hÈ™XYH9d#¹£ ˆ\Ý[™\ˆ
+È9e ¹aiH™XY[™\ÜÈÛ\¸à •ÙXZÔÙ]9£"yk§¹/¢ÂˆËÈ9c®úaãN›ØØ[ˆÛ”™XYH:aãz+åycëú ïya£y«(y¢ïùb,9d#9k§¹/¢ûï#9«i9¥íˆ›Ë[Ü;ï&ÂˆËÈ9b!ú-)¹cíùd#¹¥¬9k§¹/¢ù.#yg*Ù]:aã;ï#9/&ºaãy¥¬]XÚ8à ‚ˆËÈ9¬ê9¡#ÎœØÚY[NŠˆTÈ[™\ˆ9.#yg*:/æzaã9¬ê9a£8 %9k ù.ë9g*™YÚ\Ý\“XZÙ\’\ÜÐY\”Ü\ÚˆËÈ9a¡z`&º/áÈ™YÚ\Ý\”ØÚY[R[™\œÊ
+H9£ä9bcy£ ¹ioK[™\ˆ9a¡z`ê]ØZ]™XYH9ëby§+:(cˆËÈÙ]ØÚY[\”™XYH:, ùå*8à ‚ˆYˆ
+WÜØÚY[R\Ô™YÚ\Ý\™Yš\ÊØÚY[\ŠJHÂˆ]XÚØÚY[\‘]™[\Ý[™\œÊØÚY[\‹Ù]ØÚY[TÝÜ˜YÙJ
+JNÂˆ™YÚ\Ý\”›Ú™XÝ]]ÛX][Û’\ÊÙ]›Ú™XÝ]]ÛX][Û“ØY\Š
+JNÂˆÜØÚY[R\Ô™YÚ\Ý\™Y˜Y
+ØÚY[\ŠNÂˆBˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÝ\ØÚY[\ˆ˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆBˆËÈHÝ\\œÙYYÝ\\\È™\ÜY\ÈH›Û‹Y˜][\œ›ÜˆžHHØ]ÚX›Ý™NÂˆËÈÙY\HÛÜÝX]ØZ]™[˜ÙH\ÈÙ[ÛÈ]Ø[››ÝÛÛ[YH[ÂˆËÈÛØ[ÛÛ›Û\‹ÛX\›‹ZÜÝÝ\\Ú]HÝ[HXZÙ\‹‚ˆYˆ
+Ù]ÛØ[X\™ÝÛ‘Ù[™\˜][ÛŠ
+HOOHÛØ[Ù[™Y›Ü™JHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\ØÚY[\ŽˆX\™ÝÛˆ˜XÙYØÚY[\ˆÝ\X›Ü[™ÈÝ[HXØÛÝ[Ý\\	Ëˆ
+NÂˆ™]\›ŽÂˆBˆËÈÛØ[ÛÛ›Û\ˆ9.#ˆØÚY[\ˆ9d#9l,yîê¹à®yd+ùbª
+XZÙ\ˆ
+ÈØØ[ˆ9gaÈ™XYJN¹a¡z`ê9n`¹ëbBˆËÈ
+ØÛÛ›Û\ˆ9mì¹kf9g*9b&yæí9£©z/å9fçŠK9d+ùbª9¥íˆ™\Ý[YH9¢`9§"HXÝ]™HÛØ[8à ¹i,z-)zggº!í9doxà ‚ˆžHÂˆÝ\ÛØ[ÛÛ›Û\ŠÂˆXZÙ\‹ˆÙ]Žˆ
+
+HOˆÙ]ÛY[
+
+K™š^ž›Kˆœ›ØYØ\ÝÝ]\Îˆœ›ØYØ\ÝÛØ[Ý]\Ëˆ‹‹˜]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜËˆJNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÝ\ÛØ[ÛÛ›Û\ˆ˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆBˆËÈX\›ÛÛ›Û\ˆ9d#9l,yîê¹à®yd+ùbª
+XZÙ\ˆ
+ÈØØ[ˆ9gaÈ™XYJN¹a¡z`ê9n`¹ëbKˆËÈ9d+ùbª9¥íˆ™\Ý[YH9.+y¥«H[ˆÈ9®!yä!¹ki9a/ÈÝYÚ[™øà ¹i,z-)zggº!í9doxà ‚ˆžHÂˆËÈXˆ9®¤
+ÛX\›ˆXŽÛYÏˆ9.#ˆÚÚ[X¸à#9ki¹.h9«i9¢ : ïxà#yalyå*
+N›XZ[ˆ9a¡yæí:, ÂˆËÈX\šÙ]Ù\šXÙH9¢âHÚÚ[9a`ù¥l9£kˆ
+È9aj:`ê9mì¹cäyn ù¥¡ù.íŠØÜš\ËÜ™Y™\™[˜Ù\ËË‹‹ŠBˆËÈ9/g9..º$®:i£ùcàº  ù§d9¥¦H8 %8 %X\›‹ZÜÝ9/&¹¢¢¹k ù.ë9a¦yaiHÝYÚ[™Ë×Ü™Y™\™[˜ÙKÏÛYÏ‹ÂˆËÈ9/¦ú$®:i£ÈYÙ[9i#yb-‹9.©ùâjz"éy/§z-e¹."¹®.:!&¹§+9cm9cê¹§"HÒÒS›Y9cëú+îË:(áyk£9o%yå*9oáy «9ên¸à ‚ˆËÈ9."ºfd9.*¹¥¡ù.í¸à ycey¥¡ù.íˆ8¢iLL’Ð¸à z-ìú/áÈÙ\™\ˆ9¨!ú+¬[˜Ø]Y9æ¡ÂˆËÈ9¢âycå¹i,z-)z`$9.*ºfcyî©Ê9càº  ù§d9¥¦yl/yb¦ú #9..‹9.#zf.ù¥«Jxà ‚ˆÛÛœÝX\›“X\šÙ]Ù\šXÙHH™]ÈÚÚ[X“X\šÙ]Ù\šXÙJ
+NÂˆÝ\X\›’ÜÝ
+ÂˆXZÙ\‹ˆœ›ØYØ\Ýˆœ›ØYØ\ÝX\›‘]™[ˆ™]ÚX”ÚÚ[ˆ
+ÛYËØ][ÙÔØÛÜJHO‚ˆ™]ÚX”ÚÚ[™Y™\™[˜ÙJX\›“X\šÙ]Ù\šXÙKÛYËØ][ÙÔØÛÜJKˆ‹‹˜]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜËˆJNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÝ\X\›’ÜÝ˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆBŸB‚˜ÛÛœÝÜØÚY[R\Ô™YÚ\Ý\™YH™]ÈÙXZÔÙ]Øš™XÝŠ
+NÂ‚‹ÊŠ‚ˆ
+ˆ[X™Y[™ËZÜÝ
+\ÙHKŒKÌKŒŠNˆØØ[ˆ[œÝ\™T™XYH9k£9¢$9d#¹£"zg 9d+ùbª8à ‚ˆ
+‚ˆ
+ˆ
+ŠšÜÝ9d+ù`g9å,xà#9§"y¬¨y§"HÛÛœÝ[Y\ˆ:) yå*8à#ya¬ùk¦‹9.#yod¹lg¹.îù/eycey.*¹o 9alÊŠˆ
+ˆÌMÌÈ™]šY]Êxà ‚ˆ
+ˆ9ã¬9§"y.)9.*ˆÛÛœÝ[Y\Ž‚ˆ
+ˆHÚ]
+: b¹i*ymc9aiz+¯¹ïkŠNˆÓˆ9¢cy¬ê9a£Ú]Z\ÝÜžKY[X™Y\ˆ
+ÈÙ][˜X›Y
+YJH9a¦HÝ]Ù™‚ˆ
+ˆH9£ä¹.í¹d$zaãÈ
+[X™Y^
+Nˆ9£"zg 8 %8 %:i¥¹«(z+íù¬`¹¥íˆ[œÝ\™Q[X™Y[™ÔÙ\šXÙQ›Ü”YÚ[•™XÝÜŠ
+Bˆ
+ˆ9¢dù¨!ùnm¹fçº, ù§+9aïy¥l9¡ä¹d+ùbªˆ
+ˆ9.)9.*º`ïy.#z) yå*8¡¤ˆ9k£9aj9.#yd+ùbª
+9¬¨HÛÜšÙ\ˆÙ][\˜[9¬¨H›ÝšY\ˆ9¬ê9a£9¬¨HÛÚÈ9bkù/g9å*
+Kˆ
+ˆ9å*9¢-ù¡'ùcåù.#yb,9.îù/eyd#¹cì:/kº+èŽÈ:/æy§hy¢oú+î¹g*¹alù£¢z b¹i*ymc9aiy.%9£ä¹.í¹.ã¹¬¨yå*:/áùd$zaãÈ¹¥í¹/§yá-¹¢$9êâøà ‚ˆ
+‚ˆ
+ˆ9n`¹ëby.%9cëúaãyaiNˆÜÝ9mìº-mù¥í¹i#yå*9ã¬9§"HÙ\šXÙK9cêº(iHÚ]ÛÛœÝ[Y\ˆ9æ¡9¬ê9a£8 %8 %9alúe+¹g*9.£‚ˆ
+ˆ9£ä¹.í¹ab9¢¢ˆÜÝ9¢âz-møà yå*9¢-ù.bùd#¹¢cy¢dùo : b¹i*ymc9aiyæ¡:hn¹n£ù."ËÚ]›ÝšY\ˆÈÝ]Ù™ˆ9.gùoázhnÂˆ
+ˆ:(izod
+9d)¹b&HÙ]Ú][X™Y[™Ñ[˜X›Y9¤§ˆÙ\Ï[[: b¹i*ymc9aizgfznæ9.#yméy/g
+xà ‚ˆ
+ˆÜ[]K]™XÈ9.#ycëùå*9¥í¹.ãyd+ùbª
+9d+ùbª9d#ˆÛÜšÙ\ˆ:!ê¹mìHYH9.#ymc
+K9.#zf.ùhgˆ\8à ‚ˆ
+‹Â™[˜Ý[Ûˆ\ÐÚ][X™Y[™Ð]˜Z[X›J
+Nˆ›ÛÛX[ˆÂˆžHÂˆ™]\›ˆ\ÐÚ[™Q[X™Y[™Ó[Ù[]˜Z[X›JÙ]\ÚÝÜÙ[XÝX›PØ][ÙÊ
+KÒUÑSP‘QÓSÑSÒQ
+NÂˆHØ]ÚÂˆ™]\›ˆ˜[ÙNÂˆBŸB‚™[˜Ý[ÛˆÚ][X™Y[™ÑY˜][ÛÛ^
+
+HÂˆÛÛœÝÝ]HH]]X[˜YÙ\‹™Ù]]]Ý]J
+NÂˆ™]\›ˆÂˆ[ÙNˆÝ]K›[ÙKˆ\Ð]][XØ]YˆÝ]Kš\Ð]][XØ]Yˆ\Ù\’YˆÝ]K\Ù\ËšYÏÈ[ˆY[X™\œÚ\Ú[™ˆÝ]K\Ù\Ë›Y[X™\œÚ\Ú[™ÏÈ[ˆNÂŸB‚™[˜Ý[Ûˆ\ÜÙ\Ú][X™Y[™Ó]]][Û“ÝÛ™\Š˜]Îˆ[šÛ›ÝÛŠNˆ›ÚYÂˆÛÛœÝ^XÝYH\œÙPÚ][X™Y[™ÓÝÛ™\”Ý[\
+˜]ÊNÂˆYˆ
+Y^XÝY
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ØÚ][X™Y[™ÈÝÛ™\ˆÝ[\™\]Z\™Y	ÊNÂˆBˆYˆ
+ˆZ\ÐÚ][X™Y[™ÓÝÛ™\”Ý[\Ý\œ™[
+ˆ^XÝYˆÙ]XÝ]™Q]SÝÛ™\”\ÚÝ[\
+
+Kˆ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+Kˆ
+Bˆ
+HÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	Ô‘PÓÓ‘USÓ—ÑRSQ	Ëˆ	ÐÚ][X™Y[™ÈÙ][™È™[Û™ÜÈÈHÝ[HXØÛÝ[Ù\ÜÚ[Û‹‰Ëˆ
+NÂˆBŸB‚™[˜Ý[Ûˆ\ÜÙ\ÛÛ\XÝ[Û“]]][Û“ÝÛ™\Š˜]Îˆ[šÛ›ÝÛŠNˆ›ÚYÂˆÛÛœÝ^XÝYH\œÙPÚ][X™Y[™ÓÝÛ™\”Ý[\
+˜]ÊNÂˆYˆ
+Y^XÝY
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ØÛÛ\XÝ[ÛˆÝÛ™\ˆÝ[\™\]Z\™Y	ÊNÂˆBˆYˆ
+ˆZ\ÐÚ][X™Y[™ÓÝÛ™\”Ý[\Ý\œ™[
+ˆ^XÝYˆÙ]XÝ]™Q]SÝÛ™\”\ÚÝ[\
+
+Kˆ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+Kˆ
+Bˆ
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	Ô‘PÓÓ‘USÓ—ÑRSQ	Ë	ÐÛÛ\XÝ[ÛˆÙ][™È™[Û™ÜÈÈHÝ[HXØÛÝ[Ù\ÜÚ[Û‹‰ÊNÂˆBŸB‚™[˜Ý[Ûˆ][\Ý\[X™Y[™ÒÜÝ
+
+Nˆ›ÚYÂˆËÈ:, z`ïy.#z) yå*9l,yb*ùd+Î¹£ä¹.íˆÛÛœÝ[Y\ˆ9æ¡9¨!ú+¬9å,H[œÝ\™Q[X™Y[™ÔÙ\šXÙQ›Ü”YÚ[•™XÝÜ‚ˆËÈ9g*9fçº, ù§+9aïy¥l9.bùbcy¢dù."‹9¢`9.éz/æzaã:+îùb,9æ¡9¦+È¹d*ù§+9«(z+íù¬`ˆ¹æ¡9§ 9¥¬9¡#ùd$xà ‚ˆÛÛœÝÚ]]˜Z[X›HH\ÐÚ][X™Y[™Ð]˜Z[X›J
+NÂˆÙ][X™Y[™ÔÛÝ\˜ÙTÝ\Ü[™Y
+	ØÚ]	ËXÚ]]˜Z[X›JNÂˆÛÛœÝÚ][˜X›YBˆÚ]]˜Z[X›H	‰ˆ™XYÚ][X™Y[™ÔÙ][™ÜÊÚ][X™Y[™ÑY˜][ÛÛ^
+
+JK™[˜X›YÂˆYˆ
+XÚ][˜X›Y	‰ˆZ\ÔYÚ[•™XÝÜÛÛœÝ[Y\XÝ]™J
+JHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H›È[X™Y[™ÈÛÛœÝ[Y\ˆXÝ]™H
+Ú]Ù™‹›ÈYÚ[ˆ™XÝÜŠNÈ[X™Y[™ÒÜÝ›ÝÝ\Y	Ëˆ
+NÂˆ™]\›ŽÂˆBˆ]Ù\šXÙNˆ[X™Y[™ÔÙ\šXÙNÂˆYˆ
+\Ñ[X™Y[™ÒÜÝÝ\Y
+
+JHÂˆÙ\šXÙHHÙ][X™Y[™ÔÙ\šXÙJ
+NÂˆH[ÙHÂˆžHÂˆÙ]ÛY[
+
+NÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—H][\Ý\[X™Y[™ÒÜÝˆÛY[›Ý™XYHY]‰Ëˆ\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠKˆ
+NÂˆ™]\›ŽÂˆBˆžHÂˆÙ\šXÙHHÝ\[X™Y[™ÒÜÝ
+ÂˆÙ]ÛY[ˆ
+
+HOˆÙ]ÛY[
+
+Kˆ\Õ™XÐ]˜Z[X›Nˆ
+
+HOˆÂˆžHÂˆ™]\›ˆÙ]ÛY[
+
+K™XÐ]˜Z[X›NÂˆHØ]ÚÂˆ™]\›ˆ˜[ÙNÂˆBˆKˆËÈØ]]Ø^HÝŒKÙ[X™Y[™ÜÈ:-l™X\™\ˆS•“ÔP×ÐTWÒÑVH
+9.#ˆ\ÈÛ]YH9d#9®¤
+BˆÙ]\RÙ^Nˆ
+
+HOˆ™XYÛ]YP\RÙ^J
+KˆËÈ9aïy¥l9oh¹  N›[Ù[XXØÙ\ÜÈ9."ùcäyb!ù£hˆ[™Ú[9d#‹9n.:jnùæ¡[X™Y[™ÈÜÝ9¥è:g :aãyd+øà ‚ˆØ]]Ø^P˜\ÙU\›ˆ
+
+HOˆY™™XÝ]™VØ]]Ø^P˜\ÙU\›
+
+KˆËÈÝŒKÙ[X™Y[™ÜÈ9.gú) yd ùìîùîçù.èùä!Žº(î9aj9l`™]Ú9g*8à#9ìîùîçù.èùä!¸à#yª(yo#ù."ú(î9æí:/ç¹aî¹ïdBˆËÈ
+:)àHXZÙ\‹ZÜÝÛÝ]›Ý[™Y™]ÚÊxà ‚ˆ™]Ú[\ˆÝ]›Ý[™™]ÚˆÙÎˆÜ™X]TØÚY[\“ÙÙÙ\Š	Ù[X™Y[™ÒÜÝ	ÊKˆJNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÝ\[X™Y[™ÒÜÝ˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆ™]\›ŽÂˆBˆBˆËÈÚ]ÛÛœÝ[Y\ˆ9cê¹g*:+¯¹ïkˆÓˆ9¥í¹£ º/oxà ¹£ä¹.í¹âë:!ê¹¢¢ˆÜÝ9¢âz-mù§iyæ¡9g.¹¦kù."ú/æzaã9.#y¢iú(c8 %8 %ˆËÈ9¬¨y§"HÚ]›ÝšY\¸à y¬¨y§"HÝ]Ù™¸à ZÛÚÈ9k¢9cjù.ãy¦+È˜[ÙK: b¹i*y¥l9£k¹. 9§hz`ïy.#y/&º(ªùmc8à ‚ˆYˆ
+Ú][˜X›Y
+HÂˆËÈÙ]\Ú]\ÝÜžQ[X™Y\ˆ9n`¹ëbH
+X\œÙ]:)¡¹æåŠKÙ]Ú][X™Y[™Ñ[˜X›Y
+YJBˆËÈ:aãyi#z, ù.#y/&ºaãyïkˆÝ]Ù™‹9¢`9.éz(iy£ ¹¦+ùk¢yaj9æ¡8à ‚ˆžHÂˆÙ]\Ú]\ÝÜžQ[X™Y\ŠÂˆÙ\šXÙKˆÙ]ÛY[ˆ
+
+HOˆÙ]ÛY[
+
+KˆÙÎˆÜ™X]TØÚY[\“ÙÙÙ\Š	ØÚ]\ÝÜžQ[X™Y\‰ÊKˆJNÂˆÙ]Ú][X™Y[™Ñ[˜X›Y
+YJNÂˆHØ]Ú
+\œŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÙ]\Ú]\ÝÜžQ[X™Y\ˆ˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆBˆBŸB‚‹ËÈ9£ä¹.í¹d$zaãÈÛÛœÝ[Y\ˆ9æ¡9¡ä¹d+ùbª9£©yî¯Î˜Ú[™KXœ˜Z[ˆ9æ¡[X™Y^:-l‹ËÈ[œÝ\™Q[X™Y[™ÔÙ\šXÙQ›Ü”YÚ[•™XÝÜŠ
+K9å,yk ùfçº, ú/æzaã9k£9¢$9ç'ù«hùæ¡9d+ùbª
+9d+ùbª:g :) B‹ËÈÛY[È\HÙ^HÈØ]]Ø^H\›:/æy.¦ùcê¹§"H›ÛÝÝ˜\9§"yæ¡9/§z-eŠxà ‚œ™YÚ\Ý\‘[X™Y[™ÒÜÝ^žTÝ\
+][\Ý\[X™Y[™ÒÜÝ
+NÂ‚›]Ú][X™Y[™Ô[[YT™XÛÛ˜Ú[Nˆ›ÛZ\ÙO›ÚYˆH›ÛZ\ÙKœ™\ÛÛ™J
+NÂ‚™[˜Ý[ÛˆØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+Nˆ›ÛZ\ÙO›ÚYˆÂˆËÈÝÜ™]È[œ]Y]YHÛÜšÈ™Y›Ü™H[ˆ\Þ[˜ÈÜÝÚ]ÝÛˆØ[ˆ[‹ˆH]Y]YYˆËÈ™XÛÛ˜Ú[X][Ûˆ™K\™XYÈH]\ÝXØÛÝ[™Y™\™[˜ÙH[™Ø][ÙÈÛÈ˜\Y™Yœ™\Ú\È\™BˆËÈ\Ý]Üš]K]Ú[œÈXÜ›ÜÜÈ›Ý›ÝšY\ˆ[™]]›Ý[™\šY\Ë‚ˆÛÛœÝÚ]]˜Z[X›HH\ÐÚ][X™Y[™Ð]˜Z[X›J
+NÂˆÛÛœÝÚ][˜X›YBˆÚ]]˜Z[X›H	‰ˆ™XYÚ][X™Y[™ÔÙ][™ÜÊÚ][X™Y[™ÑY˜][ÛÛ^
+
+JK™[˜X›YÂˆÙ][X™Y[™ÔÛÝ\˜ÙTÝ\Ü[™Y
+	ØÚ]	ËXÚ]]˜Z[X›JNÂˆYˆ
+XÚ][˜X›Y
+HÙ]Ú][X™Y[™Ñ[˜X›Y
+˜[ÙJNÂˆÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[HHÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[Bˆ[Š\Þ[˜È
+
+HOˆÂˆYˆ
+ˆ\ÐÚ][X™Y[™Ð]˜Z[X›J
+H	‰‚ˆ™XYÚ][X™Y[™ÔÙ][™ÜÊÚ][X™Y[™ÑY˜][ÛÛ^
+
+JK™[˜X›Yˆ
+HÂˆ][\Ý\[X™Y[™ÒÜÝ
+
+NÂˆH[ÙHÂˆ]ØZ]Ú]ÝÛÚ][X™Y[™ÐÛÛœÝ[Y\Š
+NÂˆBˆJBˆ˜Ø]Ú
+
+\œŽˆ[šÛ›ÝÛŠHOˆÂˆÜ™X]TØÚY[\“ÙÙÙ\Š	ØÚ]Y[X™Y[™Ë\[[YIÊK™\œ›ÜŠ	Ü™XÛÛ˜Ú[H˜Z[Y	ËÂˆ\œ›ÜŽˆÝš[™Ê\œŠKˆJNÂˆJNÂˆ™]\›ˆÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[NÂŸB‚œÙ]›ÝšY\XØÙ\ÜÔ[[YT™Yœ™\Ú\Ý[™\ŠØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[JNÂ‚™[˜Ý[Ûˆœ›ØYØ\ÝÚ][X™Y[™ÔÙ][™ÜÐÚ[™ÙY
+
+Nˆ›ÚYÂˆÛÛœÝÝ[\HÙ]XÝ]™Q]SÝÛ™\”\ÚÝ[\
+
+NÂˆ›Üˆ
+ÛÛœÝÚ[ˆÙˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+JHÂˆYˆ
+]Ú[‹š\Ñ\Ý›ÞYY
+
+H	‰ˆ]Ú[‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+JHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+PRÑT—ÔTÒÒUÑSP‘QS‘×ÐÒS‘ÑQÝ[\
+NÂˆBˆBŸB‚˜ÛÛœÝÚ][X™Y[™ÔÙ][™ÜÕØ]Ú\ˆHÜ™X]PÚ][X™Y[™ÔÙ][™ÜÕØ]Ú\Š
+
+HOˆÂˆ›ÚYØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+K™š[˜[J
+
+HOˆÂˆœ›ØYØ\ÝÚ][X™Y[™ÔÙ][™ÜÐÚ[™ÙY
+
+NÂˆJNÂŸJNÂ‚™[˜Ý[Ûˆ™Xš[™Ú][X™Y[™ÔÙ][™ÜÕØ]Ú\Š
+Nˆ›ÚYÂˆÚ][X™Y[™ÔÙ][™ÜÕØ]Ú\‹œ™Xš[™
+ÝÛ™\”ØÛÜY\Ù\‘]T]
+	ØÚ]Y[X™Y[™Ë\Ù][™ÜËšœÛÛ‰ÊJNÂŸB‚˜\›Û˜ÙJ	ÝÚ[\]Z]	Ë
+
+HOˆÚ][X™Y[™ÔÙ][™ÜÕØ]Ú\‹™\ÜÜÙJ
+JNÂ‚‹ÊŠ‚ˆ
+ˆ8à#: b¹i*ymc9aixà#yalúeëy¥í¹æ¡9¥-¹l/Žˆ9 .ù¦+ú+ªHÚ]9æ¡[œ]Y]YH9k¢9cjùêâùclùi,y¥bÈ9/a¹cê¹§"yg*9¬¨y§"y£ä¹.í‚ˆ
+ˆ9d$zaãÈÛÛœÝ[Y\ˆ9¥í¹¢cy`gÜÝ8 %8 %9d)¹b&y/&¹¢¢¹cé¹. 9.*ˆÛÛœÝ[Y\ˆ9æ¡: ïyb¦ù. :-mùalù£¢H
+9£ä¹.í¹æ¡ˆ
+ˆ[X™YÝ^9aj9cæS•T“S
+xà ‚ˆ
+‚ˆ
+ˆ9å*9¢-ù¢bùbª9alúeëy¥í‹9mì¹aizf'ùæ¡9¥éÈ›Øˆ9.ãycëù`f¹k£Ü›ÝšY\ˆXØÙ\ÜÈ9.(¹i,y¥íˆ[[YH™XÛÛ˜Ú[Bˆ
+ˆ9/&¹cé¹i%¹¦ ¹`gÚ]ÛÝ\˜ÙK9¥éÈ›Øˆ9/çy£ H[™[™Ë9 h¹i#ycëùå*9d#¹a£yîëz-äxà ‚ˆ
+‹Â˜\Þ[˜È[˜Ý[ÛˆÚ]ÝÛÚ][X™Y[™ÐÛÛœÝ[Y\Š
+Nˆ›ÛZ\ÙO›ÚYˆÂˆÙ]Ú][X™Y[™Ñ[˜X›Y
+˜[ÙJNÂˆYˆ
+J]ØZ]ÝÜ[X™Y[™ÒÜÝY“›ÔYÚ[•™XÝÜÛÛœÝ[Y\Š
+JJHÂˆÛÛœÛÛK›ÙÊˆ	ÖØ›ÛÝÝ˜\Y[XÝ›Û—HÚ][X™Y[™ÈÙ™ŽÈ[X™Y[™ÒÜÝÙ\[]™H›ÜˆYÚ[ˆ™XÝÜˆÛÛœÝ[Y\‰Ëˆ
+NÂˆ™]\›ŽÂˆBˆ™\Ù]Ú][X™Y\ØXÚJ
+NÂŸB‚‹ËÈÛÙ^ÈÛ]YHÈHš[˜\žH9."ú/oH
+È9â­¹  y§éz+èˆ9aj:`ê:-lYÙ[Xš[˜\šY\È
+9£"HÚ[™9b!¹­/Šxà ‚‹ËÈ™[™Ü‹ÞØÛ]YKÛÙ^KØš[˜\žT›Ýš\Ú[Û™\‹È9mìº` 9onxà ‚‚‹ËÈ8¥ 8¥ [šYšYYÙÙÙ\ˆ[š]8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9oázhnùg*9.îù/eHÜ™X]SÙÙÙ\Š
+H:, ùå*9.bùbcxà ¹¬¨yb'yiâùc%¹æ¡:+çH[Z]
+
+H:næ:+©\Ñ]“[ÙOY˜[ÙB‹ËÈ:-lXÚØYÙY9b!¹¥+Ë9/aˆÙÔÝ™X[H:/æ9¦+È[8 %8 %9¢`9§"y¥éyoåú`ïy/&º(ªúgfznæ9d'¹£¢xà ‚‹ËÈ]Žˆ9æí9£©HÛÛœÛÛNÜXÚØYÙYˆ9a¦H\Ù\‘]KÛÙÜËÛXZ[‹›Ùøà ‚š[\ÜÂˆ[š]ÙÙÙ\‹ˆÜš]Qœ›ÛT™[™\™\‹ˆÙ]ÙÓ]™[ˆÙ]ÙÓ]™[ˆÙY\™XÙ[Þ[˜ËˆÙY\™XÙ[Ù\ÜÚ[ÛØÑXYÔÞ[˜ËˆÜ™X]SÙÙÙ\‹ˆÜš]PØÑXYÓ[™Kˆ\HÙÓ]™[ŸHœ›ÛH	Ë‹ÛÙÙÙ\‹šœÉÎÂš[š]ÙÙÙ\Š
+NÂ˜ÛÛœÝÛY[ÙÈHÜ™X]SÙÙÙ\Š	ÑÛY[	ÊNÂ˜ÛÛœÝ]]›Ý[™\žSÙÈHÜ™X]SÙÙÙ\Š	Ø]]X›Ý[™\žIÊNÂ‹ËÈ:eg9`ãùï$ùkf9®!yä!¹i,z-)y/&¹¢¢ˆZ\œ›ÜØXÚT\™ÙQ\œ›Üˆ9æ¡›ÛÝÜ™[XZ[š[™È9§+9g,9ï$ùkf:-ëùo¡9a¦z/æù¥éyoåË9ceyâë9. 9.*‚‹ËÈ9kdØÛÜK9ioz+ªy¥éyoåù."¹¢©yæ¡9§iy®¤9æoyd#ycey¢¢¹k ù£¤ºfi9£¢J]]X›Ý[™\žH9¨.ycê¹åfy.#yn)º-ëùo¡9æ¡9§#yb¨y`g9«hº+â¹¥«Jxà ‚˜ÛÛœÝ]]›Ý[™\žT\™ÙSÙÈHÜ™X]SÙÙÙ\Š	Ø]]X›Ý[™\žN›Z\œ›Ü‹XØXÚK\\™ÙIÊNÂ‹ËÈ9..ùê¥È™[™\™\ˆ9b¨:/oyi,z-)ycëú)à¹­bù )È
+È]ˆ9d+ùbª9ç"úeê9âåÊ:)àH™[™\™\‹X›ÛÝYÝX\™È:hmº`ê9¬ê:aâŠxà ‚˜ÛÛœÝ™[™\™\‘ÝX\™ÙÈHÜ™X]SÙÙÙ\Š	Ü™[™\™\‹YÝX\™	ÊNÂ˜ÛÛœÝØY™TÝÜ˜YÙT™XYÙÈHÜ™X]SÙÙÙ\Š	ÜØY™K\ÝÜ˜YÙNœ™XY	ÊNÂ‹ËÈ9®,¹§äú/æùê"ÈÛÛœÛÛH:/k9cäJŠ¹ceyâë9. 9.*ˆØÛÜJŠŽ¹a¡yk®y¦+ù®,¹§äú/æùê"ùæ¡9.îù¡#ÈÛÛœÛÛH9«hù¥¡Ë9cëú ïyn)¹å*9¢-Â‹ËÈ9a¡yk®K9fè9«i9.#z/æù¥éyoåù."¹¢©yæ¡9§iy®¤9æoyd#yceNú #™[™\™\‹YÝX\™9æ¡9b¨:/oyi,z-)y/èycíù¥è9å*9¢-ùa¡yk®xà yæoylcù£¤¹§éB‹ËÈ9oázg 9¦+ù¥/º(c9æ¡8à ¹.): !y.#z ïyalyå*ØÛÜK:+éº)àHÛÛœÛÛK[Y\ÜØYÙH9æäyd+9i!9æ¡9¬ê:aâ¸à ‚˜ÛÛœÝ™[™\™\ÛÛœÛÛSÙÈHÜ™X]SÙÙÙ\Š	Ü™[™\™\‹XÛÛœÛÛIÊNÂ˜ÛÛœÝ\]T™\Ù[][Û“ÙÈHÜ™X]SÙÙÙ\Š	Ý\]K\™\Ù[][Û‰ÊNÂ˜ÛÛœÝ›ÚXÙTÝÙ\œ›ØYØ\ÝÙÈHÜ™X]SÙÙÙ\Š	Ý›ÚXÙKZ[œ]\ÝÙ\‰ÊNÂ˜ÛÛœÝÙ\ÜÚ[Û‘˜YÔ™]šY]ÓÙÈHÜ™X]SÙÙÙ\Š	ÜÙ\ÜÚ[Û‹Y˜YË\™]šY]ÉÊNÂ˜ÛÛœÝTÝX˜YÙ[ÙÈHÜ™X]SÙÙÙ\Š	ÜK\ÝX˜YÙ[	ÊNÂ›]™[™\™\›ÛÝÝX\™ˆ™[™\™\›ÛÝÝX\™[H[Â‚˜ÛÛœÝY™XÞXÛQÛY[X[˜YÙ\ˆHÜ™X]SY™XÞXÛQÛY[X[˜YÙ\ŠÂˆÙ]Ý\œ™[”]ˆØØ[‘Ù]Ý\œ™[”]ˆÜ™X]UÛÜšÙ\ÛY[ˆÜ™X]QÛY[ˆÜ™X]R[œ›ØÐÛY[ˆ
+
+HOˆÜ™X]R[œ›ØÑÛY[
+
+KˆÙ]Ý\œ™[ÛY[ˆÛX\Ý\œ™[ÛY[ˆÙÎˆÛY[ÙËŸJNÂ‚˜\Þ[˜È[˜Ý[Ûˆ[œÝ\™SY™XÞXÛQÛY[
+\Ù\’YˆÝš[™ÊHÂˆ™]\›ˆY™XÞXÛQÛY[X[˜YÙ\‹™[œÝ\™J\Ù\’YÂˆš^ž›Q\ŽˆÙ]š^ž›Q\Š
+KˆÜ[]U™XÑ^]ˆ™\ÛÛ™TÜ[]U™XÑ^]
+
+Kˆ˜]]™Pš[™[™Îˆ™\ÛÛ™P™]\”Ü[]S˜]]™Pš[™[™Ê
+HÏÈ[™Yš[™YˆËÈš[HÛÜšÙ\ˆÈ[›[™H9fç¹®æ¹cèú`ïy/oùå*9..ú/æùê"ú)èù§¤9ioyæ¡9aiycèûï#:`oùacHXÚØYÙY9."ÂˆËÈÛÜšÙ\ˆ:!êº(c:(î™\]Z\™J	Ø™]\‹\Ü[]LÉÊH:)èù§¤9b,:e&z+ëùæë¹oexà ‚ˆ™]\”Ü[]S[Ù[T]ˆ™\ÛÛ™P™]\”Ü[]S[Ù[Q[žJ
+KˆJNÂŸB‚˜ÛÛœÝUUÐ“ÕS‘T–WÕÐRUÕSQSÕUÓTÈHLÌÂ‚˜\Þ[˜È[˜Ý[ÛˆÚ]]]›Ý[™\žU[Y[Ý]ŠX™[ˆÝš[™Ë\ÚÎˆ
+
+HOˆ›ÛZ\ÙOŠNˆ›ÛZ\ÙOˆÂˆ][Y\Žˆ™]\›•\O\[ÙˆÙ][Y[Ý]ˆ[H[ÂˆžHÂˆ™]\›ˆ]ØZ]›ÛZ\ÙKœ˜XÙJÂˆ\ÚÊ
+Kˆ™]È›ÛZ\ÙOŠ
+Ü™\ÛÛ™K™Z™XÝ
+HOˆÂˆ[Y\ˆHÙ][Y[Ý]
+
+
+HOˆÂˆ™Z™XÝ
+™]È\œ›ÜŠ	ÛX™[H[YYÝ]Y\ˆ	ÐUUÐ“ÕS‘T–WÕÐRUÕSQSÕUÓTß[\Ø
+JNÂˆKUUÐ“ÕS‘T–WÕÐRUÕSQSÕUÓTÊNÂˆ[Y\‹[œ™YËŠ
+NÂˆJKˆJNÂˆHš[˜[HÂˆYˆ
+[Y\ŠHÛX\•[Y[Ý]
+[Y\ŠNÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆX\™ÝÛ‘ÚÜÝ›Ú™XÝ[Û›Ý[™\žJ™X\ÛÛŽˆÝš[™ÊNˆ›ÛZ\ÙO›ÚYˆÂˆÛÛœÝ˜Z[\™\Îˆ[šÛ›ÝÛ–×HH×NÂˆÛÛœÝ[ˆH\Þ[˜È
+X™[ˆÝš[™Ë\ÚÎˆ
+
+HOˆ›ÛZ\ÙO›ÚYŠNˆ›ÛZ\ÙO›ÚYˆOˆÂˆžHÂˆ]ØZ]\ÚÊ
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ˜Z[\™\Ëœ\Ú
+\œ›ÜŠNÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ	ÛX™[HÛˆ	Ü™X\ÛÛŸH˜Z[Y\œ›ÜŠNÂˆBˆNÂ‚ˆ]ØZ][Š	Ú[\œ\ÚÜÝØ[Ñ›ÜXØÛÝ[›Ý[™\žIË
+
+HO‚ˆÚ]]]›Ý[™\žU[Y[Ý]
+	Ú[\œ\ÚÜÝØ[ÉË[\œ\ÚÜÝØ[Ñ›ÜXØÛÝ[›Ý[™\žJKˆ
+NÂˆ]ØZ][Š	ÝØZ]›Ü‘ÚÜÝ]]][ÛœÉË
+
+HO‚ˆÚ]]]›Ý[™\žU[Y[Ý]
+	ÝØZ]›ÜˆÚÜÝ]]][ÛœÉËØZ]›Ü‘ÚÜÝ]]][ÛœÊKˆ
+NÂˆ]ØZ][Š	ÜÝ\Ü[™[ÚÜÝÉËÝ\Ü[™[ÚÜÝÊNÂ‚ˆYˆ
+˜Z[\™\Ë›[™Ýˆ
+HÂˆ›ÝÈ™]ÈYÙÜ™YØ]Q\œ›ÜŠ˜Z[\™\ËÚÜÝ›Ú™XÝ[ÛˆX\™ÝÛˆÛˆ	Ü™X\ÛÛŸHØ\È[˜ÛÛ\]X
+NÂˆBŸB‚‹ÊŠ‚ˆ
+ˆ˜Z\ÙYÚ[ˆHXØÛÝ[›Ý[™\žHØ[››Ý›Ý™HHÝ]ÛÚ[™ÈXØÛÝ[	ÜÈ\˜X›Bˆ
+ˆÝX˜YÙ[[›™\œÈ\™HÝÜYˆ\Ý[˜ÝÛ\ÜÈ™XØ]\ÙH]™\žH
+›Ý\Šˆ˜Z[\™H[‚ˆ
+ˆ]›ØÚÈ\È[X™\˜][H›Û‹Y˜][È\ÈÛ™H]\ÝX›ÜH[™Ý™\‹‚ˆ
+‹Â˜Û\ÜÈTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›Üˆ^[™È\œ›ÜˆÂˆÛÛœÝXÝÜŠˆ™X\ÛÛŽˆÝš[™ËˆÝ™\œšYH™XYÛ›HØ]\ÙOÎˆ[šÛ›ÝÛ‹ˆ]Z[H	ÔHÝX˜YÙ[[›™\œÈÛÝ[›Ý™HÛÛ™š\›YYÝÜY	Ëˆ
+HÂˆÝ\\Šˆ	Ù]Z[HÛˆ	Ü™X\ÛÛŸNÈ
+Âˆ˜XØÛÝ[ÝÚ]ÚX›ÜYÛÈHÝ]ÛÚ[™ÈXØÛÝ[	ÜÈÜ™Y[X[È\™H›ÝY[ˆ\ÙH‹ˆ
+NÂˆ\Ë›˜[YHH	ÔTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›Ü‰ÎÂˆBŸB‚‹ÊŠ‚ˆ
+ˆY[ˆXØÛÝ[[™Ý™\ˆX›ÜY\ˆ]Y[™XYHZÙ[ˆÙ\šXÙ\È\\Âˆ
+‚ˆ
+ˆHX›ÜÙY\ÈH\Ù\ˆÛˆHÛXØÛÝ[]žHH[YH]Ø[ˆ\[‚ˆ
+ˆHÝ\ÝÛH›ÝšY\ˆØ][ÙÈ\È™Y[ˆÛX\™Y[™SKHØÚY[\‹[X™Y[™Ëˆ
+ˆHÚÜÝ›Ú™XÝ[Ûˆ[™X\›ˆ]™H™Y[ˆÝÜYˆZ\ˆÛÛœÝXÝ[ÛˆX[È[ˆ
+ˆ[™ÈÙ™ˆHÙÚ[ˆÈ‹\™XYHÙ\]Y[˜ÙH
+ØØ[˜Û”™XYH[™Bˆ
+ˆ\œ™XYKY›Ü‹X›Ý[™\ŠKÚXÚ›Ý[™È™K\[œÈÛˆ\È]8 %ÛÈHÛˆ
+ˆXØÛÝ[ÙY\ÈÛÜšÚ[™È›Üˆ[ž][™È[™XYH[ˆY[[ÜžH[™Ú[[HÙ\È›Ý›Ü‚ˆ
+ˆ]™\ž][™È]Ø\ÈÜ›ˆÝÛ‹‚ˆ
+‚ˆ
+ˆ\È™XÛÜ™ÈH˜XÝ[™Ø^\ÈÛÈÛ˜ÙKZ[›Kˆ]\È[X™\˜][H›ÝBˆ
+ˆ\X[™KZ[š]ˆÙˆHÚ^Û›HSKÛÚÈÛÛ›Û[™HØÚY[\ˆ]™H[‚ˆ
+ˆ[žHÚ[]\ÈY[\Ý[[™™XXÚX›Hœ›ÛH\™NÈH›ÝšY\ˆØ][ÙÈ8 %ˆ
+ˆHÛ™H]XÚY\ÈÚXÚ›Ý]\È[ˆYÙ[X^HZÙH8 %\È™\Ü[]YžHBˆ
+ˆ™XY[™\ÜÈ\›HX›\ÚYœ›ÛHHÝ\\ÛÜÝ\™K[™Ø[[™È[ˆH\Ýˆ
+ˆÛÝ[X]™HHXØÛÝ[ÛÚÚ[™È™XÛÝ™\™YÚ[H]È›Ý][™ÈÝ^YY[\K‚ˆ
+‚ˆ
+ˆ\Ù\‹]š\ÚX›Hœ™\Ý\™\]Z\™Yˆ\ÈH›ÙXÝXÚ\Ú[Ûˆ[™\È›ÝÛ]YÙÛYˆ
+ˆ[ˆ\™KˆHX›Ü\È™XÛÜ™Y[™ÙÙÙYÈ]Ù\È›ÝÜ[ˆHX[ÙË‚ˆ
+‹Â›]XØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛŽˆÝš[™È[H[Â‚™[˜Ý[ÛˆX\šÐXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛŠ™X\ÛÛŽˆÝš[™ÊNˆ›ÚYÂˆYˆ
+XØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛˆOOH[
+H™]\›ŽÂˆXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛˆH™X\ÛÛŽÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆXØÛÝ[[™Ý™\ˆÛˆ	Ü™X\ÛÛŸHØ\ÈX›ÜYY\ˆX\™ÝÛˆY[™XYH[ˆ8 %\È
+Âˆ	ØXØÛÝ[ÙY\È]ÈÝ\ÝÛH›ÝšY\ˆØ][ÙÈÛX\™Y[™]ÈSKØÚY[\‹	È
+Âˆ	Ù[X™Y[™ËÚÜÝ›Ú™XÝ[Ûˆ[™X\›ˆÙ\šXÙ\ÈÝÜY[[H\\È	È
+Âˆ	Ü™\Ý\YÜˆH]\ˆ[™Ý™\ˆÝXØÙYYÉËˆ
+NÂŸB‚‹ÊŠˆ\ÝÙX[NˆÚXÚ™X\ÛÛˆX›ÜYZY]X\™ÝÛ‹Üˆ[Yˆ›Û™H\Ëˆ
+‹Â™^Ü[˜Ý[Ûˆ×ØXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛ‘›Ü•\ÝÊ
+NˆÝš[™È[Âˆ™]\›ˆXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛŽÂŸB‚‹ÊŠ‚ˆ
+ˆÛX\™YžHH[™Ý™\ˆ]ÛÛ\]\Ë‚ˆ
+‚ˆ
+ˆHÝXØÙ\ÜÙ[ÝÚ]Ú™\XÙ\ÈH[[YHHX›ÜYY[ˆ\ÛX[Yˆ
+ˆÛÈH›ØÚÚ[™ÈÝ]HÝÜÈ™Z[™ÈYH[™H™^X›Ü8 %Yˆ\™H]™\ˆ\Âˆ
+ˆÛ™H8 %\ÈÈ™HX›HÈØ^HÛÈYØZ[‹‚ˆ
+‹Â™[˜Ý[ÛˆÛX\XØÛÝ[›Ý[™\žPX›ÜX\šÊ
+Nˆ›ÚYÂˆXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛˆH[ÂŸB‚˜\Þ[˜È[˜Ý[ÛˆX\™ÝÛ]]XØÛÝ[›Ý[™\žJ™X\ÛÛŽˆÝš[™ÊNˆ›ÛZ\ÙO›ÚYˆÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœ™\Ù]
+
+NÂˆÛÛœÝ›ØÚÚ[™Ñ˜Z[\™\Îˆ[šÛ›ÝÛ–×HH×NÂˆËÈÛØ[[Y\œÈØ[ˆ\Ü]Ú›ÝYÚHÝ]ÛÚ[™ÈXZÙ\ˆÚ[H][˜ÚY™[˜ÙBˆËÈXÜ]Z\Ú][ÛˆØZ]È™Z[™]Y]YYš[\Þ\Ý[HÛÜšËˆ[˜[Y]H[H™Y›Ü™BˆËÈHš\œÝ]ØZ]È™\Ù]ÛØ[ÛÛ›Û\Š
+HÞ[˜Ú›Û›Ý\ÛH\ÜÜÙ\ÈHÝ\œ™[ˆËÈÛÛ›Û\ˆ[™Ø[˜Ù[ÈÛÛ[X][ÛˆÈ\ØYÙK\™\Ý[YH[Y\œË‚ˆËÈÝ\\ÜÜØ[Þ[˜Ú›Û›Ý\ÛK[ˆ˜Z[ˆ]™Y›Ü™HØZ][™ÈÛˆBˆËÈÜ›ÜÜË\›ØÙ\ÜÈ][˜Ú™[˜ÙKˆ\ÈÛÜÙ\ÈHÛØ[›Ý[™\žH[[YYX][NÂˆËÈ\ÜÜØ[]Ù[ˆÛ›HÙ]\ÈÝÛ™\‹\ØÛÜY\œÚ\Ý[˜ÙH[™Ø[››Ý][˜ÚBˆËÈ™]È\˜X›H[›™\ˆY\ˆHÛÛ›Û\ˆ\È™Y[ˆ™[˜ÙY‚ˆÛÛœÝÛØ[\ÜÜÙHH™\Ù]ÛØ[ÛÛ›Û\Š
+NÂˆËÈ˜Z\ÙHH\˜X›K\[ˆ™[˜ÙH™Y›Ü™HH™[XZ[š[™È\ÝXÝ]™HX\™ÝÛŽ‚ˆËÈ[œ]]šXÙHÛÝÈ\™HÝ\Ü[™YHÝ\ÝÛH›ÝšY\ˆØ][ÙÈ\ÈÛX\™YˆËÈ[™SKØÚY[\‹[X™Y[™È[™ÚÜÝ›Ú™XÝ[Ûˆ\™HÝÜYˆ˜Z[[™ÈÂˆËÈ˜Z\ÙH]Ý[X›ÜÈH[™Ý™\ˆ™Y›Ü™HÜÙHÙ\šXÙ\È\™HZÙ[ˆ\\‚ˆËÂˆËÈÛ[™È]›ÜˆHÚÛHX\™ÝÛˆ˜]\ˆ[ˆÛ›HHÚ]ÝÛŠÜÝÙY\\ÂˆËÈH[[™YÚY[š[™ÎˆH\˜X›H][˜Ú\È^XÝHÚ]]\Ý›ÝÝ\ˆËÈÚ[H[ˆXØÛÝ[›Ý[™\žH\È[ˆ›ÙÜ™\ÜË‚ˆËÈXÛ\™YÝ]\™H™XØ]\ÙHH™[˜ÙIÜÈžKÙš[˜[H›ÝÈÜ[œÈHÚÛBˆËÈX\™ÝÛ‹[™H‹XÛÜÙHš[˜[H™[ÝÈÝ[\ÈÈ™XXÚ]‚ˆ]YÙ[\Û[™Ù\šXÙNˆ™]\›•\O\[ÙˆÙ]YÙ[\Û[™Ù\šXÙOˆ[™Yš[™YÂˆ]™[X\ÙP›Ý[™\žS][˜Ú™[˜ÙNˆ
+
+
+HOˆ›ÛZ\ÙO›ÚYŠH[H[ÂˆžHÂˆ™[X\ÙP›Ý[™\žS][˜Ú™[˜ÙHH]ØZ]XÜ]Z\™TTÝX˜YÙ[][˜Ú™[˜ÙJˆ]š›Ú[Š\™Ù]]
+	Ý\Ù\‘]IÊK	ÜKXYÙ[ZÛYIÊKˆ
+NÂˆHØ]Ú
+\œŠHÂˆžHÂˆ]ØZ]ÛØ[\ÜÜÙNÂˆHØ]Ú
+\ÜÜÙQ\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ™\Ù]ÛØ[ÛÛ›Û\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\ÜÜÙQ\œŠNÂˆBˆËÈH[™Ý™\ˆ\ÈX›Ü[™È™Y›Ü™HHÝÛ™\ˆÛÛ[Z]ÛÈHÝ]ÛÚ[™ÈXZÙ\‚ˆËÈ[™ˆ™[XZ[ˆ]]Üš]]]™Kˆ™XÜ™X]HHÛÛ›Û\ˆ\ÜÜÙYX›Ý™NÂˆËÈÝ\Ú\ÙHH˜[œÚY[™[˜ÙH˜Z[\™HX]™\ÈHÝ[XXÝ]™HXØÛÝ[Ú]ˆËÈ›ÈÛØ[TËÜ[[YH[[HÚÛH\™\Ý\Ë‚ˆžHÂˆÛÛœÝXZÙ\ˆHÙ]XZÙ\ÛÜ™J
+NÂˆÛÛœÝ]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜÈHÜ™X]P]]ÛX][Û•\Ù\•\›‘Ú]˜\Ù[[™RÛÚÜÊ
+NÂˆÝ\ÛØ[ÛÛ›Û\ŠÂˆXZÙ\‹ˆÙ]Žˆ
+
+HOˆÙ]ÛY[
+
+K™š^ž›Kˆœ›ØYØ\ÝÝ]\Îˆœ›ØYØ\ÝÛØ[Ý]\Ëˆ‹‹˜]]ÛX][Û‘Ú]˜\Ù[[™RÛÚÜËˆJNÂˆËÈHÝ\\[™XYH[ˆ›YÚ™Y›Ü™H™\Ù]ÛØ[ÛÛ›Û\Š
+HÚ[^]Û‚ˆËÈ]ÈÙ[™\˜][Ûˆ™[˜ÙH
+[™X^HÝÜHØÚY[\ˆ]\ÝÛÛœÝXÝY
+K‚ˆËÈ]Y]YHHœ™\Ú[XØÛÝ[ZÜÝ][\™Z[™]ÛX[\ÛÈBˆËÈÝ[XXÝ]™HXØÛÝ[[ÛÈ™YØZ[œÈØÚY[\ˆ[™X\›‹ˆÈ›Ý]ØZ]]‚ˆËÈHÜšYÚ[˜[™[˜ÙH\œ›Üˆ]\Ý™[XZ[ˆH[™Ý™\ˆ™\Ý[‚ˆ›ÚY][\Ý\ØÚY[\Š
+NÂˆHØ]Ú
+™\ÝÜ™Q\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆ™\ÝÜ™HÛØ[ÛÛ›Û\ˆY\ˆ][˜ÚY™[˜ÙH˜Z[\™HÛˆ	Ü™X\ÛÛŸH˜Z[Y˜ˆ™\ÝÜ™Q\œ‹ˆ
+NÂˆBˆËÈ˜Z[ÛÜÙY[›ZÙH]Z][™H™[][˜ÚˆÜÙHÛÈ\™H[ÝÙYÂˆËÈÛÛ[YHÚ]Ý]H™[˜ÙH™XØ]\ÙHH›ØÙ\ÜÈ\ÈX›Ý]È\Ø\X\‚ˆËÈ
+]Z]
+HÜˆHÜ\˜][Ûˆ\ÈØ[˜Ù[YÝ]šYÚ
+™[][˜Ú
+Kˆ\™HBˆËÈ›ØÙ\ÜÈÙY\È[›š[™È[™[™È]È[[YHÈHY™™\™[ÝÛ™\‹ÛÂˆËÈHÚ[™ÝÈH™[˜ÙH^\ÝÈÈÛÜÙH\È™XÚ\Ù[HHÛ™HÝ[Ü[ˆ8 %ˆËÈYÜ˜Y[™ÈÈØ\›ˆ[™ÛÛ[YHˆÛÝ[Ú[[H™Z[›ÙXÙH]ˆBˆËÈÙÛÝ]]˜Z[ÈØ[ˆ™H™]šYY[™]\ÈÚ[\™H\È›Ý[™ÂˆËÈÈ[™Ë‚ˆ›ÝÈ™]ÈTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›ÜŠˆ™X\ÛÛ‹ˆ\œ‹ˆ	ÝHHÝX˜YÙ[][˜Ú™[˜ÙHÛÝ[›Ý™H˜Z\ÙY	Ëˆ
+NÂˆBˆžHÂˆ]ØZ]ÛØ[\ÜÜÙNÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ™\Ù]ÛØ[ÛÛ›Û\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆžHÂˆËÈ\™Ø\™H]\ÝÝÜ™Y›Ü™HHÛ™È\Þ[˜È˜Z[‹ˆÝ\Ú\ÙHH[ÝXÚÈÜ‚ˆËÈZXÜ›ÜÛ™HÙY\ÈXÝ[™ÈÛˆHÝ]ÛÚ[™ÈXØÛÝ[Ú[HØXÚ\È[™SHÝÜ‚ˆÝ\Ü[™[œ]]šXÙU\ÚÔÛÝÊ
+NÂˆËÈH›Ý[™\žH\È[™XYHX\šÙY[™[™ÈžH]™\žHØ[\‹ˆ™]ÈXÝ[ÛœÈ›ÝÂˆËÈ˜Z[ÛÜÙYÈ˜Z[ˆ[ˆXÝ[Ûˆ]Ü›ÜÜÙYH›Ý[™\žH™Y›Ü™HÛÜÚ[™È]È‹‚ˆžHÂˆ]ØZ]Ú]]]›Ý[™\žU[Y[Ý]
+ˆ	ÝØZ]›Üˆ\›ˆÚ[™ÙK\Ù]XÝ[ÛœÉËˆØZ]›Ü•\›Ú[™ÙTÙ]XÝ[ÛœËˆ
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ›ØÚÚ[™Ñ˜Z[\™\Ëœ\Ú
+\œ›ÜŠNÂˆ]]›Ý[™\žSÙË™\œ›ÜŠØZ]›Ü•\›Ú[™ÙTÙ]XÝ[ÛœÈÛˆ	Ü™X\ÛÛŸH˜Z[Y\œ›ÜŠNÂˆBˆÚÚ[X]]ÔÞ[˜ÔÙ\šXÙK˜Ø[˜Ù[[‘›YÚ
+
+NÂˆËÈÝ\ÝÛH›ÝšY\ˆ›Ý]\È\™HÝÛ™\‹\ØÛÜY]HXÝ]™HØ][ÙÈ\È›ØÙ\ÜËYÛØ˜[‚ˆËÈÛX\ˆÞ[˜Ú›Û›Ý\ÛH]H›Ý[™\žNÈH™^ÝÛ™\‰ÜÈ˜XÚÙY™XY[™\ÜÈ™[ØYÈ[BˆËÈ™Y›Ü™H[žHYÙ[›Ý]HØ[ˆÝ\ˆH˜Z[Yˆ™XY\™Y›Ü™HÝ^\È˜Z[XÛÜÙY
+[\JBˆËÈ[œÝXYÙˆ™]Z[š[™ÈH™]š[Ý\ÈÝÛ™\‰ÜÈ[™Ú[Üˆ[Ù[[šY\Ë‚ˆÙ]Ý\ÝÛT›ÝšY\œÊ×JNÂˆXØÛÝ[›ÝšY\”™XY[™\ÜÐ\›K˜ÛX\Š
+NÂˆÝ\[™[™ÐXØÛÝ[›ÝšY\”™XY[™\ÜÈH[ÂˆXØÛÝ[›ÝšY\”™XY[™\ÜÐ˜\œšY\‹š[˜[Y]PYÜ[ÛŠ
+NÂˆÛX\“[Ù[š\ÚXš[]SZ\œ›ÜŠ
+NÂˆËÈ:/ç9ê"ù/&º+çyæ¡:eg9`ãùa­ùï$ùkf:aã9¦+ùb*ùæ¡:+¯¹i!ùæ¡: b¹i*ya¡yk®xà ›ÝÛ™\ˆ9doyd#yênºeí9mì¹îãù/çz+ày."ù. 9.*º-)¹cíú+îù.#yb,ˆËÈ9k Ë9/a¹ænùaî¹d#¹.#z+éyg*9ææ9."¹åfyç`8 %8 %:/æzaãÝÛ™\ˆ:/æ9£!ùd$JŠ¹¥éú-)¹cíÊŠŠÛÛ[Z]XÝ]™P\Ù\ÜÚ[Ûˆ9g*ˆËÈX\™ÝÛˆ9.bùd#¹¢cyb!ÊK9«hù¦+ùe+ù. : ïy®!yaá¹æ¡9¥í¹§.¸à ‚ˆËÂˆËÈ9b(9.#y£¢y¥íŠÚ[™ÝÜÈ9¥¡ù.íºe HÈ9§`úfdÈ9nm¹cäya¦JJŠ¹.#zf.ù¥«yænùaîŠŠˆ8 %8 %9chy/cùænùaî¹«å9ï$ùkf9«¢ùåfy¦í9ìçÈ8 %8 %ˆËÈ9/a¹.gù.#z ïycêº+¬9. :(c9¥éyoåù.¡¹.¢Î¹¢¢¹o¡y®!yæë¹oey£ y.ayc%º/æúaãz+åzf'ùb%Ë9."ù«(yd+ùbª9.#¹."ù«(z-)¹cíú/®yåc9d!9­¢9c%‚ˆËÈ9. 9«(K9æí9b,9ç'ù«hùb(9£¢J™]šY]ÎˆÛÙ^Jxà ºhn¹¢bùab9­¢9c%¹. 9«(yc¡¹cìº`eùåfxà ‚ˆžHÂˆ]ØZ]˜Z[”\™ÙT]Y]YJ
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žT\™ÙSÙËØ\›Š˜Z[ˆZ\œ›ÜˆØXÚH\™ÙH]Y]YHÛˆ	Ü™X\ÛÛŸH˜Z[Y˜\œŠNÂˆBˆžHÂˆ]ØZ]Ù]Z\œ›ÜØXÚJ
+K˜ÛX\[
+
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žT\™ÙSÙË™\œ›ÜŠÛX\ˆ]šXÙK[[šÈZ\œ›ÜˆØXÚHÛˆ	Ü™X\ÛÛŸH˜Z[Y˜\œŠNÂˆYˆ
+\œˆ[œÝ[˜Ù[ÙˆZ\œ›ÜØXÚT\™ÙQ\œ›ÜŠHÂˆËÈ™[XZ[š[™ÈÈ˜\œšY\œÈÈÛXœÝÛ™\È9."y¨-ú`ïz) yn)¹."Š9d#TÈ9/©ùæ¡]Y]YT\™ÙT™]žJN‚ˆËÈ9cê¹/(›ÛÝ9æ¡:+çK:(iyb(9¢$9b§ùd#ºf'ùb%ù¥è¹.#yçéz`dú+éz(iz!ê¹h§¹dê¹.*¹/g9n§ú+¨y¥l9.gù.#y/&º` 9onHØXØÛÝ[ˆËÈ9h¤ùè¤H8 %8 %9h¤ùè¤y. 9æí9£ ¹ç`9l,yëby.£º/æy.*ˆÝÛ™\ˆ9æ¡9ï$ùkf:+îú(ªù¬.9.ayc¢ù/cÊ™]šY]ÎˆÛÙ^Jxà ‚ˆ]ØZ][œ]Y]YT\™ÙJ\œ‹œ›ÛÝ\œ‹œ™[XZ[š[™Ë\œ‹˜˜\œšY\œË\œ‹ÛXœÝÛ™\ÊK˜Ø]Ú
+ˆ
+[œ]Y]YQ\œŽˆ[šÛ›ÝÛŠHOˆÂˆ]]›Ý[™\žT\™ÙSÙË™\œ›ÜŠ	Ù˜Z[YÈ[œ]Y]YHZ\œ›ÜˆØXÚH\™ÙH™]žN‰Ë[œ]Y]YQ\œŠNÂˆKˆ
+NÂˆBˆBˆËÈÚ[™H™[^HÝÛœÈÛ™Ë[]™Y˜[œÜÜÈ\ÈXØÛÝ[\ØÛÜY\ÚËØš[™[™ÂˆËÈÝ]Kˆ˜Z[ˆ[™Ü™\ÜÈ™Y›Ü™H\ØØ\™[™ÈHÝÛ™\‹\ØÛÜYÝÜ™NÈÝ\Ú\ÙHBˆËÈ]H[YÜ˜[KÔÛXÚÈØ[˜XÚÈÛÝ[Üš]H›ÝYÚH™^XØÛÝ[›Ý[™\žK‚ˆžHÂˆ]ØZ]ÝÜÛÚÐÛÛ›ÛXØÛÝ[
+
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠÝÜÛÚÐÛÛ›ÛXØÛÝ[Ûˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆHš[˜[HÂˆËÈ]]Ü[[YH›Ý[™\šY\ÈÙY\\˜X›HÜ›Ý\Ý\œÛÜœÈ›ÜˆH]\ˆ™[ÙÚ[ŽÂˆËÈÛ›H^XÚ]XØÛÝ[[][Ûˆ\ÈH]K\™[[Ý˜[›Ý[™\žK‚ˆ™\Ù]ÛÚÐÛÛ›ÛÝÛ™\›Ý[™\žJÈÛX\”\œÚ\ÝYˆ™X\ÛÛˆOOH	ØXØÛÝ[Y[][Û‰ÈJNÂˆBˆËÈ]™\žHÚÜÝØ[™›ÞØ[ˆ™]Z[ˆ]™HÐ]]ÝXœØÜš\[Û‹Üˆ[‹[Y[[ÜžBˆËÈÝ]KˆÝÜ[H™Y›Ü™HÚ[™Ú[™ÈÝÛ™\œÎÈ™\ÚY[ÚÜÝÈ\™H™XÜ™X]YžBˆËÈH]]XÚ[™ÙHXÝ]˜][Ûˆ\ÜÈY\ˆH™]È›Ý[™\žH\ÈÛÛ[Z]Y‚ˆžHÂˆ]ØZ]X\™ÝÛ‘ÚÜÝ›Ú™XÝ[Û›Ý[™\žJ™X\ÛÛŠNÂˆHØ]Ú
+\œ›ÜŠHÂˆ›ØÚÚ[™Ñ˜Z[\™\Ëœ\Ú
+\œ›ÜŠNÂˆBˆËÈ\œÛÛ˜[SHÚ[›™[È]™HHØ[YHˆ›Ý[™\žKˆ™[ÙÚ[ˆ™\Ý\È[Hœ›ÛBˆËÈH™^ÝÛ™\ˆ‹\™XYHØ[˜XÚÎÈ\œ™XYKY›Ü‹X›Ý™[XZ[œÈHÛÛ\]Xš[]BˆËÈ™]žHY\ˆH™]ÈÛY[\È™XYK‚ˆžHÂˆ]ØZ]ÝÜ[PÛÛ›™XÝ[ÛŠ™X\ÛÛŠNÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠÝÜ[PÛÛ›™XÝ[ÛˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆËÈ\ÙH9b!ú-)¹cíÎX\™ÝÛˆ:hn¹n£ùo¢9alúe+‹9b!¹.)9«iH8¤h™XY[™\ÜÈÛ\ˆ8¡¤ˆ8¤hHØÚY[\¸à ‚ˆËÈ8¤h9ab9®!H™XY[™\ÜÈÛ\‹
+Š¹oázhnùg*]ØZ]™\Ù]ØÚY[\Š
+H9.bùbcJŠ¸à ‚ˆËÈ™\Ù]ØÚY[\Š
+H9a¡z`ê]ØZ]ÜØÚY[\‹œÝÜ
+
+H9¦+ùo ¹«iyæ¡ú"éyab]ØZ]9k Ë9g*ˆËÈÝÜ:/æú(c9.+yæ¡:`¨ù«­yê¥ùcèúaãØÝ\œ™[9.ãy£!ùd$y«hùg*9`g9æ¡9¥éùk§¹/¢Ë9§'úeí9.îù/ey¥¬9æ¡ˆËÈÚ]ØÚY[\ˆ:, ùå*9/&ˆ]ØZ]™XYH8¡¤ˆ9êâùclÈ™\ÛÛ™H9b,:/æy.*ˆÝÜ[™È9k§¹/¢È8¡¤ˆ9.&¹b¨BˆËÈØˆ9g*9mì¹`gØÚY[\ˆ9."º-äxà ¹ab9d#9«iy®!y£¢HØÝ\œ™[:+ªyê¥ùcèùa¡yæ¡9¥¬:, ùå*:/k9..ˆ[™[™ËˆËÈ9ëbH™[ÙÚ[ˆ9d#¹æ¡Ù]ØÚY[\”™XYH9e ¹aiJŠ¹¥¬9k§¹/¢ÊŠŠ9.#ˆÛÜšÙ\ˆYÈÌH9æ¡™[ÙÚ[‚ˆËÈ:-ëùo¡9d#9§¡:/æzaã9alù£¢HX\™ÝÛˆ:-ëùo¡9æ¡9kîy`m¹ê¥ùcèÊxà ‚ˆËÈ9.#H™Z™XÝÜ[™[™È8 %:+ªyg*:`%:+íù¬`¹îéùîëyëby."ù«(HÙ]ØÚY[\”™XYKÌÈ:-¡y¥í¹ag9n¥xà ‚ˆ™\Ù]ØÚY[\”™XYJ
+NÂˆYÙ[\Û[™Ù\šXÙHHÙ]YÙ[\Û[™Ù\šXÙJ
+NÂˆYÙ[\Û[™Ù\šXÙOËœ™\Ù][[YTÝ]J
+NÂˆËÈ8¤hH9a£y`g9¥éÈØÚY[\¸à œØÚY[\ˆ9£ y§"y¥éÈ\Ù\ˆ9æ¡ÝÜ˜YÙHš^ž›H9o%yå*9oázhnùg*ˆËÈÛÜÙSØØ[ˆ9.bùbcyabÝÜùd)¹b&y."ù. 9éäˆXÚÈ9/&¹¤§ˆ	ÛØØ[ˆ›Ý™XYIøà ‚ˆËÈ™\Ù]ØÚY[\ˆ9¢¢ˆØÚY[\‹ZÜÝ9æ¡ÜØÚY[\ˆ9cey/¢ùïkˆ[9."ù. 9«(BˆËÈ][\Ý\ØÚY[\ŠÛ”™XYH:)é¹cäJy/&¹å*9¥¬\Ù\ˆ9æ¡š^ž›H:aãy¥¬9d+ùbª8à ‚ˆËÈ:)àH\ÙHÈÚ[™Ù[ÙÈ0ªÜØÚY[\ˆ9.#yæäyd+ØØ[‹˜ÛÜÙQŠ9b!ú-)¹cíÊp®È:`eùåfxà ‚ˆžHÂˆ]ØZ]™\Ù]ØÚY[\Š
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ™\Ù]ØÚY[\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆËÈ][\Ý\ØÚY[\ˆ9æ¡ÙXZÔÙ]9.gú) yîæy¥¬ØÚY[\ˆ9k§¹/¢ùåfy/cyïkˆ8 %:  yk§¹/¢ú(ªÂˆËÈ™\Ù]ØÚY[\ˆ9ïkˆ[9d#¹/&º(ªÈÐËÙXZÔÙ]:!ê¹bª9®!yä!Žù¥¬9k§¹/¢ù.ã¹§*ˆY:/áËˆËÈ][\9¥í¹/&ºaãy¥¬]XÚ8à º/æzaã9¥è:g 9¢bùbª9¤ãy/gÙXZÔÙ]8à ‚ˆËÈ[X™Y[™ËZÜÝ9.gù£ y§"y¥éÈ\Ù\ˆ9æ¡ˆ9o%yå*9b!ú-)¹cíùbcyabÝÜ9."ù«(H[œÝ\™T™XYBˆËÈ:)é¹cäyæ¡Û”™XYH9/&¹å*9¥¬ˆ:aãy¥¬9d+ùbª
+][\Ý\[X™Y[™ÒÜÝ9cey/¢ùn`¹ëbJxà ‚ˆžHÂˆ]ØZ]ÝÜ[X™Y[™ÒÜÝ
+
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠÝÜ[X™Y[™ÒÜÝÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆËÈÚ]Z\ÝÜžKY[X™Y\ˆ9ª(ygeùî©ÈÝ]H
+Ý]Ù™ˆØXÚHÈ[˜X›YÈ\ÊH9.gú-çù¥éÈ\Ù\‚ˆËÈ9æ¡ˆ9îäyk¦ŽÈ:aãyïk¹d#¹."ù. 9«(H][\Ý\[X™Y[™ÒÜÝ8¡¤ˆÙ]\Ú]\ÝÜžQ[X™Y\‚ˆËÈ9/&¹£"y¥¬\Ù\ˆ9æ¡ˆ:aãy¥¬9b'yiâùc%‹9b!ú-)¹cíù¥è9.,¹n¤úhãºfjxà ‚ˆžHÂˆ™\Ù]Ú][X™Y\ØXÚJ
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆØ›ÛÝÝ˜\Y[XÝ›Û—H™\Ù]Ú][X™Y\ØXÚHÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜ˆ\œ‹ˆ
+NÂˆBˆËÈX\›‹ZÜÝ9cey/¢ù£ y§"y¥éÈ\Ù\ˆ9æ¡XZÙ\‹Ùˆ9¬ê9aiy/§z-e¹.#¹a¡ykf[ˆÝÜ™Nù.#zaãyïk¹æ¡:+çBˆËÈ™[ÙÚ[ˆ9d#ˆÝ\X\›’ÜÝ9n`¹ëby¥êz` 9¥¬:-)¹cíù/&¹îéùîëyå*9¥éù/§z-e¸à yç"ùb,9¥éú-)¹cíùæ¡ˆËÈ[‹[Y[[ÜžH[ŠÛÙ^™]šY]Êxà ™\ÜÜÙH9.+y«h¹­.ú-àú$®:i£øà z)èùîäHØ]Ú\‹9."ù«(BˆËÈ9l,yîê¹à®yå*9¥¬9/§z-eºaãynî¸à ‚ˆžHÂˆ]ØZ]™\Ù]X\›ÛÛ›Û\Š
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ™\Ù]X\›ÛÛ›Û\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆžHÂˆ\ÜÜÙQ\ÚÝÜÛÛXÝÓX[˜YÙ\Š
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ\ÜÜÙHÛÛXÝÈX[˜YÙ\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆËÈXZÙ\ˆÙ\ÜÚ[ÛˆÝÜ˜YÙH™\ÛÛ™\ÈHÝ\œ™[ÛY[^š[KˆH]HØ[˜XÚÂˆËÈœ›ÛHH™]š[Ý\ÈÝÛ™\ˆ]\Ý›ÝÝ\š]™HÛ™È[›ÝYÚÈÜš]H[ÈH™^ˆËÈÝÛ™\‰ÜÈ]X˜\ÙKÛÈÚ]ÝÛˆ[™\ØØ\™H[\™H[[YH™Y›Ü™HˆÝØ\‚ˆËÈ9ab9.(¹o ù¥éÈÝÛ™\ˆ9æ¡9níº/çÈÛÙ^:aãyd+ùænú+¬8 %8 %Û\ˆ:f£ú/æùê"ùkf9­.Ë9.#y®!y/&¹g*9¥¬ÝÛ™\‚ˆËÈ9æ¡XZÙ\ˆ9."¹adyã¬9¥éÈÝÛ™\ˆ9æ¡:+¬9oáº+¯¹ïkºaãyd+ÊÚ]ÝÛˆ:)é¹cäyæ¡9/&º+çyalúeëy.¢ù.í¹.gù/&‚ˆËÈ9¤§¹."¹k Ë9ab9®!ya£yalÊxà ‚ˆÛX\‘Y™\œ™YÛÙ^™\Ý\›Ü“ÝÛ™\›Ý[™\žJ
+NÂˆÛX\•ÛÜšÚ[™Ñ\™XÝÜžT™XÛÝ™\žQ›Ü“ÝÛ™\›Ý[™\žJ
+NÂˆËÈ[\œ\Y]\›‹\™\Ý[YNœÚ]ÝÛˆ9¢nzaãÈÛÜÙH9/&º+çy/&º)é¹cäHÛÜÙHX\™ÝÛˆ9æ¡ˆËÈX\šÔÙ\ÜÚ[Û•\›‘[™Y9¢¢ˆº/®yåc9¥íº/æ9g*:hç¹æ¡\›ˆ¹/*º(áy¢$9«hùn.9¥-¹l/ˆ8 %8 %:(ªùb!ù£h¹¢dù¥«yæ¡ˆËÈ9.îùb¨y.ã¹«i9¥è¹¥è9.+y¥«yª*¹nay.gù¥è9î¨¹à®K9db9ã¬9..ˆ¹chy/cù.%9¥è9¢©ze&HŠ9.#ˆ8£&H9æ¡]Z]œ™Y^™H9d#9«/‚ˆËÈ:eëºh¦]Z]œ™Y^™H9cê¹/çy¢©:` 9aî¹ï%¹£¤‹9.#z)¡¹æåº/æzaã
+xà œÚ]ÝÛˆ9b,ˆ\ÜÜÙH9§'úeí9¢¤yb-‚ˆËÈ[™Y9a¦K9/çy/cÈÝ\Y]ˆ[™Y]9æ¡9.+y¥«yååz/îNù.#z)¡¹æåˆX\™ÝÛˆ9bcy«­K:/®yåc9¥êy«­BˆËÈ:!ê¹á-¹k£9¢$9æ¡\›ˆ9áiùn.9¥-¹l/¸à ºaâ¹¥/¹¥/ˆš[˜[N¹¢¤yb-¹fj9¦+ú/æùê"ùî©ú+¨y¥l9¬á9¯#ù. 9«(yl,y¢¢‚ˆËÈ9d#¹îëHÝÛ™\ˆ9æ¡9«hùn.9¥-¹l/¹a¦yaj:`ê9d'¹£¢K9.+y¥«yª*¹nay/&¹g*9«ãù.*¹«hùn.9k£9¢$9æ¡9.îùb¨y."º+ëùo.xà ‚ˆÛÛœÝ™[X\ÙQ[™YÝ\™\ÜÚ[ÛˆH™YÚ[”Ù\ÜÚ[Û•\›‘[™YÝ\™\ÜÚ[ÛŠ
+NÂˆžHÂˆËÈÛØ[ÛÛ›Û\ˆØ\\™\ÈHXZÙ\ˆ[™ÝÛ™\ˆˆ]ÛÛœÝXÝ[Ûˆ[YK‚ˆËÈ\ÜÜÙH]™Y›Ü™H™\XÚ[™ÈHXZÙ\ˆÛÈH™[ÙÚ[ˆØ[››Ý\Ü]ÚˆËÈÛØ[È›ÝYÚHÚ][™ËYÝÛˆ[[YHœ›ÛHH™]š[Ý\ÈXØÛÝ[‚ˆžHÂˆ]ØZ]™\Ù]ÛØ[ÛÛ›Û\Š
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ™\Ù]ÛØ[ÛÛ›Û\ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆBˆËÈØ[YH™[˜ÙKØ[YHÜ™\š[™È\™Ý[Y[\È]Z][™H\]H™[][˜Úˆ˜Z\ÙYˆËÈ™Y›Ü™HXZÙ\‹œÚ]ÝÛ˜ÛÈ]ÛÝ™\œÈHÚ]ÝÛˆ
+˜[™
+ˆHÝÙY\™[ÝË‚ˆËÈXZÙ\‹œÚ]ÝÛ˜™\ÜÈ\‹\Ù\ÜÚ[Ûˆ]XÚ˜Z[\™\È˜]\ˆ[ˆ›ÝÚ[™ËˆËÈÛÈH\™[HØ[ˆÝ\š]™H]8 %[™HÝ\š]›ÜˆÛÝ[X›\ÚHœ™\Ú[‚ˆËÈY\ˆHÛ™K\ÚÝÝÙY\Y[™XYHØØ[›™Y[™[™ÈH™^ÝÛ™\ˆBˆËÈ[›™\ˆÛ[™ÈH™]š[Ý\ÈXØÛÝ[	ÜÈÜ™Y[X[Ë‚ˆËÂˆËÈ[›ZÙH]Z]\È]\ÝÛÛYHÝÛˆÛˆ
+™]™\žJˆ]ˆ[ˆXØÛÝ[›Ý[™\žHÝØ\ÂˆËÈHÝÛ™\ˆ[œÚYHH]™H›ØÙ\ÜÎˆH™[˜ÙHYÝ[™[™ÈÛÝ[™Y\ÙHBˆËÈ[˜ÛÛZ[™ÈÝÛ™\‰ÜÈÝÛˆ\˜X›H][˜Ú\È›ÜˆH™\ÝÙˆ\È›ØÙ\ÜÉÜÈY™K‚ˆËÈ˜Z\ÙY[œÚYHHÝ\™\ÜÚ[ÛˆžXÛÈ]š[˜[H™[X\Ù\È›Ý‚ˆËÈYHXZÙ\ˆÚ[™Û]ÛˆÙ]Ú\ÛÛ™Y[™\È]Ý[Û[™È[ž][™ÏÂˆËÂˆËÈXZÙ\‹œÚ]ÝÛ˜Ù]ÈÚ]ÝÛ”Ý\YÛˆ[žH[™™]™\ˆÛX\œÈ]ÛÂˆËÈÛ˜ÙH]\È[ˆ]™\žH]\ˆÜ™X]TÙ\ÜÚ[Û˜\È™Y\ÙYÚ]“XZÙ\ˆ\ÂˆËÈÚ][™ÈÝÛˆ‹ˆ]\Èš[™HÚ[ˆH[™Ý™\ˆÛÛ\]\È8 %HXZÙ\ˆ\ÂˆËÈ™\XÙY8 %][ˆX›ÜY[™Ý™\ˆX]™\ÈH\Ù\ˆÛˆHÛXØÛÝ[ˆËÈÚ]HÚ[™Û]Ûˆ]Ø[ˆ›ÈÛ™Ù\ˆÝ\H\ÚÈ[[H\™\Ý\Ë‚ˆ]Ú]ÝÛ”˜[ˆH˜[ÙNÂˆ]™]Z[™YTÙ\ÜÚ[ÛœÈHÂˆžHÂˆÛÛœÝXZÙ\ˆHÙ]XZÙ\’Y”™XYJ
+NÂˆËÈÙÛÝ]ÈXØÛÝ[ÝÚ]ÚˆHÝÛ™\ˆÛY[\È\ÜÜÙYH™]È[™\ÂˆËÈ™[ÝÈ[™HØ]]Ø^HÜ™Y[X[È™Z[™]™\žH›ÞHÚÙ[ˆ\™H™Z[™ÂˆËÈ™\XÙYˆY\\œÈ]ÙY\\™[Z[™\[™[Ú[™[ˆ[]™HXÜ›ÜÜÈ[‚ˆËÈÜ™[˜\žHÛÜÙH
+H\˜X›HÝX˜YÙ[ÊH]\ÝÝÜ[H\™H[œÝXY‚ˆËÈX\šÙY™Y›Ü™HH]ØZ]ˆÚ]ÝÛ”Ý\Y\ÈÙ]Ûˆ[žKÛÈBˆËÈÚ[™Û]Ûˆ\ÈÚ\ÛÛ™Y]™[ˆYˆ\È™Z™XÝË‚ˆYˆ
+XZÙ\ŠHÚ]ÝÛ”˜[ˆHYNÂˆÛÛœÝÚ]ÝÛ”™\ÜHXZÙ\‚ˆÈ]ØZ]XZÙ\‹œÚ]ÝÛŠÈ™X\ÛÛŽˆ	ØXØÛÝ[X›Ý[™\žIÈJBˆˆ[™Yš[™YÂˆËÈHHÙ\ÜÚ[ÛˆÚÜÙH]XÚ™]ÈX^HÝ[]™HH]™H›ØÙ\ÜË[™]ˆËÈ›ØÙ\ÜÈÝÛœÈ\˜X›HÚ[™[ˆÛ[™È–SÓHÜ™Y[X[È\ÈXØÛÝ[ˆËÈØ[››Ý™]›ÚÙKˆ™XÛÜ™Y›ÝËXÝYÛˆY\ˆHÝÙY\8 %HÝÙY\\ÂˆËÈÝ[ÛÜ[›š[™Ë]]Ø[››ÝXZÙH\È˜Z[\™H\Ø\X\‹‚ˆËÂˆËÈÛ›HH\È\ØØ[]YˆÝ\ˆYÙ[ÉÈ]XÚ˜Z[\™\ÈÝ^HÙÙÙY[™ˆËÈ›Û‹Y˜][^XÝH\È™Y›Ü™NˆZ\ˆÚ[™[ˆYHÚ]H\™[ÛÈBˆËÈ˜Z[YX\™ÝÛˆÙ\È›ÝX]™H™]›ØØ][Û‹\›ÛÙˆÜ™Y[X[È[ˆ\ÙK‚ˆÛÛœÝTÙ\ÜÚ[Û‘˜Z[\™\ÈH
+Ú]ÝÛ”™\ÜËœÙ\ÜÚ[Û‘˜Z[\™\ÈÏÈ×JK™š[\Šˆ
+˜Z[\™JHOˆ˜Z[\™K˜YÙ[Ú[™OOH	ÜIËˆ
+NÂˆËÈHÙ\ÜÚ[ÛˆÚÜÙH]XÚ˜Z[Y\È
+šÙ\
+ŽˆÙ\ÜÚ[Û‹™]XÚX]™\È][‚ˆËÈ\œ›Ü˜›ÝÛÜÙYÛÈHXZÙ\ˆÙY\È]ÈÝ]\È\Ý[™\ˆ[™]ÂˆËÈXÝ]™K\Ù\ÜÚ[ÛˆÛÝ[X™\˜][K[™H]\ˆÚ]ÝÛŠ
+X™]šY\È]‚ˆËÈ]XZÙ\È\ÈXZÙ\ˆHÛ›H™[XZ[š[™ÈÝ\\š\Ú[ÛˆÝ\™˜XÙH›ÜˆHBˆËÈ›ØÙ\ÜÈ]X^HÝ[™H[]™H8 %ÚXÚXÚY\ÈÚ]\ˆHX›Ü]ˆËÈ™[ÝÈX^H\ØØ\™]‚ˆ™]Z[™YTÙ\ÜÚ[ÛœÈHTÙ\ÜÚ[Û‘˜Z[\™\Ë›[™ÝÂˆ›Üˆ
+ÛÛœÝ˜Z[\™HÙˆTÙ\ÜÚ[Û‘˜Z[\™\ÊHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆHÙ\ÜÚ[Ûˆ	Ù˜Z[\™KœÙ\ÜÚ[Û’YH˜Z[YÈ]XÚÛˆ	Ü™X\ÛÛŸN˜ˆ˜Z[\™K™\œ›Ü‹ˆ
+NÂˆBˆËÈXZÙ\‹œÚ]ÝÛˆÛ›H™XXÚ\È\ÚÜÈ]Ý[]™HH]™H[™KˆBˆËÈ]XÚYHÝX˜YÙ[ÚÜÙH\™[\ÚÈØ\ÈÛÜÙYX\›Y\ˆ\È›È[™BˆËÈY]]\ÈÝ[Û[™ÈH˜[œÙ™\œ™Y›ÞHX\ÙH[™Ý[ˆËÈÜš][™ÈHÛÜšÜÜXÙH8 %ÝÙY\HÚÛHYÙ[ÛYHÛÈ›ÈÚ[ÙˆBˆËÈÝ]ÛÚ[™ÈÝÛ™\ˆÝ\š]™\È[ÈH™^Û™KˆØ[YHØ[H]Z]]\Ù\ÎÂˆËÈY[\Ý[Ú]H\‹Z[™HÝÜX›Ý™K‚ˆËÈ\ÈÛ™H\È
+››Ý
+ˆ›Û‹Y˜][ˆ]™\ž][™È™[ÝÈ[™ÈH[[YHÈBˆËÈ™^ÝÛ™\ŽˆHXZÙ\ˆ\È\ØØ\™YHÝ]ÛÚ[™È]X˜\ÙH\È\ÜÜÙYˆËÈ[™H\Ù\ÜÚ[Ûˆ\ÈÛÛ[Z]YÈH™]ÈXØÛÝ[ˆH[›™\ˆÙHÛÝ[ˆËÈ›ÝÛÛ™š\›H\ÈÝÜYÙY\È[›š[™ÈYØZ[œÝ\™XÝ–SÓHÜ™Y[X[ÂˆËÈœ›ÛHHÝ]ÛÚ[™ÈXØÛÝ[8 %Ü™Y[X[È›ÈÚÙ[ˆ™]›ØØ][ÛˆØ[ˆ™XXÚ8 %ˆËÈÛÈÛÛ\][™ÈH[™Ý™\ˆÛÝ[X]™HH™]š[Ý\ÈXØÛÝ[^Z[™È›Ü‹ˆËÈ[™H™]š[Ý\ÈÛÜšÜÜXÙH™Z[™ÈY]YžKH›ØÙ\ÜÈ›Ø›ÙH\ÈYÂˆËÈÝ\\š\ÙKˆX›Ü[œÝXY[™]HÙÛÝ]ÈÝÚ]Ú˜Z[[™™BˆËÈ™]šYYˆØÛÜH\È[˜Ú[™ÙYˆÛ›H[œÈ]šX]X›HÈ\È[[YH\™BˆËÈØZ]YÛˆÜˆÚ[YÛÈ[›Ý\ˆ[œÝ[˜ÙIÜÈ[›™\œÈ™]™\ˆ›ØÚÈ\Ë‚ˆÛÛœÝÝÜYH]ØZ]ÝÜ[TÝX˜YÙ[[œÑ›Ü‘^]
+ˆ]š›Ú[Š\™Ù]]
+	Ý\Ù\‘]IÊK	ÜKXYÙ[ZÛYIÊKˆ[™Yš[™YˆËÈH[›™\ˆ]™]™\ˆÛÛœÝ[Y\È]ÈXZ[›ÞÝ[ÛÈ\™XÝ–SÓBˆËÈÜ™Y[X[Èœ›ÛHHÝ]ÛÚ[™ÈXØÛÝ[[™ÜÙHØ[››Ý™H™]›ÚÙYˆËÈHØ^HH›ÞHÚÙ[ˆØ[‹ˆ\ØØ[]HÈH™\šYšYYÚ[˜]\ˆ[‚ˆËÈÙÙÚ[™È[™[™[™ÈHXØÛÝ[Ý™\‹‚ˆÈÜÝYˆ›ØÙ\ÜËœYÚ[[œ™\ÜÛœÚ]™T[›™\œÎˆYHKˆ
+K˜Ø]Ú
+
+\œŽˆ[šÛ›ÝÛŠHOˆÂˆ›ÝÈ™]ÈTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›ÜŠ™X\ÛÛ‹\œŠNÂˆJNÂˆYˆ
+\ÝÜY
+H›ÝÈ™]ÈTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›ÜŠ™X\ÛÛŠNÂˆYˆ
+TÙ\ÜÚ[Û‘˜Z[\™\Ë›[™Ýˆ
+HÂˆ›ÝÈ™]ÈTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›ÜŠˆ™X\ÛÛ‹ˆTÙ\ÜÚ[Û‘˜Z[\™\ÖÌOË™\œ›Ü‹ˆ	ÜTÙ\ÜÚ[Û‘˜Z[\™\Ë›[™ÝHHÙ\ÜÚ[ÛŠÊHÛÝ[›Ý™HÜ›ˆÝÛ˜ˆ
+NÂˆBˆ™\Ù]XZÙ\Š
+NÂˆHØ]Ú
+\œŠHÂˆËÈHX›ÜX›Ý™H]\Ý›Ý™H][™\™Y[È››Û‹Y˜][Žˆ]\ÈHÛ™BˆËÈ˜Z[\™H[ˆ\È›ØÚÈ]\ÈÈÝÜH[™Ý™\‹‚ˆYˆ
+\œˆ[œÝ[˜Ù[ÙˆTÝX˜YÙ[XØÛÝ[›Ý[™\žQ\œ›ÜŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠ	Ù\œ‹›Y\ÜØYÙ_H
+Ø]\ÙN˜\œ‹˜Ø]\ÙK	ÊIÊNÂˆËÈH[™Ý™\ˆ\ÈX›ÜY[™H\Ù\ˆÝ^\ÈÛˆHÛXØÛÝ[8 %Ú]ˆËÈHXZÙ\ˆ]\È[™XYH™Y[ˆÚ]ÝÛˆ[™›ÝÈ™Y\Ù\È]™\žH™]ÂˆËÈ\ÚËˆ™\XÙH]^XÝH\ÈH›Û‹Y˜][]™[ÝÈÙ\ËÛÈBˆËÈXØÛÝ[H\Ù\ˆ\ÈÝ[Ûˆ™[XZ[œÈ\ØX›H[™H™]šYYÙÛÝ]ˆËÈÝ\Èœ›ÛHHÛX[ˆ[œÝ[˜ÙK‚ˆËÂˆËÈÛ›HÚ[ˆ›Ý[™È\ÈÝ[]XÚYÈ]ˆÝ\š]›ÜœÈÙˆH
+œÝÙY\
+‚ˆËÈ˜Z[\™H\™H]XÚY[›™\œÎˆZ\ˆÝÛ™\œÚ\]™\È[ˆ\˜X›Hš[\ËˆËÈZ\ˆY[™H[[YSÝÛ™\’YÝ[\Y[ÈZ\ˆÝ]\È8 %›Û™BˆËÈÙˆ]Ûˆ\ÈØš™XÝ[™H™]šYYÙÛÝ]ÝÙY\ÈHÚÛHYÙ[ˆËÈÛYHYØZ[‹ˆHÙ\ÜÚ[ÛˆÚÜÙH
+™]XÚ
+ˆ˜Z[Y\ÈHÜÜÚ]NˆBˆËÈXZÙ\ˆ\ÈÛ[™È]È[™HÛˆ\œÜÙHÛÈH™^Ú]ÝÛŠ
+XØ[‚ˆËÈ™]žH][™\ØØ\™[™ÈH[œÝ[˜ÙHÛÝ[Üœ[ˆH]™HH›ØÙ\ÜÂˆËÈÝ[Ü[™[™È\ÈXØÛÝ[	ÜÈÜ™Y[X[ËˆÝ^Z[™ÈÚ\ÛÛ™Y\ÈBˆËÈ\ÜÙ\ˆ\›H\™K[™HÙÈX›Ý™H\ÈÚ]Ø^\ÈÛË‚ˆYˆ
+Ú]ÝÛ”˜[ˆ	‰ˆ™]Z[™YTÙ\ÜÚ[ÛœÈOOH
+H™\Ù]XZÙ\Š
+NÂˆX\šÐXØÛÝ[›Ý[™\žPX›ÜYZYX\™ÝÛŠ™X\ÛÛŠNÂˆ›ÝÈ\œŽÂˆBˆ]]›Ý[™\žSÙË™\œ›ÜŠXZÙ\ˆÚ]ÝÛˆÛˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜\œŠNÂˆ™\Ù]XZÙ\Š
+NÂˆBˆËÈ]šXÙK[[šÈ9cey£ y§"z !y.ìº(àN¹oázhnùg*\ÜÜÙHÛY[
+Š¹.bùbcJŠºaâ¹¥/¹£ y§"y§`ú(cˆËÈ
+\ÜÜÙH9d#9«iHÛX\Ý\œ™[ÛY[9.bùd#ˆÝÜ™H9.#ycëùå*9cêº ïyëbHM\ÊÈ9oàú-ìÂˆËÈ:/áù§'Ë9d#9§.¹nn9kf9k§¹/¢ù£©yë¨ycæ9¡hŠxà ¹a¡z`ê9n)ˆK\È:-¡y¥í‹9.#y/&¹chy/cùænùaî¸à ‚ˆžHÂˆ]ØZ]™[X\ÙQ]šXÙS[šÓÝÛ™\œÚ\™Y›Ü™SÙÛÝ]
+
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆØ›ÛÝÝ˜\Y[XÝ›Û—H™[X\ÙH]šXÙK[[šÈÝÛ™\œÚ\Ûˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜ˆ\œ‹ˆ
+NÂˆBˆ]ØZ]Y™XÞXÛQÛY[X[˜YÙ\‹™\ÜÜÙJ™X\ÛÛŠNÂˆHš[˜[HÂˆ™[X\ÙQ[™YÝ\™\ÜÚ[ÛŠ
+NÂˆBˆHš[˜[HÂˆËÈ›ÝÝ]ÛÛY\È™[X\ÙH]ˆH[™Ý™\ˆÛÛ\]Y
+H[˜ÛÛZ[™ÈÝÛ™\‚ˆËÈ]\Ý™HX›HÈ][˜Ú
+KÜˆ]Ø\ÈX›ÜY
+\ÈÝÛ™\ˆÝ^\È[™]\ÝˆËÈ™HX›HÈ][˜Ú
+KˆZ]\ˆØ^HHÚ[™ÝÈ\È™[˜ÙHÛÝ™\œÈ\ÈÝ™\‹ˆËÈ[™]™\žH^]œ›ÛHH›ÙHX›Ý™H8 %[˜ÛY[™ÈHX›Ü8 %[™È\™K‚ˆÛÛœÝ™[X\ÙQ™[˜ÙHH™[X\ÙP›Ý[™\žS][˜Ú™[˜ÙNÂˆ™[X\ÙP›Ý[™\žS][˜Ú™[˜ÙHH[Âˆ]ØZ]™[X\ÙQ™[˜ÙOËŠ
+K˜Ø]Ú
+
+
+HOˆ[™Yš[™Y
+NÂˆBˆËÈ]šXÙK[[šÈ9cey£ y§"z !y.ìº(àN¹oázhnùg*\ÜÜÙHÛY[
+Š¹.bùbcJŠºaâ¹¥/¹£ y§"y§`ú(cˆËÈ
+\ÜÜÙH9d#9«iHÛX\Ý\œ™[ÛY[9.bùd#ˆÝÜ™H9.#ycëùå*9cêº ïyëbHM\ÊÈ9oàú-ìÂˆËÈ:/áù§'Ë9d#9§.¹nn9kf9k§¹/¢ù£©yë¨ycæ9¡hŠxà ¹a¡z`ê9n)ˆK\È:-¡y¥í‹9.#y/&¹chy/cùænùaî¸à ‚ˆžHÂˆ]ØZ]™[X\ÙQ]šXÙS[šÓÝÛ™\œÚ\™Y›Ü™SÙÛÝ]
+
+NÂˆHØ]Ú
+\œŠHÂˆ]]›Ý[™\žSÙË™\œ›ÜŠˆØ›ÛÝÝ˜\Y[XÝ›Û—H™[X\ÙH]šXÙK[[šÈÝÛ™\œÚ\Ûˆ	Ü™X\ÛÛŸH˜Z[Y
+›Û‹Y˜][
+N˜ˆ\œ‹ˆ
+NÂˆBˆžHÂˆ]ØZ]Y™XÞXÛQÛY[X[˜YÙ\‹™\ÜÜÙJ™X\ÛÛŠNÂˆHš[˜[HÂˆžHÂˆØØ[ÛÜÙQŠ
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ›ØÚÚ[™Ñ˜Z[\™\Ëœ\Ú
+\œ›ÜŠNÂˆ]]›Ý[™\žSÙË™\œ›ÜŠÛÜÙHØØ[ˆÛˆ	Ü™X\ÛÛŸH˜Z[Y\œ›ÜŠNÂˆBˆYÙ[\Û[™Ù\šXÙOËœ™\Ù][[YTÝ]J
+NÂˆB‚ˆYˆ
+›ØÚÚ[™Ñ˜Z[\™\Ë›[™Ýˆ
+HÂˆ›ÝÈ™]ÈYÙÜ™YØ]Q\œ›ÜŠˆ›ØÚÚ[™Ñ˜Z[\™\ËˆXØÛÝ[›Ý[™\žHX\™ÝÛˆÛˆ	Ü™X\ÛÛŸHØ\È[˜ÛÛ\]Xˆ
+NÂˆBˆËÈ™XXÚYÛ›HÚ[ˆH[™Ý™\ˆ˜[ˆ[HØ^H›ÝYÚÚXÚ\È^XÝBˆËÈÚ[ˆH™]š[Ý\ÈX›Ü	ÜÈ›ØÚÚ[™ÈÝ]HÝÜÈ™Z[™ÈYK‚ˆÛX\XØÛÝ[›Ý[™\žPX›ÜX\šÊ
+NÂŸB‚˜]]X[˜YÙ\‹œÙ]XØÛÝ[ÝÚ]ÚX\™ÝÛŠ\Þ[˜È
+
+HOˆÂˆ]ØZ]X\™ÝÛ]]XØÛÝ[›Ý[™\žJ	Ü[[YK\™\XÙ[Y[XXØÛÝ[\ÝÚ]Ú	ÊNÂŸJNÂ˜]]X[˜YÙ\‹œÙ]]]Ù\ÜÚ[Û•X\™ÝÛŠX\™ÝÛ]]XØÛÝ[›Ý[™\žJNÂ˜]]X[˜YÙ\‹œÙ]›Ú™XÝ[Û”™\Z\•X\™ÝÛŠX\™ÝÛ‘ÚÜÝ›Ú™XÝ[Û›Ý[™\žJNÂ‚‹ËÈH][˜Ú™[˜ÙHYžHHÜÝÙH\Ý™\XÙY
+ÜˆžHÛ™H]Ü˜\ÚY‹ËÈZY\™[][˜Ú
+HÛÝ[Ý\Ú\ÙH™Y\ÙH\È[œÝ[˜ÙIÜÈÝX˜YÙ[][˜Ú\È›Üˆ\Â‹ËÈÛ™È\ÈHš[HÚ]È\™KˆÛ›H™[˜Ù\ÈÚÜÙHÝÛ™\ˆ\ÈÛÛ™H\™H›ÜYÛÈB‹ËÈÛÛ˜Ý\œ™[[œÝ[˜ÙHÙ[Z[™[HZY\™[][˜ÚÙY\È]ÈÝÛ‹‚›ÚYÛX\”Ý[TTÝX˜YÙ[][˜Ú™[˜ÙJ]š›Ú[Š\™Ù]]
+	Ý\Ù\‘]IÊK	ÜKXYÙ[ZÛYIÊJK˜Ø]Ú
+ˆ
+\œŽˆ[šÛ›ÝÛŠHOˆÂˆTÝX˜YÙ[ÙËØ\›Š	ÜÝ[HÝX˜YÙ[][˜Ú™[˜ÙHÛX[\˜Z[Y
+›Û‹Y˜][
+N‰Ë\œŠNÂˆKŠNÂ‚žHÂˆ™X\Û]YSÜœ[œÔÞ[˜Ê
+NÂŸHØ]Ú
+\œŠHÂˆËÈY™[œÚ]™Nˆ™X\Û]YSÜœ[œÔÞ[˜È[™XYHØ]Ú\È]ÈÝÛˆØØ[‹ÚÚ[\œ›ÜœÂˆËÈ[™ÙÜÈÈXYËˆ\ÈÛ›Hš\™\ÈÛˆ[H[™^XÝY›ÝÜÈ
+K™Ëˆ[Ù[BˆËÈØY˜Z[\™JH[™]\Ý™]™\ˆX›Ü›ÛÝÝ˜\‚ˆÜ™X]SÙÙÙ\Š	ØÛ]YK[Üœ[‹\™X\\‰ÊKØ\›Š	Ú[š]X[™X\™]ÉËÈ\œ›ÜŽˆÝš[™Ê\œŠHJNÂŸB‚‹ËÈ8¥ 8¥ YÙ[:/æùê"ù/&9ab9î©úfcy¨hÈØ]Ú\ŠYÙ[:-a9®¤9ch9å*9¬®ùä!Šx¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ:+¯¹ïkŠ›ØÙ\ÜÔš[Üš]Jy..ˆ›Ü›X[9.%9¥è9«(9 h¹i#z/æùê"ù¥í‹9«ãÈXÚÈ:fí¹¢$9§+
+9.#y¢jú/æùê"ú(j
+NÂ‹ËÈ[\˜[9mìˆ[œ™Y‹:/æùê"ú` 9aî¹.#z(ªùk ù¢å¹/cøà ¹¢`9§"yi,z-)H™\ÝYY™›Ü9.#yolydãyd+ùbª8à ‚žHÂˆÝ\YÙ[›ØÙ\ÜÔš[Üš]UØ]Ú\Š
+NÂŸHØ]Ú
+\œŠHÂˆÜ™X]SÙÙÙ\Š	ØYÙ[\›ØÙ\ÜË\š[Üš]IÊKØ\›Š	ÝØ]Ú\ˆÝ\™]ÉËÈ\œ›ÜŽˆÝš[™Ê\œŠHJNÂŸB‚‹ËÈ8¥ 8¥ 9d+ùbª:+â¹¥«H
+\ÜÝYHÍÍN
+H8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9."¹«(yo ¹n.:` 9aî¹l.9¨à
+[ˆX\šÙ\ŠH
+ÈÜ˜\ÚY9§+9g,Z[šY[\
+ÈÜ˜\Ú[\9¢jù£ãøà ‚‹ËÈ9oázhnùg*\™XYH9bcH
+Ü˜\Ú™\Ü\‹œÝ\9î©¹§gÊxà ]\Ù\‘]H9k¦¹g¢ùd#ˆ
+[™^È9æ¡‹ËÈ]‘›YÜÈÝ™\œšYH9mì¹å'ù¥b
+H:, ùå*8 %8 %9«i9i!:hm¹l`¹®èz-¬ù.): !xà ¹a¡z`ê9aj9ag9n¥K9¬.9.#zf.ù¥«yd+ùbª8à ‚š[š]Ý\\XYÛ›ÜÝXÜÊ
+NÂ‚‹ËÈ8¥ 8¥ ]‹[Û›NˆÚ›ÛYH]•ÛÛÈ›ÝØÛÛ™[[ÝHXYÙÚ[™ÈÜ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9.áH]ˆ9ª(yo#ùo 9¥/¸à ¹o 9.¡¹.bùd#ˆXZ[ˆ:/æùê"ù/&¹g*LËŒŒŒNŽLŒŒˆ9."¹£ä9/¦ÈÚœÛÛ‹Û\Ý‹ËÈ9b%ùaî¹¢`9§"H™[™\™\‹Ý][]H9æ¡ÙX”ÛØÚÙ]XYÙÙ\•\›9å*Ñ9¢¤ÈX\Û˜\ÚÝ‹ËÈ
+X\›Ùš[\‹ZÙRX\Û˜\ÚÝ
+H9.#ya£y/§z-e¹.®¹méyo ]•ÛÛøà ‚‹ËÂ‹ËÈ:acyieú!&¹§+ˆ\ËÙ\ÚÝÜÜØÜš\ËÝZÙKZX\\Û˜\ÚÝ›ZœÂ‹ËÈ›ÙH\ËÙ\ÚÝÜÜØÜš\ËÝZÙKZX\\Û˜\ÚÝ›ZœÈK[Ý]‹Ø\ËÙ\ÚÝÜÛÙÜËÂ‹ËÂ‹ËÈXÚØYÙY9."ùîçy.#yo 8 %9.îù/eyn)ˆLŒŒˆ9êëùcèùæ¡Ú›ÛZ][H:/æùê"ú`ïz ïz(ªù§+9§.¹am¹.å¹ê"ùn£Â‹ËÈ9¬ê9aiH”Ë9¦+ú/ç9ê"ù.èùè y¢iú(c9cèùkd8à ™]ˆ9§.¹fj:!ê¹á-¹.#yg*]XÚÈÝ\™˜XÙH9a¡xà ‚‹ËÂ‹ËÈ9êëùcèùcëùå*ÐÑÔÔ•:)¡¹a¦J9.áy¥l9keùå'ù¥b
+N¹nmº(c9i&¹o 9¬¦yë¬y¥íˆLŒŒˆ9cê¹§"yab:-mùæ¡‹ËÈ9k§¹/¢ú ïyîäy."‹9d#º-mùk§¹/¢ú) y/çy/cÈÑ:, ú+åzgh¹l,y£h¹.*¹êëùcèøà ‚‚šYˆ
+X\š\ÔXÚØYÙY
+HÂˆÛÛœÝÙÜÝ™\œšYHH›ØÙ\ÜË™[‹–ÐÑÔÔ•ÂˆÛÛœÝÙÜHÙÜÝ™\œšYH	‰ˆ×—Ì‹_IË\Ý
+ÙÜÝ™\œšYJHÈÙÜÝ™\œšYHˆ	ÎLŒŒ‰ÎÂˆ\˜ÛÛ[X[™[™K˜\[™ÝÚ]Ú
+	Ü™[[ÝKYXYÙÚ[™Ë\Ü	ËÙÜ
+NÂŸB‚‹ËÈ8¥ 8¥ ÙXšY]È\™[™\ˆ
+”Ðˆ\ÙH
+H8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9oázhnùg*\™XYH9.bùbcH[œÝ[‘[XÝ›Ûˆ9æ¡ÙX‹XÛÛ[ËXÜ™X]Y\Ý[™\ˆ9g*‹ËÈ™XYH9bcy¬ê9a£9.gù§"y¥b9a¡z`ê9ï$ùa¬¹b,š\™H9¥í¹¢cy¢¥z`$‹9èk¹/çy..ùê¥ÈÈ9.îù/eHÙXÛÛ[Â‹ËÈ:i¥¹«(H]XÚÙXšY]È:`ïz-l\™[™\¸à º+éº)àHÙXšY]Ë\ÙXÝ\š]Køà ‚š[œÝ[ÙXšY]Ò\™[™\Š
+NÂ‚‹ËÈ9ænùoeHØ\ÚHÙXšY]È9æ¡]]ÜšYÚ[ˆ9æoyd#yceNš\™[™\ˆ:fa9b¨ùkï:"*ºeî9£k¹«i9¨(zj£‹ËÈ9£$y¢&:hmyg,9g`8à ¹ ì9 )ú)èù§¤
+]XÚ9¥í¹b.ùcå¹odùbcyêëùà®y®!yceJK9.)™X[H:`ïy¥-¸ %8 %‹ËÈ:`«¹ë¬ycäyè yfî¹k¦º-l9§¡9nî¹c.¹gçË9/a¹®!yceyg*]‹ú/ç9ê"ùfç¹hjùoh¹  y."ùg,9g`9cëú ïycæ9c%¸à ‚œÙ]ÙÚ[Ø\ÚSÜšYÚ[”™\ÛÛ™\Š
+
+HOˆÂˆÛÛœÝÜšYÚ[œÈH™]ÈÙ]Ýš[™ÏŠ
+NÂˆ›Üˆ
+ÛÛœÝ™X[HÙˆÉØÛ‰Ë	ÙÛØ˜[	×H\ÈÛÛœÝ
+HÂˆžHÂˆÜšYÚ[œË˜Y
+™]ÈT“
+Ù]ÛY[[™Ú[›Ü”™X[J™X[K	Ø]]\P˜\ÙU\›	ÊJK›ÜšYÚ[ŠNÂˆHØ]ÚÂˆËÈ:+éH™X[H9®!ycey.#ycëùå*
+9d+ùbª9¥êy§'Ëùo ¹n.
+y¥í¹.#yb¨9aiH8 %8 %˜Z[XÛÜÙY8à ‚ˆBˆBˆ™]\›ˆË‹‹›ÜšYÚ[œ×NÂŸJNÂ‚‹ËÈ8¥ 8¥ ”Ðˆœ›ÝÜÙ\ˆœšYÙH
+œ›ÝÜÙ\‹X˜XÚÙ[™\ÙHŠH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ™[™\™\ˆ8¡¤ˆXZ[ˆ9¨iK9¢¢ˆ”ÐˆÙXšY]Ï˜9¬ê9a£9b,XZ[ˆ9êëÈX”™YÚ\ÝžK]\™B‹ËÈ9­cú)â9fj:!ê¹bª9c%ˆ˜XÚÙ[™
+\ÙHÊÊy­¢:-.HÙXÛÛ[È9céy§á8à ‚‹ËÈ:hm¹l`¹¬ê9a£’TÈ[™\ˆ9¦+È\ÓXZ[‹š[™K9g*\™XYH9bcy¬ê9a£9.gù§"y¥bÜ[‹Ý[œ[‚‹ËÈ:`&¹çéyå*9æ¡ÜÝÙXÛÛ[È:`&º/áÈXZ[•Ú[™ÝÔ™Yˆ^žH9cå‹9..ùê¥ù§*¹l,yîê¹¥íºgfznæ:-ìú/áÂ‹ËÈ
+[ˆ9â­¹  yå,HXZ[ˆ9êëÈ™YÚ\ÝžH9/çy§`ùj K™[™\™\ˆ9êëù/&º`&º/áÈ™XÛÛ˜Ú[X][Ûˆ:-çù."Šxà ‚‹ËÈ8¥ 8¥ 9cìù/©ù¨#ùâë9êâùkd9ê¥ùcèÊ”ÐˆÚ[™ÝÊx¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9cìù/©ù¨#ùodùbcz/æùê"ùa¡yæ¡9b!¹é®ùâ­¹  H
+È9kd9ê¥ùcèùå'ùdoydj9§'ùâ­¹  y§.¸à ™]XÚY9.%9ê¥ùcèùo 9ç`9¥í‹‹ËÈ”ÐˆÜÝ
+[‹Ý[œ[ˆ:`&¹çéxà ]X‹[Ü\Ü]Ú9æ¡9æë¹¨!È™[™\™\Šy¦+ùkd9ê¥ùcèú #:gg¹..ùê¥Ë‹ËÈ9."ù¥®y."yi!”ÐˆœšYÙHÚ\š[™È9îçù. 9îãÈÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+H:)èù§¤8à ‚‹ËÈ\È9aj:`ê9¦+È^žH:eëyc!JXZ[•Ú[™ÝÔ™YˆÈ\Ô]Z][™È9g*9¥¡ù.í¹¦í:gh9d#¹hì9¦#Šú-bù`/‹ËÈ:, ùå*9¥í¹§.º/ç9¦f¹.£¹«i9i!9§¡:`(
+K9â­¹  y§.¹§+9/dú)àHšYÚ\ÚYX˜\‹]Ú[™ÝËØÛÛ›Û\‹øà ‚œ™\Ù]œØ•Ú[™ÝÔÙ][™ÜÑ›Ü”Ý\\
+
+NÂ˜ÛÛœÝœØ•Ú[™ÝÐÛÛ›Û\ˆH™]ÈœØ•Ú[™ÝÐÛÛ›Û\ŠÂˆÙ][™ÜÎˆÈ™XYˆ™XYœØ•Ú[™ÝÔÙ][™ÜËÜš]T]ÚˆÜš]TœØ•Ú[™ÝÔÙ][™ÜÔ]ÚKˆÜ™X]UÚ[™ÝÎˆ
+
+HOˆÂˆÛÛœÝÚ[™ÝÈHÜ™X]TšYÚÚYX˜\•Ú[™ÝÊ
+NÂˆÛÛœÝXZ[•\™Ù]BˆXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+H	‰ˆ[XZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+BˆÈXZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Âˆˆ[ÂˆYˆ
+XZ[•\™Ù]
+HÂˆ[š\š]SÔÔÚ[][]Ü”™[™\™\”Ù\ÜÚ[ÛXØÙ\ÜÊXZ[•\™Ù]Ú[™ÝËÙXÛÛ[ÊNÂˆËÈ\È™[™\™\ˆ\ÈÝ[Y[ˆ›Üˆ™]Ø\›KˆÙY\]ÈšY]Ù\ˆXÚÙ]ËˆËÈ]]\ÙHH[š\š]YXÝ]™H]]][ÛˆÜ˜[[[]\ÈÚÝÛ‹‚ˆÞ[˜ÒSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÑ›Ü”Ù\ÜÚ[ÛÚ[™ÙJÚ[™ÝËÙXÛÛ[Ë[
+NÂˆBˆ™]\›ˆÚ[™ÝÎÂˆKˆÙ]XZ[•Ú[™ÝÎˆ
+
+HOˆXZ[•Ú[™ÝÔ™Y‹ˆœ›ØYØ\ÝÝ]Nˆ
+Ý]JHOˆÂˆ›Üˆ
+ÛÛœÝÚ[ˆÙˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+JHÂˆYˆ
+Ú[‹š\Ñ\Ý›ÞYY
+
+JHÛÛ[YNÂˆžHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+PRÑT—ÔTÒ””Ð—ÕÒS‘Õ×ÔÕUWÐÒS‘ÑQÝ]JNÂˆHØ]ÚÂˆËÈÚ[™ÝÈÜ›ˆÝÛˆZYXœ›ØYØ\Ý8 %YÛ›Ü™BˆBˆBˆKˆÙ[™ÕÚ[™ÝÎˆ
+Ú[‹Ú[›™[^[ØY
+HOˆÂˆžHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+Ú[›™[^[ØY
+NÂˆHØ]ÚÂˆËÈÚ[™ÝÈÜ›ˆÝÛˆZY\Ù[™8 %YÛ›Ü™BˆBˆKˆÛ•Ú[™ÝÕÚ[ÚÝÎˆ
+Ú[™ÝÊHOˆÂˆÛÛœÝXZ[•\™Ù]BˆXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+H	‰ˆ[XZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+BˆÈXZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Âˆˆ[ÂˆÛÛœÝ[š\š]YHXZ[•\™Ù]ˆÈ[š\š]SÔÔÚ[][]Ü”™[™\™\”Ù\ÜÚ[ÛXØÙ\ÜÊXZ[•\™Ù]Ú[™ÝËÙXÛÛ[ÊBˆˆ˜[ÙNÂˆYˆ
+Z[š\š]Y
+HÂˆËÈ›È]]Üš]]]™HXZ[ˆÛ˜\ÚÝ\È]˜Z[X›Kˆ™]™\ˆX]™HHØXÚYˆËÈÚYX˜\‰ÜÈ™]š[Ý\ÈXÝ]™H]]][ÛˆÜ˜[\ØX›HÚ[ˆ]™XÛÛY\Èš\ÚX›K‚ˆÞ[˜ÒSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÑ›Ü”Ù\ÜÚ[ÛÚ[™ÙJÚ[™ÝËÙXÛÛ[Ë[
+NÂˆBˆKˆÛ•Ú[™ÝÒY[Žˆ
+Ú[™ÝÊHOˆÂˆÞ[˜ÒSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÑ›Ü”Ù\ÜÚ[ÛÚ[™ÙJÚ[™ÝËÙXÛÛ[Ë[
+NÂˆKˆÛÛ^Ú[›™[ˆPRÑT—ÔTÒ””Ð—ÕÒS‘Õ×ÐÓÓ•VÐÒS‘ÑQˆÛÛ[X[™Ú[›™[ˆPRÑT—ÔTÒ””Ð—ÕÒS‘Õ×ÐÓÓSPS‘ˆX’[™Ù™Ú[›™[ˆPRÑT—ÔTÒ””Ð—ÕÒS‘Õ×ÕP—ÒS‘Ñ‘‹ˆ\Ô]Z][™Îˆ
+
+HOˆ\Ô]Z][™ËˆØ[ÛÜÙUÚ[™ÝÎˆ
+
+HOˆZ\ÐXÝ]™TœØ“˜]]™TÜ\Ý\™˜XÙ\Ê
+Kˆ™\ÛÛ™RÜÝÛÛ^ˆ™\ÛÛ™TœØ’ÜÝÛÛ^œ›ÛTÙ\ÜÚ[Û‹ˆÙÎˆÜ™X]SÙÙÙ\Š	ÜšYÚ\ÚYX˜\‹]Ú[™ÝËXÛÛ›Û\‰ÊKŸJNÂ‚™[˜Ý[Ûˆ\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™JÚÜÝÈHÙ]ÚÜÝX[˜YÙ\Š
+K›\Ý
+
+JNˆ›ÛÛX[ˆÂˆ™]\›ˆÚÜÝËœÛÛYJˆ
+ÚÜÝ
+HO‚ˆÚÜÝ™[˜X›YOOHYH	‰‚ˆÚÜÝ›X[šY™\Ýš[ÜÔÚ[][]ÜˆOOHYH	‰‚ˆ\ÑÚÜÝ]˜Z[X›Q›ÜXÝ]™TÙ\ÜÚ[ÛŠÚÜÝ›X[šY™\ÝšY
+Kˆ
+NÂŸB‚™[˜Ý[Ûˆ™\ÛÛ™RSÔÔÚ[][]Ü”™[™\™\•Ú[™ÝÊˆ\™Ù]ˆ\˜[Y]\œÏ\[Ùˆœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ï–ÌKŠNˆœ›ÝÜÙ\•Ú[™ÝÈ[ÂˆÛÛœÝÝÛ™\ˆHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê\™Ù]
+NÂˆYˆ
+[ÝÛ™\ˆZ\Õ\ÝY\™[™\™\•Ú[™ÝÊÝÛ™\ŠJH™]\›ˆ[ÂˆÛÛœÝÚYX˜\•\™Ù]HœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]š\ÚX›TÚYX˜\•ÙXÛÛ[Ê
+NÂˆÛÛœÝ\ÔÚYX˜\ˆHÚYX˜\•\™Ù]OOH\™Ù]ÂˆYˆ
+Z\ÔÚYX˜\ˆ	‰ˆZ\ÓXZ[”Ú[Ú[™ÝÕ\›
+ÝÛ™\‹ÙXÛÛ[Ë™Ù]T“
+
+JJH™]\›ˆ[Âˆ™]\›ˆÝÛ™\ŽÂŸB‚˜ÛÛ™šYÝ\™RSÔÔÚ[][]Ü”™[™\™\•\™Ù]Ê
+™Y™\œ™Y\™Ù]
+HOˆÂˆYˆ
+Z\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™J
+JH™]\›ˆ[ÂˆÛÛœÝXZ[•\™Ù]BˆXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+H	‰ˆ[XZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+BˆÈXZ[•Ú[™ÝÔ™Y‹ÙXÛÛ[Âˆˆ[ÂˆÛÛœÝÚYX˜\•\™Ù]HœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]š\ÚX›TÚYX˜\•ÙXÛÛ[Ê
+NÂˆÛÛœÝ™[Û™ÜÕÓXZ[‘˜[Z[HBˆ\™Y™\œ™Y\™Ù]™Y™\œ™Y\™Ù]OOHXZ[•\™Ù]™Y™\œ™Y\™Ù]OOHÚYX˜\•\™Ù]ÂˆYˆ
+X™[Û™ÜÕÓXZ[‘˜[Z[JHÂˆYˆ
+\™Y™\œ™Y\™Ù]\™\ÛÛ™RSÔÔÚ[][]Ü”™[™\™\•Ú[™ÝÊ™Y™\œ™Y\™Ù]\ÈÙXÛÛ[ÊJHÂˆ™]\›ˆ[ÂˆBˆ™]\›ˆÂˆÜ˜[\™Ù]ÎˆÜ™Y™\œ™Y\™Ù]Kˆ›ØÝ\Õ\™Ù]ˆ™Y™\œ™Y\™Ù]ˆNÂˆBˆÛÛœÝÜ˜[\™Ù]ÈHÛXZ[•\™Ù]ÚYX˜\•\™Ù]K™š[\Šˆ
+\™Ù]
+Nˆ\™Ù]\È›Û“[X›O\[Ùˆ\™Ù]ˆOˆ›ÛÛX[Š\™Ù]
+Kˆ
+NÂˆÛÛœÝ›ØÝ\Õ\™Ù]HœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+HÏÈ™Y™\œ™Y\™Ù]ÏÈXZ[•\™Ù]Âˆ™]\›ˆ›ØÝ\Õ\™Ù]ÈÈÜ˜[\™Ù]Ë›ØÝ\Õ\™Ù]Hˆ[ÂŸJNÂ˜ÛÛ™šYÝ\™RSÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÐÛÛ™š\›X][ÛŠ\Þ[˜È
+\™Ù]Ù\ÜÚ[Û’Y
+HOˆÂˆYˆ
+Z\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™J
+JH™]\›ˆ˜[ÙNÂˆÛÛœÝÝÛ™\ˆH™\ÛÛ™RSÔÔÚ[][]Ü”™[™\™\•Ú[™ÝÊ\™Ù]\ÈÙXÛÛ[ÊNÂˆYˆ
+[ÝÛ™\ŠH™]\›ˆ˜[ÙNÂˆÛÛœÝ›ÝÈH]ØZ]Ù]Ù\ÜÚ[Û”›ÝÔÛ˜\ÚÝ
+Ù\ÜÚ[Û’Y
+NÂˆYˆ
+\›ÝÈ›ÝËœÝ]\ÈOOH	ØXÝ]™IÈ›ÝËœ™[[ÝRÜÝY
+H™]\›ˆ˜[ÙNÂ‚ˆÛÛœÝ\ÚÓX™[BˆØ[š]^™QÚÜÝ›ÝXÙU^
+›ÝË]HÏÈ	ÉÊBˆœ™\XÙJÖ×LŒKWLŒ‘WLŒ‹WLŒŽWKÙË	ÉÊBˆœ™\XÙJ×ÊËÙË	È	ÊBˆœÛXÙJLŒ
+H
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÕ[]Y\ÚÉÊNÂˆÛÛœÝ™\Ý[H]ØZ]X[ÙËœÚÝÓY\ÜØYÙP›Þ
+ÝÛ™\‹Âˆ\Nˆ	Ü]Y\Ý[Û‰Ëˆ]Nˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÕ]IÊKˆY\ÜØYÙNˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÓY\ÜØYÙIÊKœ™\XÙP[
+	ÞÞÝ\Úß_IË\ÚÓX™[
+Kˆ]Z[ˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÑ]Z[	ÊKˆ]ÛœÎˆÂˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÐ[ÝÉÊKˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÐØ[˜Ù[	ÊKˆKˆY˜][YˆKˆØ[˜Ù[YˆKˆ›Ó[šÎˆYKˆJNÂˆYˆ
+™\Ý[œ™\ÜÛœÙHOOHÝÛ™\‹š\Ñ\Ý›ÞYY
+
+H\™Ù]š\Ñ\Ý›ÞYY
+
+JH™]\›ˆ˜[ÙNÂˆÛÛœÝÝ\œ™[H]ØZ]Ù]Ù\ÜÚ[Û”›ÝÔÛ˜\ÚÝ
+Ù\ÜÚ[Û’Y
+NÂˆ™]\›ˆ›ÛÛX[ŠˆÝ\œ™[	‰ˆÝ\œ™[œÝ]\ÈOOH	ØXÝ]™IÈ	‰ˆXÝ\œ™[œ™[[ÝRÜÝY	‰ˆ\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™J
+Kˆ
+NÂŸJNÂ˜ÛÛ™šYÝ\™RSÔÔÚ[][]ÜYÙ[ÛÛ›ÛÛÛ™š\›X][ÛŠ\Þ[˜È
+\™Ù]Ù\ÜÚ[Û’Y[œÝ[˜ÙRY
+HOˆÂˆYˆ
+Z\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™J
+JH™]\›ˆ˜[ÙNÂˆÛÛœÝÝÛ™\ˆH™\ÛÛ™RSÔÔÚ[][]Ü”™[™\™\•Ú[™ÝÊ\™Ù]\ÈÙXÛÛ[ÊNÂˆYˆ
+[ÝÛ™\ŠH™]\›ˆ˜[ÙNÂˆÛÛœÝ›ÝÈH]ØZ]Ù]Ù\ÜÚ[Û”›ÝÔÛ˜\ÚÝ
+Ù\ÜÚ[Û’Y
+NÂˆYˆ
+\›ÝÈ›ÝËœÝ]\ÈOOH	ØXÝ]™IÈ›ÝËœ™[[ÝRÜÝY
+H™]\›ˆ˜[ÙNÂˆÛÛœÝÝ]\ÈH]ØZ]Ù]SÔÔÚ[][]Ü”Ù\ÜÚ[Û”Ý]\ÊÙ\ÜÚ[Û’Y
+NÂˆÛÛœÝ[œÝ[˜ÙHHÝ]\Ë›ÚÂˆÈÝ]\Ëš[œÝ[˜Ù\Ë™š[™
+
+Ø[™Y]JHOˆØ[™Y]Kš[œÝ[˜ÙRYOOH[œÝ[˜ÙRY
+Bˆˆ[™Yš[™YÂˆYˆ
+Z[œÝ[˜ÙJH™]\›ˆ˜[ÙNÂ‚ˆÛÛœÝ\ÚÓX™[BˆØ[š]^™QÚÜÝ›ÝXÙU^
+›ÝË]HÏÈ	ÉÊBˆœ™\XÙJÖ×LŒKWLŒ‘WLŒ‹WLŒŽWKÙË	ÉÊBˆœ™\XÙJ×ÊËÙË	È	ÊBˆœÛXÙJLŒ
+H
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜XØÙ\ÜÑX[ÙÕ[]Y\ÚÉÊNÂˆÛÛœÝÚ[][]Ü“X™[HØ[š]^™QÚÜÝ›ÝXÙU^
+[œÝ[˜ÙKœÚ[][]Ü“˜[YJBˆœ™\XÙJÖ×LŒKWLŒ‘WLŒ‹WLŒŽWKÙË	ÉÊBˆœ™\XÙJ×ÊËÙË	È	ÊBˆœÛXÙJLŒ
+NÂˆÛÛœÝ™\Ý[H]ØZ]X[ÙËœÚÝÓY\ÜØYÙP›Þ
+ÝÛ™\‹Âˆ\Nˆ	ÝØ\›š[™ÉËˆ]Nˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜YÙ[ÛÛ›ÛX[ÙÕ]IÊKˆY\ÜØYÙNˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜YÙ[ÛÛ›ÛX[ÙÓY\ÜØYÙIÊKœ™\XÙP[
+ˆ	ÞÞÜÚ[][]ÜŸ_IËˆÚ[][]Ü“X™[ˆ
+Kˆ]Z[ˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜YÙ[ÛÛ›ÛX[ÙÑ]Z[	ÊKœ™\XÙP[
+ˆ	ÞÞÝ\Úß_IËˆ\ÚÓX™[ˆ
+Kˆ]ÛœÎˆÂˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜YÙ[ÛÛ›ÛX[ÙÐ[ÝÉÊKˆ
+	ÜšYÚÚYX˜\‹š[ÜÔÚ[][]Ü‹˜YÙ[ÛÛ›ÛX[ÙÐØ[˜Ù[	ÊKˆKˆY˜][YˆKˆØ[˜Ù[YˆKˆ›Ó[šÎˆYKˆJNÂˆYˆ
+™\Ý[œ™\ÜÛœÙHOOHÝÛ™\‹š\Ñ\Ý›ÞYY
+
+H\™Ù]š\Ñ\Ý›ÞYY
+
+JH™]\›ˆ˜[ÙNÂˆÛÛœÝÝ\œ™[H]ØZ]Ù]Ù\ÜÚ[Û”›ÝÔÛ˜\ÚÝ
+Ù\ÜÚ[Û’Y
+NÂˆ™]\›ˆ›ÛÛX[ŠˆÝ\œ™[	‰ˆÝ\œ™[œÝ]\ÈOOH	ØXÝ]™IÈ	‰ˆXÝ\œ™[œ™[[ÝRÜÝY	‰ˆ\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™J
+Kˆ
+NÂŸJNÂœ™YÚ\Ý\”œØ•Ú[™ÝÒ\ÊÂˆÛÛ›Û\ŽˆœØ•Ú[™ÝÐÛÛ›Û\‹ˆÙ]XZ[•Ú[™ÝÎˆ
+
+HOˆXZ[•Ú[™ÝÔ™Y‹ŸJNÂ‚‹ËÈ8¥ 8¥ 9£ä¹.í¹`g:gh:gh¹§oùâë9êâùê¥ùcèÊÚÜÝ[™[Ú[™ÝÊx¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9«ãÈÚÜÝY9. 9¢aùê¥Î”[™[Ú›ÛYxà#9âë9êâùê¥ùcèøà#y£"zd«ˆ8¡¤ˆÙ]]XÚY
+YYJH9o 9ê¥Ë‹ËÈ9..ùê¥ùn ùl`9¨$zaã:+éH[™H9`g9«h¹®,¹§äÊ9¨$y.#ybª
+Nùalùê¥Ëùd"9nm¹clùfç¹`g:gh8à º(áKùcnùd+ù`g9noù¤«B‹ËÈ9îãÈÙ]ÚÜÝÐÚ[™ÙYØœÙ\™\ˆ9e ˆ™XÛÛ˜Ú[K9i,yc®ú-a9¨/9æ¡9ê¥ùcèùclù¥í¹¥-¹£¢xà ‚‹ËÈ\È9d#9¨-ùaj^žJ\Ô]Z][™È9hì9¦#¹g*9d#ŠK9â­¹  y§.º)àHÚÜÝ\[™[]Ú[™ÝËØÛÛ›Û\‹øà ‚œ™\Ù]ÚÜÝ[™[Ú[™ÝÔÙ][™ÜÑ›Ü”Ý\\
+
+NÂ˜ÛÛœÝÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\ˆH™]ÈÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\ŠÂˆÙ][™ÜÎˆÂˆ™XYˆ™XYÚÜÝ[™[Ú[™ÝÜÔÙ][™ÜËˆ]Ú[žNˆ]ÚÚÜÝ[™[Ú[™ÝÑ[žKˆ™[[Ý™Q[žNˆ™[[Ý™QÚÜÝ[™[Ú[™ÝÑ[žKˆKˆÜ™X]UÚ[™ÝÎˆ
+ÚÜÝY
+HOˆÂˆÛÛœÝÚÜÝHÙ]ÚÜÝX[˜YÙ\Š
+Bˆ›\Ý
+
+Bˆ™š[™
+
+ÊHOˆË›X[šY™\ÝšYOOHÚÜÝY
+NÂˆÛÛœÝ]HHÚÜÝË›X[šY™\Ýœ[™[Ë]HÏÈÚÜÝË›X[šY™\Ý›˜[YHÏÈÚÜÝYÂˆ™]\›ˆÜ™X]QÚÜÝ[™[Ú[™ÝÊÚÜÝY]JNÂˆKˆ\ÑÚÜÝ]XÚX›Nˆ
+ÚÜÝY
+HOˆÂˆÛÛœÝÚÜÝHÙ]ÚÜÝX[˜YÙ\Š
+Bˆ›\Ý
+
+Bˆ™š[™
+
+ÊHOˆË›X[šY™\ÝšYOOHÚÜÝY
+NÂˆ™]\›ˆ
+ˆÚÜÝOOH[™Yš[™Y	‰‚ˆÚÜÝ™[˜X›YOOH˜[ÙH	‰‚ˆÚÜÝ›X[šY™\Ýœ[™[OOH[™Yš[™Y	‰‚ˆÚÜÝ›X[šY™\Ýœ[™[œÜÚ][ÛˆOOH	ÝX‰È	‰‚ˆ\ÑÚÜÝ]˜Z[X›Q›ÜXÝ]™TÙ\ÜÚ[ÛŠÚÜÝY
+Bˆ
+NÂˆKˆœ›ØYØ\ÝÝ]Nˆ
+Ý]JHOˆÂˆ›Üˆ
+ÛÛœÝÚ[ˆÙˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+JHÂˆYˆ
+Ú[‹š\Ñ\Ý›ÞYY
+
+JHÛÛ[YNÂˆžHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+PRÑT—ÔTÒ‘ÒÔÕÔS‘SÕÒS‘Õ×ÔÕUWÐÒS‘ÑQÝ]JNÂˆHØ]ÚÂˆËÈÚ[™ÝÈÜ›ˆÝÛˆZYXœ›ØYØ\Ý8 %YÛ›Ü™BˆBˆBˆKˆÙ[™ÕÚ[™ÝÎˆ
+Ú[‹Ú[›™[^[ØY
+HOˆÂˆžHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+Ú[›™[^[ØY
+NÂˆHØ]ÚÂˆÊˆYÛ›Ü™H
+‹ÂˆBˆKˆ\Ô]Z][™Îˆ
+
+HOˆ\Ô]Z][™ËˆÙÎˆÜ™X]SÙÙÙ\Š	ÙÚÜÝ\[™[]Ú[™ÝËXÛÛ›Û\‰ÊKŸJNÂœ™YÚ\Ý\‘ÚÜÝ[™[Ú[™ÝÒ\ÊÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\ŠNÂ‚‹ËÈ8¥ 8¥ :-a9®¤9æäz)á¹fj:/¡ybªyê¥ùcèÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9ceyk§¹/¢ú/núaãú/¡ybªyê¥ùcèÎºhmº`ê:#ç9cexà#:-a9®¤9æäz)á¹fj8à#x¡¤ˆÜ[Š
+xà ¹.#zg :) H]XÚØ]XÚ9`cùioxà B‹ËÈ9.#zg :) HÙ\ÜÚ[Ûˆ9."¹."ù¥¡ú/k9cäxà ¹d#¹cì:h¡9àëyd#¹n.:jnùi#yå*;ï#9¦kº`&¹alùê¥ùcêºf¤:%ãøà ‚‹ËÈXXÓÔÈ9/oùå*9âë9êâúhm¹l`¹ê¥ùcèûï#9¢dùo 9¥í¹/çyåfyìîùîçùc§ùå'ÈÜXÙHÈ9aj9lcùdb9ã¬;ï#9.#ya£yå,HÛÛ›Û\‚‹ËÈ9..ùbª:eg9`ãÈÝÛ™\»ï&ÕÚ[™ÝÜÈÈ[^9/çy£ H\™[9alùìîøà ›ÝÛ™\ˆ9§ 9l#ùc%¹¢%¹alùb,9¢f9ææ9¥í¹.ãy. :-mù¥-º-møà ‚˜ÛÛœÝ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\ˆH™]È™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\ŠÂˆÜ™X]UÚ[™ÝÎˆ
+
+HOˆÂˆÛÛœÝÝÛ™\ˆHXZ[•Ú[™ÝÔ™YŽÂˆ™]\›ˆÜ™X]T™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÊÝÛ™\ˆ	‰ˆ[ÝÛ™\‹š\Ñ\Ý›ÞYY
+
+HÈÝÛ™\ˆˆ[™Yš[™Y
+NÂˆKˆ\ÓÜ[”Ù[™\Žˆ
+Ù[™\ŠHO‚ˆ\Ô™\ÛÝ\˜ÙU\ØYÙSÜ[”Ù[™\ŠÂˆÙ[™\‹ˆXZ[•Ú[™ÝÎˆXZ[•Ú[™ÝÔ™Y‹ˆÙ[™\•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[ÊÙ[™\ŠKˆ\ÔÙXÛÛ™\žP\Ú[™ÝËˆJKˆÙ]ÝÛ™\•Ú[™ÝÎˆ
+Ù[™\ŠHOˆÂˆÛÛœÝÙ[™\•Ú[™ÝÈHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[ÊÙ[™\ŠNÂˆYˆ
+Ù[™\•Ú[™ÝÈ	‰ˆ\Ù[™\•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ˆÙ[™\•Ú[™ÝÎÂˆÛÛœÝÝÛ™\ˆHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+[ÝÛ™\ˆÝÛ™\‹š\Ñ\Ý›ÞYY
+
+JH™]\›ˆ[Âˆ™]\›ˆÝÛ™\ŽÂˆKŸJNÂœ™YÚ\Ý\”™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÒ\ÊÈÛÛ›Û\Žˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\ˆJNÂ˜ÛÛœÝ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜÈH™]È™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜÊ
+Ù[™\ŠHO‚ˆ\Ô™\ÛÝ\˜ÙU\ØYÙSÜ[”Ù[™\ŠÂˆÙ[™\‹ˆXZ[•Ú[™ÝÎˆXZ[•Ú[™ÝÔ™Y‹ˆÙ[™\•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[ÊÙ[™\ŠKˆ\ÔÙXÛÛ™\žP\Ú[™ÝËˆJKŠNÂœ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœ™YÚ\Ý\Š
+NÂ‚œÙ]ÚÜÝÐÚ[™ÙYØœÙ\™\Š
+ÚÜÝÊHOˆÂˆÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\‹œ™XÛÛ˜Ú[JÚÜÝÊNÂˆYˆ
+Z\ÒSÔÔÚ[][]Ü”YÚ[XÝ]™JÚÜÝÊJHÛX\’SÔÔÚ[][]Ü”™[™\™\XØÙ\ÜÊ
+NÂŸJNÂ‚˜ÛÛœÝœØœ›ÝÜÙ\”™YÚ\ÝžHHÙ]œØœ›ÝÜÙ\œšYÙJ
+NÂœ™YÚ\Ý\”œØ“˜]]™TÜ\Ý\™˜XÙR\ÊœØœ›ÝÜÙ\”™YÚ\ÝžJNÂœ™YÚ\Ý\”œØœ›ÝÜÙ\œšYÙR\ÊÂˆ™YÚ\ÝžNˆœØœ›ÝÜÙ\”™YÚ\ÝžKˆÙ]ÜÝÙXÛÛ[Îˆ
+
+HOˆœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+KˆÙ]˜]]™TÜ\ÝÛ™\•ÙXÛÛ[ÎˆÙ]œØ“˜]]™TÜ\ÝÛ™\•ÙXÛÛ[ËˆÙÙÙ\ŽˆÜ™X]SÙÙÙ\Š	ÜœØ‹Xœ›ÝÜÙ\‹XœšYÙKX›ÛÝÝ˜\	ÊKŸJNÂ‹ËÈÜ\Ü[™\ˆ9cãy§éNÙXšY]Ë\ÙXÝ\š]H9æ¡Ü\:-ëùå,y£k¹«i9¢¢ˆÚ[™ÝË›Ü[ˆ9æ¡9æë¹¨!Â‹ËÈXˆ9od¹lg¹b,9cäz-mù¥®HXˆ9æ¡Ù\ÜÚ[ÛŠ: #9.#y¦+ùå*9¢-ù«hùg*9ç"ùæ¡Ù\ÜÚ[ÛŠxà ‚œÙ]œØ”Ü\Ü[™\”™\ÛÛ™\Š
+ÙXÛÛ[ÒY
+HOˆÂˆÛÛœÝ™XÛÜ™HÙ]œØœ›ÝÜÙ\œšYÙJ
+K™š[™žUÙXÛÛ[ÒY
+ÙXÛÛ[ÒY
+NÂˆ™]\›ˆ™XÛÜ™ÈÈX’Yˆ™XÛÜ™X’YÙ\ÜÚ[Û’Yˆ™XÛÜ™œÙ\ÜÚ[Û’YHˆ[ÂŸJNÂ‹ËÈ™\Ü9b,:/¯¹.¢ù.íº+¨ºf!N¹od¹lg¹ëbyo¡y.ã¹fî¹k¦º/kº+è¹ê¥ùcèùcaùî©ù..¹.¢ù.íºjlybª8 %8 %™\Ü:$/yg,9æ¡‹ËÈ9ç«:eí9k£9¢$9cãy§éK:-¡y¥í¹cê¹agœ™\Ü9¬.9.#y§iH¹æ¡9§ yêëùg.¹¦køà ‚œÙ]œØ”Ü\Ü[™\”™\ÜÝXœØÜšX™\Š
+\Ý[™\ŠHO‚ˆÙ]œØœ›ÝÜÙ\œšYÙJ
+K›Û”™\Ü
+
+™XÛÜ™
+HOˆ\Ý[™\Š™XÛÜ™ÙXÛÛ[ÒY
+JKŠNÂ‹ËÈÜ\:-ëùå,yæë¹¨!ÈÜÝ9bª9  z)èù§¤¹o ¹«iyëbyo¡J9od¹lg¹cãy§éHÈY™\œ™YT“9£ez#­Êy§'úeí9å*9¢-Â‹ËÈ]XÚ9/©ú/®y¨#ù¢%¹b!ú)á¹fï¹d#‹9£ez#­ù¥í¹æ¡ÜÝÛÛ[È9mìº/áù¥íˆ8 %8 %9cäz` y¥í¹b.ù£"yodùbcyk¯ù..Â‹ËÈ9oh¹  z)èù§¤
+9.#ˆX‹[ÜœšYÙH9d#9. 9§iy®¤
+K9­¢9 kù¢cz ïz$/yb,9­.ùç`9æ¡:+¨ºf!z !xà ‚œÙ]œØ”Ü\ÜÝ™\ÛÛ™\Š
+
+HOˆœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+JNÂ‹ËÈX‹[Ü™\Ý[[™\ˆ›ÜˆHXZ[ˆ8¡¤ˆ™[™\™\ˆ™\]Y\ÝÜ™\ÜÛœÙHœšYÙH8 %‹ËÈœØ•ÙXšY]Ð˜XÚÙ[™
+\ÙHÊH\Ù\È\ÈÈš]™HÜ[˜È›ØÝ\ØÈÛÜÙX‹ËÈYØZ[œÝH™[™\™\‰ÜÈ”ÐˆÝÜ™K‚œ™YÚ\Ý\•X“Ü™\Ý[[™\ŠÂˆÙ]ÜÝÙXÛÛ[Îˆ
+
+HOˆœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+KˆÙÙÙ\ŽˆÜ™X]SÙÙÙ\Š	ÜœØ‹Xœ›ÝÜÙ\‹XœšYÙK\™[™\™\‹XœšYÙIÊKŸJNÂ‚‹ËÈ\ÙHNˆÚ\™HHÜÝXØÙ\ÜÛÜˆ[ÈH˜XÚÙ[™[Ù[HÛÈB‹ËÈœØ•ÙXšY]Ð˜XÚÙ[™	ÜÈ™[™\™\‹XœšYÙHØ[ˆ™XXÚHÜÝ™[™\™\ˆ›Ü‚‹ËÈX‹[Ü\Ü]Ú[ˆ™YÚ\Ý\ˆHÙ][™ÜËYš]™[ˆ˜XÚÙ[™ÙÙÛHTË‚‹ËÈHXØÙ\ÜÛÜˆ™\ÛÛ™\È›ÝYÚH”ÐˆÚ[™ÝÈÛÛ›Û\Žˆ]XÚY
+ÈÜ[ˆ8¡¤‚‹ËÈÚYX˜\ˆÚ[™ÝÈ™[™\™\‹Ý\Ú\ÙHHXZ[ˆÚ[™ÝÈ
+^žHÛÜÝ\™HÝ™\‚‹ËÈXZ[•Ú[™ÝÔ™Y˜\ÜÚYÛ™Y]\ˆ[ˆÜ™X]SXZ[•Ú[™ÝØ
+Kˆ[œÝ\™RÜÝ]Â‹ËÈ[ˆ]]ÛX][ÛˆX‹[ÜÜHÚYX˜\ˆÚ[™ÝÈš\œÝÚ[ˆH\Ù\ˆ™Y™\œÂ‹ËÈ]XÚY[ÙH]\ÈHÚ[™ÝÈÛÜÙY‚œÙ]XZ[•Ú[™ÝÐXØÙ\ÜÛÜ‘›Ü˜XÚÙ[™
+
+
+HOˆœØ•Ú[™ÝÐÛÛ›Û\‹™Ù]ÜÝÙXÛÛ[Ê
+JNÂœÙ][œÝ\™RÜÝ›Ü˜XÚÙ[™
+
+Ù\ÜÚ[Û’Y
+HOˆœØ•Ú[™ÝÐÛÛ›Û\‹™[œÝ\™SÜ[‘›Ü]]ÛX][ÛŠÈÙ\ÜÚ[Û’YJJNÂœÙ]\Ñ]XÚY›Ü˜XÚÙ[™
+
+
+HOˆ™XYœØ•Ú[™ÝÔÙ][™ÜÊ
+K™]XÚY
+NÂœÙ]œ›ÝÜÙ\”Ù\ÜÚ[Û•\ØY›ÛÝ™\ÛÛ™\Š\Þ[˜È
+Ù\ÜÚ[Û’Y
+HOˆÂˆžHÂˆÛÛœÝY]HH]ØZ]Ù]XZÙ\ÛÜ™J
+K™Ù]Ù\ÜÚ[Û“Y]JÙ\ÜÚ[Û’Y
+NÂˆYˆ
+[Y]OËÛÜšÑ\ˆY]Kœ™[[ÝRÜÝY
+H™]\›ˆ×NÂˆ™]\›ˆÛY]KÛÜšÑ\—NÂˆHØ]ÚÂˆ™]\›ˆ×NÂˆBŸJNÂœ™YÚ\Ý\œ›ÝÜÙ\˜XÚÙ[™\Ê
+NÂ‚‹ËÈ8¥ 8¥ 9n¥9å*9î©ùoêù£múe+ˆÝ™\œšYH9kf9`ªTÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ™[™\™\ˆ9d+ùbª9d#9«iy¢âHÝ™\œšY\øà z+¯¹ïkºhmya¦z-ëùo¡8à XÚ[™ÙY9noù¤«xà ºhm¹l`¹¬ê9a£‹ËÈ\ÓXZ[‹š[™H9g*\™XYH9bcy¬ê9a£9.gù§"y¥b8à ‚œ™YÚ\Ý\\ÚÜÝ]\Ê
+NÂœ™YÚ\Ý\\X\˜[˜ÙTÙ][™ÜÒ\Ê
+NÂœ™YÚ\Ý\“ÙÚ[’][R\Ê
+NÂ‚‹ËÈ8¥ 8¥ :-a9®¤9å*:aãúgh¹§oÈTÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ:+¨ºf!zjlybª:aáù¨-Ê:gh¹§où.#yo 9.#zaáù¨-ÊK[\˜[9mìˆ[œ™Yˆ9.#y¢åº` 9aîŽÝ\›Z[˜]H9cêº+©‹ËÈ9§+9.©ùdàHÜ]Ûˆ9æ¡YÙ[9¨.z/æùê"øà º)àHXZ[‹Ü›ØÙ\ÜË[[Ûš]Ü‹øà ‚œ™YÚ\Ý\”›ØÙ\ÜÓ[Ûš]Ü’\ÊÂˆ[ÝÜÔØ[\[™Îˆ
+Ù[™\ŠHOˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹˜[ÝÜÔ›ØÙ\ÜÓ[Ûš]Ü”Ø[\[™ÊÙ[™\ŠKŸJNÂ‚‹ËÈ8¥ 8¥ 9..ùåc:gh¹n ùl`9¨$ykf9`ªTø¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ™[™\™\ˆ:i¥¹n)ÈÙ[™Þ[˜È9¢âyn ùl`
+:)á9b&HÈ9¥è:-ìùcæ
+xà \Ù]Ü™\Ù]9a¦z-ëùo¡8à XÚ[™ÙY‹ËÈ9noù¤«xà ¹¬ê9a£9¥íºhn¹n)ˆ[œÝ\™T\œÚ\ÝY\Ù\‘]H:$/H^[Ý]ŒKšœÛÛˆ
+È9£gùgcú!ê¹¡"8à ‚œ™YÚ\Ý\“^[Ý]\Ê
+NÂ‚‹ËÈ8¥ 8¥ 9¡#ú+á¹.äùn¤ÈTø¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ™[™\™\ˆ:i¥¹n)ÈÙ[™Þ[˜È9¢âymìº(áy¡#ú+á¹®!yceJ9¡#ú+áºgh¹§où.#¹a¡yïkºgh¹§oùd#9n)ù¬ê9a£:)á9b&HÂ‹ËÈ9¥è:-ìùcæ
+xà Z[œÝ[Ý[š[œÝ[9a¦z-ëùo¡8à XÚ[™ÙY9noù¤«xà º)àHXZ[‹ØÚ[™KXœ˜Z[‹øà ‚‹ËÈ9fï¹âaú`&º`dùæ¡Ú]Ô:bm9§`ùoázhnùå,HXZ[ˆ:gfy  z(ázac{ï&ùé y«h¹g*:+íù¬`¹¥íˆ[\ÜXZÙ\‹ZÜÝ‹ËÈ9å'ù¢$9níº/çÈÚ[šûï"XZ[ˆ[™H9cãyd$H™\]Z\™H9/&ºaãyi#y¢iú(c9d+ùbª9bkù/g9å*;ï"xà ‚œÙ]ÛÙ^[XYÙP]]š[™[™ÊÂˆ\Ð]]ˆ
+›ÝšY\’Y
+HOˆÛÙ^XØÛÝ[Ý]J›ÝšY\’Y
+K˜]][XØ]YˆÙ]]]ˆÙ]Ú]ÜœšYÙP]]ˆÛ]]˜Z[\™Nˆ[˜[Y]PÚ]ÜœšYÙP]]ŸJNÂœ™YÚ\Ý\‘ÚÜÝ\Ê
+NÂœ™YÚ\Ý\”YÚ[“X\šÙ]\Ê
+NÂœ™YÚ\Ý\”YÚ[”X›\Ú\’\Ê
+NÂœÙ]\Ù\ÜÚ[ÛÛÛ[Z]›Ý[™\žRÛÚÊ
+
+HOˆÂˆÛX\[Ù\ÜÚ[Û][[ÛŠ
+NÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœ™\Ù]
+
+NÂˆÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\‹˜ÛÜÙQ›Ü“ÝÛ™\Ú[™ÙJ
+NÂˆÛX\[Ù\ÜÚ[Û”›ÝšY\œÊ
+NÂˆÛX\[Ù\ÜÚ[Û”[[YP^\Ê
+NÂˆÛX\[Ù\ÜÚ[Û”[[YPÛÛ›ÛÝ]\Ê
+NÂŸJNÂ˜]]X[˜YÙ\‹œÙ]ÝX›SÝÛ™\”ÜÝÛÛ[Z]\ÚÊ\Þ[˜È
+È™X\ÛÛ‹ØÛÜRÙ^K]SÝÛ™\’YJHOˆÂˆÛÛœÝZ[[“Ý]ÛÛYHH]ØZ][”ÝX›SÝÛ™\”ÜÝÛÛ[Z]\ÚÊ™X\ÛÛ‹ÈØÛÜRÙ^K]SÝÛ™\’YJNÂˆYˆ
+Z[[“Ý]ÛÛYHOOH	ÙY™\œ™Y	ÊH™]\›ˆZ[[“Ý]ÛÛYNÂ‚ˆ]™YYÔ™]žHHZ[[“Ý]ÛÛYHOOH	Ü™]žK\[™[™ÉÈZ[[“Ý]ÛÛYHOOH	Ù˜Z[Y	ÎÂˆËÈÚYÛ™Y[Ý]\ÈH™X[ÝX›HØÛÜH›ÜˆXØÛÝ[Yœ™YH[™Y›Ýš\Ú[Ûš[™Ë‚ˆËÈX\šÙ][™Ð]]\™HÝÛ™\‹\š]˜]H›ÛÝË]\È[™Ý^H™Z[™\ÈØ]K‚ˆYˆ
+]SÝÛ™\’YOOH[
+H™]\›ˆ™YYÔ™]žHÈ	Ù˜Z[Y	Èˆ	ØÛÛ\]Y	ÎÂˆ]Y™\œ™YH˜[ÙNÂˆÛÛœÝX\šÙ]Ý]ÛÛYHH]ØZ]Þ[˜ÑY˜][X\šÙ]YÚ[œÊ
+NÂˆYˆ
+X\šÙ]Ý]ÛÛYHOOH	Ù˜Z[Y	ÊH™YYÔ™]žHHYNÂˆYˆ
+X\šÙ]Ý]ÛÛYHOOH	ÙY™\œ™Y	ÊHY™\œ™YHYNÂ‚ˆžHÂˆÛÛœÝØ]]ÛÛ\]YH]ØZ]™XÛÛ˜Ú[QÚÜÝØ]]XØÛÝ[Ñ›ÜXÝ]™SÝÛ™\Š
+NÂˆYˆ
+[Ø]]ÛÛ\]Y
+HY™\œ™YHYNÂˆHØ]Ú
+\œ›ÜŠHÂˆÜ™X]SÙÙÙ\Š	ÙÚÜÝ[Ø]][ÝÛ™\‹\™XÛÛ˜Ú[IÊKØ\›Šˆ	ÓÐ]]XØÛÝ[™XÛÛ˜Ú[X][Ûˆ›ÜˆXÝ]™HÝÛ™\ˆ˜Z[Y	ËˆÈ\œ›ÜŽˆ\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆÝš[™Ê\œ›ÜŠHKˆ
+NÂˆ™YYÔ™]žHHYNÂˆB‚ˆ™]\›ˆ™YYÔ™]žHÈ	Ù˜Z[Y	ÈˆY™\œ™YÈ	ÙY™\œ™Y	Èˆ	ØÛÛ\]Y	ÎÂŸJNÂ‚‹ËÈ8¥ 8¥ Ý\ÝÛH›ÝØÛÛ™YÚ\Ý˜][Ûˆ
+[XYÙK[ØØ[XØXÚHLŠH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈUTÕ[ˆ™Y›Ü™H\Ú[”™XYJ
+K[™UTÕ™HHÒS‘ÓHØ[‚‹ËÈ™YÚ\Ý\”ØÚ[Y\Ð\Ôš]š[YÙY™\XÙ\ÈHÚÛHš]š[YÙY\ØÚ[YH\Ý]™\žB‹ËÈ[YH][œËÛÈ\‹[[Ù[HØ[ÈÚ[[HÚ\HXXÚÝ\ˆ8 %Û›HH\Ý‹ËÈØ[\‰ÜÈØÚ[YHÙY\È]Èš]š[YÙ\Ëˆ]^XÝYÈÚ\YÛ˜ÙH
+[[Ù[‹ËÈÜÝÝ\Ü™]ÚTHÚ[ˆÚ[™K\™[[ÝK[YYXH™YÚ\Ý\™YY\ˆ]8¡¤ˆÑ™]šY]Â‹ËÈÝXÚÈÛˆÜÝ\ŠKˆ]™\žH›ÝØÛÛ[Ù[H\™Y›Ü™HÛ›HVÔ•È]Èš]š[YÙB‹ËÈ[žNÈ\È\ÈHÛ™HXÙH]™YÚ\Ý\œÈ[K‚‹ËÈZ[XYÙNˆØØ[HØXÚYÚ][XYÙ\È
+[YÏŠB‹ËÈ]šY[ÎˆØØ[HØXÚYšY[ÜÎÈ˜[™ÙH9å,H[™\ˆ9¢bùbªŒˆ9b!ùâaÂ‹ËÈ
+Ý™X[N™˜[ÙH9¦+ùã¬9â­º+ëy.bK9.#yg*9«i9i!9¥.JB‹ËÈYš[Nˆ\˜š]˜\žHØØ[š[H™]šY]ÜÈ
+^[œÚ[ÛˆÚ][\Ý
+B‹ËÈX]Y[ÎˆØØ[]Y[Èš[\È
+]Y[Ï‹˜[™ÙH9d#šY[È9¢bùbª9i!9ä!ŠB‹ËÈ[[Ù[ˆZ]›ÈÑ[Ù[ØXÚH8 %[Ù[]šY]Ù\ˆ9å*™]Ú
+
+H9¢âyª(yg¢Ë‹ËÈÝ\Ü™]ÚTH9.(¹i,yclúgfznæ9æoylcË9bïùbª‹ËÈÚ[™K\™[[ÝK[YYXNˆ]šXÙK[[šÈ9aiy¥®yd$yj¤¹/dÊ:(ªù£©ùêëùkeú" ¹îãÈÔÔÈ9.+z/k
+B‹ËÈÚ[™KYÚÜÝˆ9¡#ú+á¹¬¦yë¬y¥¡ù.í¹/¦ùâaÊ[™\ˆ9£ ¹g*9«ãù¡#ú+á¹.$ùlgˆÙ\ÜÚ[Ûˆ9b!¹c.‹‹ËÈ9cêº+©:!ê¹mìyk¢z(áyæë¹oeNÙØÜËÙ]‹\[\ËÜYÚ[‹\ÙXÝ\š]KX[™X]]Üš[™Ë›Y
+B‹ËÈÚ[™K[YYXNˆ9j¤¹/dù .ù.äùkeú" ¹.äùcå¹.í¹ê¥ùcèÊ9a¡yk®ykîùg`›ØŽù¥¬9a¦yaiyj¤¹/dùæ¡‹ËÈ9îçù. 9ccú+«‹9c¡¹cìˆJˆ9ccú+«¹cêº+îùao9k®JBœ›ÝØÛÛœ™YÚ\Ý\”ØÚ[Y\Ð\Ôš]š[YÙY
+ÂˆÂˆØÚ[YNˆ	ØÚ[™KY\ÚÝÜXØ\\™IËˆš]š[YÙ\ÎˆÈÝ[™\™ˆYKÙXÝ\™NˆYKÝ\Ü™]ÚTNˆYHKˆKˆ[XYÙTØÚ[YTš]š[YÙKˆšY[ÔØÚ[YTš]š[YÙKˆØØ[š[TØÚ[YTš]š[YÙKˆ]Y[Ñš[TØÚ[YTš]š[YÙKˆ[Ù[ØÚ[YTš]š[YÙKˆ™[[ÝSYYXTØÚ[YTš]š[YÙKˆÚ[™QÚÜÝØÚ[YTš]š[YÙKˆÚ[™SYYXTØÚ[YTš]š[YÙK—JNÂ‚š[\ÜÝ\Yœ›ÛH	Ù[XÝ›Û‹\Ü]Z\œ™[\Ý\\	ÎÂ‚š[\ÜÈTPÐUSÓ—ÓQS•WÓP‘SË\H\XØ][Û“Y[SØØ[HHœ›ÛH	Ë‹Ø\XØ][Û“Y[SX™[ËšœÉÎÂš[\ÜÈ[œÝ[Ú[™PÛPÛÛ[X[™ÓWÐÓÓSPS‘ÓSQHHœ›ÛH	Ë‹Ú[œÝ[ÛPÛÛ[X[™šœÉÎÂ‚šYˆ
+Ý\Y
+HÂˆ\œ]Z]
+
+NÂŸB‚‹ËÈ
+™[[Ý™YˆÛ™K\ÚÝZ]›È™]\™[Y[ZYÜ˜][Û‹ˆZ]›ÈPÔØ\È™XXÝ]˜]Y‹ËÈ[ˆ\Èœ˜[˜Ú8 %ÙYHXÚØYÙ\ËÛ^šK[XÜËÜÜ˜ËÛZ]›ËËˆHÛX[\ZYÜ˜][Û‚‹ËÈØ\È[][™ÈHœ™\ÚK\Ø]™YZ]›×Ø\WÚÙ^K™[˜ÈÛˆ]™\žHÝ\\Ø][™Â‹ËÈH^šSXÜ›ÝšY\ˆÙ™ˆÛÈH™]™\ˆØ]ÈZ]›ÈÛÛËˆHZYÜ˜][Ûˆ\È›Â‹ËÈÛ™Ù\ˆØ[YÈYˆH\Ù\ˆÙ[Z[™[H™]™\ˆ\ÙYZ]›ËHXœÙ[š[B‹ËÈ™[XZ[œÈXœÙ[[™›Ý[™È\[œÈ8 %›ÈZYÜ˜][Ûˆ™YYYŠB‚‹ËÈ8¥ 8¥ ØZ]›Üˆ[‹Y›YÚ\]H8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈH\]HØÜš\Ü™X]\ÈH\][™ÈØÚÈš[HÚ[H›Ø›ØÛÜH™\XÙ\Â‹ËÈ\š[\ËˆYˆÙH][˜Ú\š[™È]Ú[™ÝËH^KÑÈX^H™H[‹B‹ËÈÜš][ˆ8¡¤ˆÜ˜\Úˆ›ØÚÈ\™H
+Þ[˜Ú›Û›Ý\ÛJH[[HØÚÈ\Ø\X\œË‚žÂˆÛÛœÝØÚÔ]HÙ]\]SØÚÔ]
+
+NÂˆËÈÚ[™ÝÜÈÈXXÈ9àëy¦í9ê¥ùcèùo¢9çëxà “[^Ù^XÈ:) yå*9¢-ú/¤ùaiyká¹è {ï#9¦í9¥¬:!&¹§+9/&‚ˆËÈ9oàú-ìùb-ù¥¬:/æy¢¢ºe ynm¹¢¢º!ê¹mìyæ¡Q9a¦z/æúe ya¡yk®{ï&ùcêº) HQ:/æ9­.ùç`9.%9oàú-ìù¥¬:l§;ï#ˆËÈ9l,y.#z ïy®!y£¢z/æy¢¢ºe x %8 %9d)¹b&y¥éú/æùê"ù/&¹g*9k¢z(áy.+z`%9d+ùbª;ï#:(ªÈ›ÛÝ9¦ïù£h¹¥¡ù.í¸à ‚ˆÛÛœÝX^ØZ]\ÈH›ØÙ\ÜËœ]›Ü›HOOH	Û[^	ÈÈÌ
+ˆŒ
+ˆLˆÌÌÂˆÛÛœÝÝ[PY\“\ÈH›ØÙ\ÜËœ]›Ü›HOOH	Û[^	ÈÈŒÌˆÌÌÂˆÛÛœÝÛ\ÈHLÂˆÛÛœÝÝ\H]K››ÝÊ
+NÂˆËÈ9d+ùbª:f-¹«­z/æ9¬¨y§"HR{ï#9oázhnùd#9«iyëbze xà ]ÛZXÜËØZ]9/&º+ªyaîˆÔ{ï#ˆËÈ:`oùacyc§ù§iyæ¡9ênº/k9g*[^:/¤ùká¹è y§'úeí9ch9®èy. 9¨.8à ‚ˆÛÛœÝØÚÕØZ]H™]È[Ì\œ˜^J™]ÈÚ\™Y\œ˜^PY™™\Š
+JNÂˆÛÛœÝ™XYØÚÔYH
+
+Nˆ[X™\ˆ[OˆÂˆžHÂˆÛÛœÝ˜]ÈHœËœ™XYš[TÞ[˜ÊØÚÔ]	Ý]Ž	ÊNÂˆÛÛœÝYH[X™\Š˜]Ëš[J
+KœÜ]
+×ÊËÊKœÜ
+
+JNÂˆ™]\›ˆ[X™\‹š\Ò[YÙ\ŠY
+H	‰ˆYˆÈYˆ[ÂˆHØ]ÚÂˆ™]\›ˆ[ÂˆBˆNÂˆÛÛœÝY[]™HH
+Yˆ[X™\ŠNˆ›ÛÛX[ˆOˆÂˆžHÂˆ›ØÙ\ÜËšÚ[
+Y
+NÂˆ™]\›ˆYNÂˆHØ]ÚÂˆ™]\›ˆ˜[ÙNÂˆBˆNÂˆËÈ9..ú/æùê"ùg*Ü]Ûˆ9bczh¡9nîºe J9£ y§"z !HH9..ú/æùê"ÈQ
+KÜ]Ûˆ9.¢ù.í¹d#º` 9aîŽÂˆËÈ9¦í9¥¬:!&¹§+9£©yë¨yd#¹a£y¢¢º!ê¹mìyæ¡Q9a¦z/æùc®øà º/æy.+zeí9§"y«êùéä¹î©ùæ¡9.©9£©yê¥ùcèÎ‚ˆËÈ:e zaã9æ¡9..ú/æùê"ÈQ9mì¹«nù/aˆ][YH9§ y¥¬9.#z ïyodù«núe y®!y£¢x %8 %9îæH\È9.©9£©BˆËÈ9k¯zfd9§'úeí9îéùîëyëbz!&¹§+9£©yë¨xà ‚ˆÛÛœÝ[™Ù™‘Ü˜XÙS\ÈHWÌÂˆËÈ9ki9a/ùoàú-ìùag9n¥N¹i ¹§§9£ y§"z !HQ9mì¹«nøà yoàú-ìùcm9£ yîëyb-ù¥¬:e J9¦í9¥¬:!&¹§+:(ªÂˆËÈ9ceyâëÚ[8à yoàú-ìùkd:/æùê"ú/æ9­.ùç`
+K9.#z ïy¥è:fd9ëbxà ¹oàú-ìù«ãù«(H\È9b-ù¥¬:/ç¹îëBˆËÈÈ9.*¹oàú-ìùdj9§'ú`ïyç"ùb,8à#Q9«nÈ
+È][YH9¥¬8à#yl,yb)9k¦¹..¹ki9a/Ë9®!ze yîéùîëyd+ùbª8à ‚ˆÛÛœÝÜœ[‘Ü˜XÙS\ÈHÝ[PY\“\È
+ˆˆ
+ÈWÌÂˆ]XY]œ™\ÚÚ[˜ÙS\Îˆ[X™\ˆ[H[ÂˆËÈ:+¬9oey¦+ùd)¹g*:e y."¹ëbz/áË9/¦ùëbze yk§¹/¢úa¤¹§iyd#ˆ^XÈ:!ê¹mìJ:)àyoª¹ã«ù."ù¥®Jxà ‚ˆ]ØZ]Y›Ü•\]SØÚÈH˜[ÙNÂˆÚ[H
+œË™^\ÝÔÞ[˜ÊØÚÔ]
+JHÂˆØZ]Y›Ü•\]SØÚÈHYNÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Û[^	ÊHÂˆÛÛœÝÛ\”YH™XYØÚÔY
+
+NÂˆËÈ9n)ˆQ9æ¡9¥¬:e N¹­.úe HH9oàú-ìù¥¬:l§9.%
+9£ y§"z !ykf9­.È9¢%ˆ9i!9.£¹.©9£©yk¯zfd
+xà ‚ˆYˆ
+Û\”YOOH[
+HÂˆÛÛœÝ][YS\ÈH
+
+
+HOˆÂˆžHÂˆ™]\›ˆœËœÝ]Þ[˜ÊØÚÔ]
+K›][YS\ÎÂˆHØ]ÚÂˆ™]\›ˆ[ÂˆBˆJJ
+NÂˆYˆ
+][YS\ÈOOH[
+Hœ™XZÎÂˆÛÛœÝYÙS\ÈH]K››ÝÊ
+HH][YS\ÎÂˆÛÛœÝœ™\ÚHYÙS\ÈHÝ[PY\“\ÎÂˆÛÛœÝ[’[™Ù™ˆHYÙS\ÈH[™Ù™‘Ü˜XÙS\ÎÂˆÛÛœÝÛ\[]™HHY[]™JÛ\”Y
+NÂˆYˆ
+œ™\Ú	‰ˆ
+Û\[]™H[’[™Ù™ŠJHÂˆ]ÛZXÜËØZ]
+ØÚÕØZ]Û\ÊNÂˆÛÛ[YNÂˆBˆËÈ9oàú-ìù¥¬:l§9/a¹£ y§"z !ymì¹«nÎº-¡z/áù.©9£©yk¯zfd9l,yo 9iâú+¨yki9a/ù¥íºeoøà ‚ˆYˆ
+œ™\Ú	‰ˆZÛ\[]™JHÂˆYˆ
+XY]œ™\ÚÚ[˜ÙS\ÈOOH[
+HXY]œ™\ÚÚ[˜ÙS\ÈH]K››ÝÊ
+NÂˆYˆ
+]K››ÝÊ
+HHXY]œ™\ÚÚ[˜ÙS\ÈÜœ[‘Ü˜XÙS\ÊHÂˆ]ÛZXÜËØZ]
+ØÚÕØZ]Û\ÊNÂˆÛÛ[YNÂˆBˆœ™XZÎÂˆBˆœ™XZÎÂˆBˆËÈ:  y¨/9o#úe J9¬¨y§"HQ
+Nº` 9fç¹c§ù§iyæ¡9 .ù¥íºeoù."ºfd8à ‚ˆYˆ
+]K››ÝÊ
+HHÝ\HX^ØZ]\ÊHœ™XZÎÂˆ]ÛZXÜËØZ]
+ØÚÕØZ]Û\ÊNÂˆÛÛ[YNÂˆBˆÛÛœÝÛ\”YH™XYØÚÔY
+
+NÂˆÛÛœÝÛ\[]™HHÛ\”YOOH[	‰ˆY[]™JÛ\”Y
+NÂˆÛÛœÝ[\ÙY\ÈH]K››ÝÊ
+HHÝ\ÂˆYˆ
+ˆÚÝ[ÙY\ØZ][™Ñ›Ü•Ú[™ÝÜÕ\]SØÚÊÂˆØÚÑ^\ÝÎˆYKˆ[\ÙY\ËˆX^ØZ]\ËˆÛ\”YˆÛ\[]™Kˆ[›[šÑ˜Z[Yˆ˜[ÙKˆÚ\š[™Õš[Û][ÛŽˆ˜[ÙKˆJBˆ
+HÂˆ]ÛZXÜËØZ]
+ØÚÕØZ]Û\ÊNÂˆÛÛ[YNÂˆBˆ][›[šÑ˜Z[YH˜[ÙNÂˆ]Ú\š[™Õš[Û][ÛˆH˜[ÙNÂˆžHÂˆœË[›[šÔÞ[˜ÊØÚÔ]
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ[›[šÑ˜Z[YHœË™^\ÝÔÞ[˜ÊØÚÔ]
+NÂˆÚ\š[™Õš[Û][ÛˆH[›[šÑ˜Z[Y	‰ˆ\ÕÚ[™ÝÜÕ\]SØÚÔÚ\š[™Õš[Û][ÛŠ\œ›ÜŠNÂˆBˆYˆ
+ˆÚÝ[ÙY\ØZ][™Ñ›Ü•Ú[™ÝÜÕ\]SØÚÊÂˆØÚÑ^\ÝÎˆœË™^\ÝÔÞ[˜ÊØÚÔ]
+Kˆ[\ÙY\ËˆX^ØZ]\ËˆÛ\”YˆÛ\[]™Kˆ[›[šÑ˜Z[YˆÚ\š[™Õš[Û][Û‹ˆJBˆ
+HÂˆ]ÛZXÜËØZ]
+ØÚÕØZ]Û\ÊNÂˆÛÛ[YNÂˆBˆœ™XZÎÂˆBˆËÈYˆÝ[ØÚÙYY\ˆHØZ]›ØÙYY[ž]Ø^H
+Ý[HØÚÊK‚ˆËÈ:e ymì¹.#ykf9g*
+9¦í9¥¬:!&¹§+9«hùn.9®!y£¢Jyd#9¨-ùë¥ùmì¹®!x %8 %9ëbze yk§¹/¢ùoázhnú-lˆËÈ8à#9¢âz-mù¥¬:/æùê"ú` 9aî¸à#z-ëùo¡9d)¹b&y¥éù.èùè yîéùîëz-äxà ‚ˆ]ØÚÐÛX\™YHYœË™^\ÝÔÞ[˜ÊØÚÔ]
+NÂˆžHÂˆœË[›[šÔÞ[˜ÊØÚÔ]
+NÂˆØÚÐÛX\™YHYNÂˆHØ]ÚÂˆØÚÐÛX\™YHYœË™^\ÝÔÞ[˜ÊØÚÔ]
+NÂˆB‚ˆËÈ[^º/æy.*¹k§¹/¢ùg*:e y."¹ëbz/áÊ:+í9¦#¹. 9«(yn¥9å*9a¡y¦í9¥¬9b&¹b&¹k£9¢$
+xà ¹k ùb¨:/oyæ¡ˆËÈ9¦+ùk¢z(áybcyæ¡9¥éù.èùè K9æí9£©yîéùîëy/&¹.#¹¦í9¥¬:!&¹§+9b&¹¢âz-mùæ¡9¥¬9k§¹/¢ù¢¨¹ceyk§¹/¢úe KˆËÈ9¢¨º-h¹æ¡:+çy¥éù.èùè y/&¹n)¹ç`9¥¬:-a9®¤9­íú-äxà ¹ëbze yæ¡9k§¹/¢úa¤¹§iyd#¹¢ây. 9.*¹¥¬:/æùê"ÂˆËÈ
+9b¨:/oyèàyææ9."¹æ¡9¥¬9.£:/æùb-Šynm¹êâùclú` 9aî‹9ceyk§¹/¢úe y.):/®z`ïymì¹¦+ù¥¬9.èùè xà ‚ˆËÈ9cê¹§"ze yèk¹k§¹b(9£¢y.¡¹¢cz-l:/æy§hz-ëÎ¹b(9.#y£¢J9æë¹oeycêº+îËù§`úfd:(ªù¥.Jz+í9¦#¹¦í9¥¬ˆËÈ:!&¹§+9¢%¹ã«ùh ù.ãz+©9..¹¦í9¥¬9g*:/æú(c9îéùîëy£"yc§ùëe¹åiy¥/º(c9/&º+ªz!ê¹mìzfmùaixà#9¢âz-mÂˆËÈ9¥¬:/æùê"È8¡¤ˆ9¥¬:/æùê"ùcâ:)àze yëbyo¡H8¡¤ˆ9a£y¢âz-møà#yæ¡:aãyd+ùoª¹ã«øà ‚ˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Û[^	È	‰ˆØZ]Y›Ü•\]SØÚÈ	‰ˆØÚÐÛX\™Y
+HÂˆžHÂˆÛÛœÝ^HH›ØÙ\ÜË™^XÔ]ÂˆËÈ[\ÜÈ\™H[X™\˜][H›ÝØ\œšYYXÜ›ÜÜÈ[ˆ\]H™\Ý\ˆH\Ù\‚ˆËÈØ[ˆÛXÚÈHÜšYÚ[˜[[šÈYØZ[ŽÈ™]™\ˆÛÜH]ÈÜ™Y[X[ÈÈHÚ[‚ˆ™YXÝÛÛœÝ[YYY\[šÒ[\™ÝŠ›ØÙ\ÜË˜\™ÝŠNÂˆÛÛœÝ\™ÜÈH›ØÙ\ÜË˜\™Ý‹œÛXÙJJNÂˆÜ]ÛŠ^K\™ÜËÈÝ[Îˆ	Ú[š\š]	Ë]XÚYˆYHJK[œ™YŠ
+NÂˆHØ]ÚÂˆÊˆYÛ›Ü™H
+‹ÂˆBˆ›ØÙ\ÜË™^]
+
+NÂˆBŸB‚‹ËÈ8¥ 8¥ š[KX]XÚY[]ÛXÞH
+‹Q’KMÈ9k¢yaj
+H8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈÚ\™YžH™XYYš[KY›Ü‹X]XÚY[YZËYš[KZXY\˜‹ËÈ^Yš[Nœ™XY\™]šY]Ø[™Ú[›Ü[‹\]ˆ›ØÚÜÈXØÙ\ÜÈÈÔÂ‹ËÈÞ\Ý[H\™XÝÜšY\È][ˆ]XÚY[\[[™H\È›ÈYÚ][X]H™X\ÛÛ‚‹ËÈÈÝXÚ8 %Y™[˜ÙH[ˆ\ÛˆÜÙˆHXœÛÛ]K\]ÚXÚË‚‹ËÂ‹ËÈH›ØÚÛ\Ý
+ÈÛÛZ[›Y[ÚXÚÈ›ÝÈ]™H[ˆš[T]ÛXÞKØÛÈB‹ËÈ]]Ë[ØYYYš[N‹ËØYYXH›ÝØÛÛØ[ˆ™]\ÙHHØ[YH[Ù[
+Ú]B‹ËÈÝšXÝ\‹Ü™Y[X[X]Ø\™HÝ\\œÙ]
+Kˆ™Z]š[Üˆ›ÜˆHØ[\œÈ\™H\Â‹ËÈ[˜Ú[™ÙYˆØ[YHÞ\Ý[H\œËØ[YH™\ÛÛ™KÛ›Ü›X[^™H
+ÈØ\ÙKZ[œÙ[œÚ]]™K[Û‹B‹ËÈÚ[ŒÌˆÛÛ\\š\ÛÛˆÚ]Ù\\˜]Ü‹X›Ý[™\žHØY™]K‚˜ÛÛœÝÖTÕSWÔUÐ“ÐÒÓTÕˆÝš[™Ö×HHZ[Þ\Ý[T]›ØÚÛ\Ý
+
+NÂ‚‹ËÈ\XØ][Û“Y[PÛÛ[X[™9.ãˆ‹‹ÜÚ\™YØ\XØ][Û“Y[PÛÛ[X[™È9ceyà®ykï9aixà ‚‹ËÈ9n¥9å*:#ç9ceyfæú+ëy¨!ùëo¹¢¯yb,‹Ø\XØ][Û“Y[SX™[Ë9/où§+ú+ëzeê9é z ïyæí9£©H[\Ü9¢jù£ãÊ:)àz+éy¥¡ù.í¹¬ê:aâŠxà ‚‚™[˜Ý[Ûˆ™\ÛÛ™P\XØ][Û“Y[SØØ[J˜]ÎˆÝš[™È[[™Yš[™Y
+Nˆ\XØ][Û“Y[SØØ[HÂˆ™]\›ˆ™\ÛÛ™TÞ\Ý[SØØ[J˜]ÊNÂŸB‚™[˜Ý[ÛˆÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+Nˆ\XØ][Û“Y[SØØ[HÂˆÛÛœÝ[™ÜÈH\™Ù]™Y™\œ™YÞ\Ý[S[™ÝXYÙ\Ê
+NÂˆ™]\›ˆ™\ÛÛ™T™Y™\œ™YÞ\Ý[SØØ[J[™ÜË›[™ÝˆÈ[™ÜÈˆØ\™Ù]ØØ[J
+WJNÂŸB‚™[˜Ý[Ûˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+ˆY[UÚ[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝËˆÛÛ[X[™ˆ\XØ][Û“Y[PÛÛ[X[™ˆÜ[ÛœÎˆÈXÝ]˜]UÚ[™ÝÏÎˆ›ÛÛX[ˆHHßKŠNˆ›ÚYÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+HÈXZ[•Ú[™ÝÔ™YˆˆY[UÚ[™ÝÎÂˆYˆ
+XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆÛÛœÝXÝ]˜]UÚ[™ÝÈHÜ[ÛœË˜XÝ]˜]UÚ[™ÝÈÏÈYNÂˆYˆ
+XÝ]˜]UÚ[™ÝÊHÂˆYˆ
+XZ[•Ú[™ÝËš\ÓZ[š[Z^™Y
+
+JHXZ[•Ú[™ÝËœ™\ÝÜ™J
+NÂˆXZ[•Ú[™ÝËœÚÝÊ
+NÂˆXZ[•Ú[™ÝË™›ØÝ\Ê
+NÂˆB‚ˆÛÛœÝÙ[™ÛÛ[X[™H
+
+HOˆÂˆYˆ
+[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHÂˆXZ[•Ú[™ÝËÙXÛÛ[ËœÙ[™
+	Ø\[Y[N˜ÛÛ[X[™	ËÛÛ[X[™
+NÂˆBˆNÂ‚ˆYˆ
+XZ[•Ú[™ÝËÙXÛÛ[Ëš\ÓØY[™Ê
+JHÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›Û˜ÙJ	ÙYYš[š\Ú[ØY	ËÙ[™ÛÛ[X[™
+NÂˆH[ÙHÂˆÙ[™ÛÛ[X[™
+
+NÂˆBŸB‚‹ÊŠ‚ˆ
+ˆ:#ç9ceHXØÙ[\˜]Üˆ9.ãˆ\\ÚÜÝ]ÈÝÜ™H9cå¹å'ù¥b9`/
+:næ:+©
+È9å*9¢-ÈÝ™\œšYJxà ‚ˆ
+ˆ9îá9d"9¥è9¬åz(j:/¯¹..ˆ[XÝ›ÛˆXØÙ[\˜]Üˆ9¥íº/å9fçˆ[™Yš[™Y8 %8 %:#ç9cezhny.#yn)‚ˆ
+ˆXØÙ[\˜]Üˆ
+9à®yaîù.ãycëùå*
+K9k§ºfay£"ze+¹å,H™[™\™\ˆÈ™Y›Ü™KZ[œ]Y]™[9c.zacz-ëùo¡9å'ù¥b8à ‚ˆ
+‹Â™[˜Ý[ÛˆY[PXØÙ[\˜]Ü‘›ÜŠYˆ\ÚÜÝ]Y
+NˆÝš[™È[™Yš[™YÂˆÛÛœÝš\œÝHÙ]\ÚÜÝ]ÝÜ™J
+K™Ù]Y™™XÝ]™PÛÛX›ÜÊY
+VÌNÂˆYˆ
+Yš\œÝ
+H™]\›ˆ[™Yš[™YÂˆ™]\›ˆÛÛX›ÕÑ[XÝ›ÛXØÙ[\˜]ÜŠš\œÝ›ØÙ\ÜËœ]›Ü›JHÏÈ[™Yš[™YÂŸB‚™[˜Ý[Ûˆ˜]]™SY[T›ÛSX™[
+›ÛNˆ	Ü™\Ù]›ÛÛIÈ	Þ›ÛÛR[‰È	Þ›ÛÛSÝ]	ÊNˆÝš[™ÈÂˆžHÂˆ™]\›ˆY[K˜Z[œ›ÛU[\]JÞÈ›ÛHWJKš][\ÖÌOË›X™[ÏÈ›ÛNÂˆHØ]ÚÂˆ™]\›ˆ›ÛNÂˆBŸB‚™[˜Ý[Ûˆ\œÚ\ÝY›ÛÛSY[R][Jˆ›ÛNˆ	Ü™\Ù]›ÛÛIÈ	Þ›ÛÛR[‰È	Þ›ÛÛSÝ]	Ëˆ[Nˆ[X™\ˆ[ˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ›ÛÛX[‹ŠNˆ[XÝ›Û‹“Y[R][PÛÛœÝXÝÜ“Ü[ÛœÈÂˆÛÛœÝXØÙ[\˜]ÜˆBˆ›ÛHOOH	Ü™\Ù]›ÛÛIÂˆÈ	ÐÛÛ[X[™ÜÛÛ›Û
+Ì	Âˆˆ›ÛHOOH	Þ›ÛÛR[‰ÂˆÈ	ÐÛÛ[X[™ÜÛÛ›Û
+Ô\ÉÂˆˆ	ÐÛÛ[X[™ÜÛÛ›Û
+ËIÎÂˆ™]\›ˆÂˆX™[ˆ˜]]™SY[T›ÛSX™[
+›ÛJKˆXØÙ[\˜]Ü‹ˆ™YÚ\Ý\XØÙ[\˜]Ü‹ˆÛXÚÎˆ
+
+HOˆÂˆ›ÚY\]T\œÚ\ÝYÚ[™ÝÖ›ÛÛJ[JK˜Ø]Ú
+
+\œ›ÜŽˆ[šÛ›ÝÛŠHOˆÂˆÜ™X]SÙÙÙ\Š	Ø\X\˜[˜ÙK\Ù][™ÜË[Y[IÊK™\œ›ÜŠ	Ü\œÚ\ÝYYÙH›ÛÛH\]H˜Z[Y	ËÂˆ›ÛKˆ\œ›ÜŽˆ\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆÝš[™Ê\œ›ÜŠKˆJNÂˆJNÂˆKˆNÂŸB‚™[˜Ý[Ûˆ\œÚ\ÝY›ÛÛSY[R][\Êˆ›ÛNˆ	Ü™\Ù]›ÛÛIÈ	Þ›ÛÛR[‰È	Þ›ÛÛSÝ]	Ëˆ[Nˆ[X™\ˆ[ˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ›ÛÛX[‹ŠNˆ[XÝ›Û‹“Y[R][PÛÛœÝXÝÜ“Ü[ÛœÖ×HÂˆÛÛœÝ][HH\œÚ\ÝY›ÛÛSY[R][J›ÛK[K™YÚ\Ý\XØÙ[\˜]ÜŠNÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰È›ÛHOOH	Þ›ÛÛR[‰ÊH™]\›ˆÚ][WNÂ‚ˆËÈXXÓÔÈ™X]È8£&H
+[œÚYY\]X[
+H[™8¡éø£&H
+\ÊH\ÈÙ\\˜]HXØÙ[\˜]Ü‚ˆËÈ]ËˆÙY\HÙXÛÛ™]™YÚ\Ý\™YÚ[HX]š[™ÈÛ™Hš\ÚX›HY[H][K‚ˆ™]\›ˆÂˆ][KˆÂˆ‹‹š][KˆYˆ	Ü\œÚ\ÝY\YÙK^›ÛÛKZ[‹][œÚYY	ËˆXØÙ[\˜]ÜŽˆ	ÐÛÛ[X[™ÜÛÛ›Û
+ÏIËˆš\ÚX›Nˆ˜[ÙKˆXØÙ[\˜]Ü•ÛÜšÜÕÚ[’Y[ŽˆYKˆKˆNÂŸB‚™[˜Ý[Ûˆ[œÝ[\XØ][Û“Y[JˆXZ[•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝËˆØØ[Nˆ\XØ][Û“Y[SØØ[HHÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+KŠNˆ›ÚYÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊHÂˆY[KœÙ]\XØ][Û“Y[J[
+NÂˆ™]\›ŽÂˆB‚ˆÛÛœÝX™[ÈHTPÐUSÓ—ÓQS•WÓP‘SÖÛØØ[WNÂˆËÈÙÙÛHÚYX˜\Žˆ9å*™YÚ\Ý\XØÙ[\˜]ÜŽˆ˜[ÙH8 %8 %:#ç9cey¦/¹é.ˆ8£&ˆ9¨!ùëo¹.%9cëùà®yaîËˆËÈ9/a¹.#yd$HÔÈ9¬ê9a£9àëze+¸à ¹ç'ù«hù£"ze+¹å,HXZ[“^[Ý]:aã9æ¡™[™\™\ˆÙ^YÝÛˆ9i!9ä!ˆ
+:`¨ù«­BˆËÈ9/&º-ìú/áúggˆ\\9æ¡ÛÛ[Y]X›K9/çyåfykã9¥¡ù§+9ï%º/¤yfj:!ê¹mìyæ¡›Û: ïyb¦Êxà ‚ˆÛÛœÝÙÙÛTÚYX˜\’][Nˆ[XÝ›Û‹“Y[R][PÛÛœÝXÝÜ“Ü[ÛœÈHÂˆX™[ˆX™[ËÙÙÛTÚYX˜\‹ˆXØÙ[\˜]ÜŽˆY[PXØÙ[\˜]Ü‘›ÜŠ	ÝÙÙÛK\ÚYX˜\‰ÊKˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ˜[ÙKˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÝÙÙÛK\ÚYX˜\‰ÊKˆNÂˆËÈ™[X\ÙH9c!ybe:fi™[ØYÈ›Ü˜ÙT™[ØYÈÙÙÛQ]•ÛÛÈ8 %:/æy."zhnznæ:+©XØÙ[\˜]Ü‚ˆËÈ
+ÛY
+ÔˆÈÚY
+ÐÛY
+ÔˆÈ[
+ÐÛY
+ÒJH9/&¹¢¢ˆ™[™\™\ˆ9¥m:hmyb-ù£¢K9.(¹£¢HÝ™X[Z[™È9.+yæ¡ˆËÈYÙ[\›¸à XÛÛ\ÜÙ\ˆ:#byê/ùëbya¡ykf9  xà ™]ˆ9ª(yo#ù."ùleyo :næ:+©šY]ÓY[H9æ¡:hnK9¢¢‚ˆËÈÙÙÛHÚYX˜\ˆ9£ä¹b,:hmº`ê
+›ÛNˆ	ÝšY]ÓY[IÈ9.#ya`z+®9g*:aã:ghº/ïyb¨:!ê¹k¦¹.bzhnJxà ‚ˆËÈ:+¯¹ïkºhmyoeyb-¹oêù£múe+¹§'úeí9.#yd$yìîùîçù¬ê9a£:#ç9ceHXØÙ[\˜]Üˆ
+9¨!ùëo¹.ãy¦/¹é.ŠK9d)¹b&yoeyb-‚ˆËÈ8£&ˆÈ8£&ˆÈ8£&9ëby/&º(ªú#ç9ceyab9d ù£¢yæí9£©z)é¹cäydoy.é9è-9gcùoeyb-¹  y.¤¹¥©xà ¹oeyb-¹îäù§gùå,BˆËÈÝXœØÜšX™P\ÚÜÝ]™XÛÜ™[™È9fçº, úaãynîº#ç9cey h¹i#y¬ê9a£8à ‚ˆÛÛœÝ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈHZ\Ð\ÚÜÝ]™XÛÜ™[™ÐXÝ]™J
+NÂˆÛÛœÝšY]ÓY[Nˆ[XÝ›Û‹“Y[R][PÛÛœÝXÝÜ“Ü[ÛœÈH\š\ÔXÚØYÙYˆÈÂˆX™[ˆX™[ËšY]ÓY[KˆÝX›Y[NˆÂˆÙÙÛTÚYX˜\’][KˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Ü™\Ù]›ÛÛIË[™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Þ›ÛÛR[‰ËQÑWÖ“ÓÓWÑPÕÔ—ÔÕT™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Þ›ÛÛSÝ]	ËTQÑWÖ“ÓÓWÑPÕÔ—ÔÕT™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÈ›ÛNˆ	ÝÙÙÛY[ØÜ™Y[‰Ë™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆKˆBˆˆÂˆX™[ˆX™[ËšY]ÓY[KˆÝX›Y[NˆÂˆÙÙÛTÚYX˜\’][KˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÈ›ÛNˆ	Ü™[ØY	Ë™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆÈ›ÛNˆ	Ù›Ü˜ÙT™[ØY	Ë™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆÈ›ÛNˆ	ÝÙÙÛQ]•ÛÛÉË™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Ü™\Ù]›ÛÛIË[™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Þ›ÛÛR[‰ËQÑWÖ“ÓÓWÑPÕÔ—ÔÕT™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆ‹‹œ\œÚ\ÝY›ÛÛSY[R][\Ê	Þ›ÛÛSÝ]	ËTQÑWÖ“ÓÓWÑPÕÔ—ÔÕT™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÊKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÈ›ÛNˆ	ÝÙÙÛY[ØÜ™Y[‰Ë™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆKˆNÂ‚ˆËÈ9n¥9å*9d#yæî9alù¥¡ù¨b9. 9o¢ú-l”S‘ÓSQJ9leyé.¹d#JK9.#yå*\™Ù]˜[YJ
+N¹d#º !z/å9fç‚ˆËÈXÚØYÙKšœÛÛˆ›ÙXÝ˜[YJ:/áù®(y§'ù.ãy¦+È[XZÙ\‹9§.¹fj:.ªù.ïy.#z+®:-çúf£ù¥.yd#KˆËÈ:)àHXZÙ\‹\Ú\™YØœ˜[™[™ËÈ:hm¹¬ê
+xà šYKÜ]Z]›ÛH9æ¡:næ:+©9¨!ùëo¹.gùd È\›˜[YKˆËÈ9¢`9.éy¦/¹o#ùîæHX™[8à ›XXÓÔÈ:#ç9cey¨#ùë+9. :hnyæ¡9ì¥ù/dù¨!úh¦9.#yd ú/æzaã9æ¡X™[
+9ìîùîçùcåº!ê‚ˆËÈ9cëù¢iú(c[™H9æ¡[™›Ëœ\ÝÑ[™S˜[YJK]ˆ9."ù d¹..ˆ‘[XÝ›Ûˆ‹9¥è9¬åz/ä:(c9¥í¹/ë¹¥.xà ‚ˆÛÛœÝ[\]Nˆ[XÝ›Û‹“Y[R][PÛÛœÝXÝÜ“Ü[ÛœÖ×HHÂˆÂˆX™[ˆ”S‘ÓSQKˆÝX›Y[NˆÂˆÂˆX™[ˆX™[Ë˜X›Ý]œ™\XÙJ	ÞÞØ\˜[Y__IË”S‘ÓSQJKˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÛÜ[‹XX›Ý]	ÊKˆKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÂˆX™[ˆX™[ËœÙ][™ÜËˆXØÙ[\˜]ÜŽˆY[PXØÙ[\˜]Ü‘›ÜŠ	ÛÜ[‹\Ù][™ÜÉÊKˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœËˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÛÜ[‹\Ù][™ÜÉÊKˆKˆÂˆX™[ˆX™[Ë˜ÚXÚÑ›Ü•\]\ËˆÛXÚÎˆ
+
+HO‚ˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ØÚXÚËY›Ü‹]\]\ÉËÂˆXÝ]˜]UÚ[™ÝÎˆ˜[ÙKˆJKˆKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÈ›ÛNˆ	ÜÙ\šXÙ\ÉÈKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆËÈYKÚYSÝ\œËÜ]Z]ÛZ[š[Z^™H9d#9¨-ùd ùoeyb-ˆØ]Nˆ9d)¹b&yoeyb-¹.+y£"BˆËÈ8£&Kø£&ø£&H9/&¹ab:)é¹cäyc§ùå'È›ÛK9å*9¢-ùç"ù.#yb,¹ìîùîçù/çyåfH¹¨(zj£9£ä9é.¹l,y¢¢‚ˆËÈ9n¥9å*:` 9aî‹úf¤:%ãù.¡¸à ŠÛÜÙH9mì¹¥.y..¹¬.9.#y¬ê9a£XØÙ[\˜]Ü‹9.#yg*9«i9b%ËˆËÈ:)ày."ù¥®HÚ[™ÝÈ:#ç9cey¬ê:aâ¸à ŠBˆÂˆ›ÛNˆ	ÚYIËˆX™[ˆX™[ËšYKœ™\XÙJ	ÞÞØ\˜[Y__IË”S‘ÓSQJKˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœËˆKˆÈ›ÛNˆ	ÚYSÝ\œÉË™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆÈ›ÛNˆ	Ý[šYIÈKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÂˆ›ÛNˆ	Ü]Z]	ËˆX™[ˆX™[Ëœ]Z]œ™\XÙJ	ÞÞØ\˜[Y__IË”S‘ÓSQJKˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœËˆKˆKˆKˆÂˆX™[ˆX™[Ë™š[SY[KˆÝX›Y[NˆÂˆÂˆX™[ˆX™[Ë›™]ÓXZÙ\‹ˆXØÙ[\˜]ÜŽˆY[PXØÙ[\˜]Ü‘›ÜŠ	Û™]Ë[XZÙ\‰ÊKˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœËˆÛXÚÎˆ
+Ú][KÝÚ[™ÝË]™[
+HO‚ˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+ˆXZ[•Ú[™ÝËˆ™\ÛÛ™S™]ÓXZÙ\“Y[PÛÛ[X[™
+]™[šYÙÙ\™YžPXØÙ[\˜]ÜŠKˆ
+KˆKˆKˆKˆÈ›ÛNˆ	ÙY]Y[IÈKˆšY]ÓY[KˆÂˆX™[ˆX™[ËÚ[™ÝÓY[Kˆ›ÛNˆ	ÝÚ[™ÝÉËˆÝX›Y[NˆÂˆÈ›ÛNˆ	ÛZ[š[Z^™IË™YÚ\Ý\XØÙ[\˜]ÜŽˆ™YÚ\Ý\“Y[PXØÙ[\˜]ÜœÈKˆÈ›ÛNˆ	Þ›ÛÛIÈKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆËÈÛÜÙH9.#ˆÙÙÛHÚYX˜\ˆ9d#9«/ˆ™YÚ\Ý\XØÙ[\˜]ÜŽˆ˜[ÙH8 %8 %:#ç9cey¦/¹é.‚ˆËÈ8£&È9¨!ùëo¹.%9à®yaîù.ãyalúeëz f¹á)¹ê¥ùcèË9/a¹.#yd$yìîùîçù¬ê9a£9àëze+‹:+ªy£"ze+¹­`yb,™[™\™\Ž‚ˆËÈ9á)¹à®yg*9cìù/©ù¨#È
+9îâ9êëÈÈ9¥¡ù.í¹­cú)â9fj9ëbJH9a¡y¥í¹ab9alù¯à9­.ÈX‹9d)¹b&z-lˆËÈÚ[™ÝËXÛÜÙK\Ù[ˆ9alÊ:f¤:%ãÊyê¥ùcèÈ
+:)àH\ÚÜÝ]È	ØÛÜÙK]X‹[Ü‹]Ú[™ÝÉÂˆËÈ9.#ˆXZ[“^[Ý]ÈÚYX˜\•Ú[™ÝÓ^[Ý]9æ¡9­¢:-.yà®Jxà ¹¬.9.#y¬ê9a£9.gùl,y¥è:g 9d ÂˆËÈ9oeyb-ˆØ]xà ‚ˆÈ›ÛNˆ	ØÛÜÙIË™YÚ\Ý\XØÙ[\˜]ÜŽˆ˜[ÙHKˆKˆKˆÂˆX™[ˆX™[Ëš[Y[KˆÝX›Y[NˆÂˆÂˆX™[ˆX™[Ëš[ˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÛÜ[‹Z[	ÊKˆKˆÂˆX™[ˆX™[Ëœ™[X\ÙS›Ý\ËˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÛÜ[‹\™[X\ÙK[›Ý\ÉÊKˆKˆÂˆX™[ˆX™[Ëš\ÜÝY\ËˆÛXÚÎˆ
+
+HOˆ\Ü]Ú\XØ][Û“Y[PÛÛ[X[™
+XZ[•Ú[™ÝË	ÛÜ[‹Z\ÜÝY\ÉÊKˆKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÂˆËÈ9doy.é9d#zf£ÈY][Ûˆ9dàyâc
+[œÝ[ÛH9¥¡ù¨b:aã9æ¡ÞØÛY_H9ch9/cyë)Šxà ‚ˆX™[ˆX™[Ëš[œÝ[ÛKœ™\XÙP[
+	ÞÞØÛY_IËÓWÐÓÓSPS‘ÓSQJKˆËÈ9âny§`ùbª9/g
+9a¦HU9æë¹oeHÈ9cëú ïyo.yë¨yä!¹df9£¢9§`Êy¥m9«­yg*XZ[ˆ9¢iú(cˆËÈ9.#yîãÈ™[™\™\‹9.gù.#y¥¬9h§ˆTÈ:gh¸à º)àH[œÝ[ÛPÛÛ[X[™øà ‚ˆÛXÚÎˆ
+
+HOˆÂˆ›ÚY[œÝ[Ú[™PÛPÛÛ[X[™
+XZ[•Ú[™ÝËØØ[JNÂˆKˆKˆKˆKˆNÂ‚ˆY[KœÙ]\XØ][Û“Y[JY[K˜Z[œ›ÛU[\]J[\]JJNÂŸB‚›]Ý\œ™[\XØ][Û“Y[SØØ[Nˆ\XØ][Û“Y[SØØ[H[H[Â‚‹ËÈ9oêù£múe+¹¥.yîäyå'ù¥bˆÝ™\œšY\È9cæ9c%¹¥í¹å*9odùbcHØØ[H9aj:aãúaãynîº#ç9ceH
+9.#ˆØØ[H9cæ9¦í‹ËÈ9d#9. :-ëùo¡
+xà ¹.áyå*9¢-ùg*:+¯¹ïkºhmy/çykf9¥.yîäy¥íº)é¹cäK:aãynî¹ç«:eí9¢dùo 9ç`9æ¡:#ç9cey/&¹¥-º-mË9cëù£©ycåøà ‚‹ËÈ9oeyb-¹  yb!ù£h¹d#9ä!ºaãynîˆ8 %8 %9oeyb-¹.+z#ç9cey.#y¬ê9a£XØÙ[\˜]Üˆ
+:)àH[œÝ[\XØ][Û“Y[Jxà ‚™[˜Ý[Ûˆ™Z[œÝ[\XØ][Û“Y[RY”™\Ù[
+
+Nˆ›ÚYÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+HÈXZ[•Ú[™ÝÔ™Yˆˆ[ÂˆYˆ
+XZ[•Ú[™ÝÊHÂˆ[œÝ[\XØ][Û“Y[JˆXZ[•Ú[™ÝËˆÝ\œ™[\XØ][Û“Y[SØØ[HÏÈÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+Kˆ
+NÂˆBŸB™Ù]\ÚÜÝ]ÝÜ™J
+KœÝXœØÜšX™J™Z[œÝ[\XØ][Û“Y[RY”™\Ù[
+NÂœÝXœØÜšX™P\ÚÜÝ]™XÛÜ™[™Ê™Z[œÝ[\XØ][Û“Y[RY”™\Ù[
+NÂ‚š\ÓXZ[‹›ÛŠ	Ø\[ØØ[N™Ù]\™Y™\œ™Y\Þ\Ý[K[ØØ[K\Þ[˜ÉË
+]™[
+HOˆÂˆ]™[œ™]\›•˜[YHHÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+NÂŸJNÂ‚‹ËÈ™[™\™\ˆ9/©ÈXZ[“^[Ý][Ý[9d#¹..ùbª9¢ây. 9«(ya­ùd+ùbª9§'úeí9ï$ùkf9æ¡Y\[šÈÂ‹ËÈK[Ü[‹Y›Û\ˆ^[ØY8à œ[[Û‹[[Ý[:-ëùo¡9.$ùå*ZÙH9. 9«(y®!yên‹:aãyi#z, ùk¢yaj8à ‚‹ËÈ:+éº)àHY\[šËÈ9æ¡[™[™ÈY™™\ˆ9«­xà ‚š\ÓXZ[‹š[™J	ÙY\[[šÎZÙK\[™[™ÉË
+
+HOˆÂˆ™]\›ˆZÙT[™[™ÑY\[šÊ
+NÂŸJNÂ‚š\ÓXZ[‹š[™J	Ø\[Y[NœÙ][ØØ[IË
+Ù]™[ØØ[Nˆ[šÛ›ÝÛŠNˆÈÚÎˆYHHOˆÂˆÝ\œ™[\XØ][Û“Y[SØØ[HH™\ÛÛ™P\XØ][Û“Y[SØØ[Jˆ\[ÙˆØØ[HOOH	ÜÝš[™ÉÈÈØØ[Hˆ[ˆ
+NÂˆÙ]Ù[XÝ[ÛÛÛ^Y[SØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆÙ]XZ[“ØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆ™Yœ™\ÚÚ[™ÝÜÐ\˜YÙJ
+NÂˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹œÙ]ØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœÙ]ØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆœØ•Ú[™ÝÐÛÛ›Û\‹œÙ]ØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\‹œÙ]ØØ[JÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆ™Yœ™\ÚÚÜÝØØ[^˜][ÛŠ
+NÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+HÈXZ[•Ú[™ÝÔ™Yˆˆ[ÂˆYˆ
+XZ[•Ú[™ÝÊHÂˆ[œÝ[\XØ][Û“Y[JXZ[•Ú[™ÝËÝ\œ™[\XØ][Û“Y[SØØ[JNÂˆBˆ[˜[Y]UÚ[™ÝÜÕ˜^SY[J
+NÂˆÙ]YÙ[\Û[™Ù\šXÙJ
+OËœ™Yœ™\ÚØØ[^˜][ÛŠ
+NÂˆ™]\›ˆÈÚÎˆYHNÂŸJNÂ‚‹ÊŠ‚ˆ
+ˆÛÛ™\ÔÒV\Ý[HXœÛÛ]H]È[Z]YžHÛ]YHÛÙHÑÈÛˆÚ[™ÝÜÂˆ
+ˆ
+K™ËˆÙKÐRUÛÜšËÞ[XZÙ\‹Ë‹‹˜
+H[È˜]]™HÚ[ŒÌˆ]È
+N—RUÛÜš×‹‹˜
+K‚ˆ
+‚ˆ
+ˆÛˆ›Û‹UÚ[™ÝÜÈ]›Ü›\È\È\ÈH›Ë[Ü8 %XXËÓ[^[™XYH\ÙHÔÒVˆ
+ˆ]È˜]]™[H[™œØØ[ˆ™XY[H\ËZ\ËˆÛˆÚ[™ÝÜÈHÑÈœ™\]Y[Bˆ
+ˆ[Z]ÈÞË‹‹˜Ý[H]È[ˆÛÛ\™ÜÈ
+™XYÕÜš]KÑY]š[WÜ]
+NÈBˆ
+ˆ›ÙHœØTHÛˆÚ[™ÝÜÈ™X]ÈÜÙH\ÈS“ÑS•Ý\™˜XÚ[™È[ˆBˆ
+ˆ^YÚ›Þ\È‘š[H›Ý›Ý[™‹‚ˆ
+‹Â™[˜Ý[ÛˆÜÚ^ÕÚ[ŒÌŠˆÝš[™ÊNˆÝš[™ÈÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰È\
+H™]\›ˆÂˆËÈÞÜ™\Ý8¡¤ˆ—™\ÝˆÚ[™ÛHš]™H]\ˆÛ›NÈY\\ˆÙYÛY[È™\Ù\™Y‚ˆÛÛœÝHH×—ÊØK^KV—JWÊŠŠIË™^XÊ
+NÂˆYˆ
+JH™]\›ˆ	ÛVÌWKÕ\\Ø\ÙJ
+_N—	ÛVÌ—Kœ™\XÙJ×ËÙË	×	Ê_XÂˆ™]\›ˆÂŸB‚™[˜Ý[Ûˆ\Ô][ÝÙY
+š[T]ˆÝš[™ÊNˆ›ÛÛX[ˆÂˆ™]\›ˆ\Ô][ÝÙYYØZ[œÝ
+š[T]ÖTÕSWÔUÐ“ÐÒÓTÕ
+NÂŸB‚‹ËÈ9å*9¢-ùcã9aîùfï¹¨!ÈÈ9.£9«(yd+ùbª9¥í‹ÙXÛÛ™Z[œÝ[˜ÙH9.¢ù.íº) y¢¢¹..ùê¥ùcèù¢âyfç¹bcycì8à ‚‹ËÈ9.#z ïyå*œ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+VÌH8 %8 %9.-9¥í¹­k¹ê¥ËÕØ\Ý9.gùlg¹.£‚‹ËÈœ›ÝÜÙ\•Ú[™Ýûï#ÌH9¢ïùb,9k ùa£H™›ØÝ\Ê
+H9ëby.£¹eiy.gù¬¨ynl»ï#9å*9¢-ú)áº)ây."¹.éy..‚‹ËÈ¹cã9aîùd+ùbª9.#y.¡ˆ¸à ‚›]XZ[•Ú[™ÝÔ™YŽˆœ›ÝÜÙ\•Ú[™ÝÈ[H[Â›]XZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\ŽˆXZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\ˆ[H[Â‹ËÈ9êëùà®y®!ycezf.ù¥«zeêœ™XYH9­`yê"ú-l9b,9«hùn.Ü™X]UÚ[™ÝÊ
+H9bcyïkˆYxà ¹g*9«i9.bùbcB‹ËÈÙXÛÛ™Z[œÝ[˜ÙHÈXÝ]˜]H9. 9o¢ù.#z+®9nî¹ê¥ø %8 %:f.ù¥«yoª¹ã«Ê:e&z+ëù¨aºaãz+åJy§'úeí9å*9¢-Â‹ËÈ9cã9aîùfï¹¨!ÈÈ9à®HØÚÈ:"éz ïynî¹ê¥Ë™[ØY9æ¡9ª(ygeùî©ÈÙ[™Þ[˜È9/&¹fè[™\ˆ9§*¹¬ê9a£‹ËÈ: #9æoylcË9.%9ê¥ùcèù/&¹n)¹ç`9àæ9á&yêëùà®yîåz/áÈ¹¢ây.#yb,9®!ycey.#y¥/º(c¹æ¡:+ëy.bxà ‚›]Ý\\Ú[™ÝÐÜ™X][Û[ÝÙYH˜[ÙNÂ›]\›ØÝ\ÔÞ[˜Õ[Y\Žˆ™]\›•\O\[ÙˆÙ][Y[Ý]ˆ[H[Â˜ÛÛœÝ›ÝšY\“[Ù[›ØÝ\Ô™Yœ™\Ú˜XÚÙ\ˆHÜ™X]P\›ØÝ\Ð]]Ô™Yœ™\Ú˜XÚÙ\ŠÂˆ›ÝÎˆ]K››ÝËˆÛ“YX[š[™Ù[›Ü™YÜ›Ý[™ˆ
+
+HOˆÂˆ›ÚY™\]Y\Ý›ÝšY\“[Ù[]]Ô™Yœ™\Ú
+	Ù›Ü™YÜ›Ý[™	ÊNÂˆKŸJNÂ›]XZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ð[ÝÙYHYNÂ˜ÛÛœÝ\Õ\]T™[][˜ÚØ[™Y]HBˆ›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰È	‰ˆ\ÓXXÓÔÕ\]T™[][˜Ú
+›ØÙ\ÜË˜\™ÝŠNÂ›]\]T™\Ù[][Û”™XÛÝ™\žR[š]X[^™YH˜[ÙNÂ˜ÛÛœÝQÑWÖ“ÓÓWÑPÕÔ—ÓRSˆHNÂ˜ÛÛœÝQÑWÖ“ÓÓWÑPÕÔ—ÓPVHÎÂ˜ÛÛœÝQÑWÖ“ÓÓWÑPÕÔ—ÔÕTHŒNÂ‚˜ÛÛœÝ\]T™\Ù[][Û”™XÛÝ™\žHH\Õ\]T™[][˜ÚØ[™Y]BˆÈÜ™X]U\]T™\Ù[][Û”™XÛÝ™\žPÛÛ›Û\ŠÂˆ™XYØÜ™Y[”Ý]Nˆ
+
+HOˆÂˆžHÂˆ™]\›ˆÝÙ\“[Ûš]Ü‹™Ù]Þ\Ý[RYTÝ]JJNÂˆHØ]Ú
+\œŠHÂˆ\]T™\Ù[][Û“ÙËØ\›Š	Ù˜Z[YÈ™XY[š]X[ØÜ™Y[ˆØÚÈÝ]IËÂˆ\œ›ÜŽˆ\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠKˆJNÂˆ™]\›ˆ	Ý[šÛ›ÝÛ‰ÎÂˆBˆKˆ™XYÚ[™ÝÔÝ]Nˆ
+
+HOˆÂˆÛÛœÝÚ[ˆHXZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+HÈXZ[•Ú[™ÝÔ™Yˆˆ[Âˆ™]\›ˆÈ^\ÝÎˆÚ[ˆOOH[›ØÝ\ÙYˆÚ[Ëš\Ñ›ØÝ\ÙY
+
+HOOHYHNÂˆKˆ›ØÝ\ÕÚ[™ÝÎˆ
+
+HOˆÂˆ›ØÝ\ÓXZ[•Ú[™ÝÊ
+NÂˆKˆØÚY[Nˆ
+Ø[˜XÚË[^S\ÊHOˆÙ][Y[Ý]
+Ø[˜XÚË[^S\ÊKˆØ[˜Ù[ˆ
+[™JHOˆÛX\•[Y[Ý]
+[™H\È™]\›•\O\[ÙˆÙ][Y[Ý]ŠKˆÛ‘]™[ˆ
+]™[
+HOˆÂˆYˆ
+]™[OOH	ÙY™\œ™Y[ØÚÙY	ÊHÂˆ\]T™\Ù[][Û“ÙËš[™›Ê	Ý\]HÚ[™ÝÈXÝ]˜][ÛˆY™\œ™Y[[ØÜ™Y[ˆ[›ØÚÉÊNÂˆH[ÙHYˆ
+]™[OOH	Ù›ØÝ\Ë]Ú[™ÝÉÊHÂˆ\]T™\Ù[][Û“ÙËš[™›Êˆ	Ü™\ÝÜš[™È\]K[][˜ÚYÚ[™ÝÈY\ˆ™\Ù[][Ûˆ™XØ[YH]˜Z[X›IËˆ
+NÂˆH[ÙHYˆ
+]™[OOH	Ü]\ÙY][šÛ›ÝÛ‰ÊHÂˆ\]T™\Ù[][Û“ÙËØ\›Šˆ	Ü]\Ú[™È\]HÚ[™ÝÈ™XÛÝ™\žH[[[ˆ^XÚ]ØÜ™Y[ˆ]™[™XØ]\ÙHÝ]HÝ^YY[šÛ›ÝÛ‰Ëˆ
+NÂˆH[ÙHÂˆ\]T™\Ù[][Û“ÙËØ\›Šˆ	ØX˜[™Ûš[™È\]HÚ[™ÝÈ™XÛÝ™\žHY\ˆ›Ý[™Y›ØÝ\È][\ÈÙ\™H[šYY	Ëˆ
+NÂˆBˆKˆJBˆˆ[Â‚‹ËÈXXÓÔÈ9c§ùå'È\:(c9..ŠÛXÚÈÈ”ÐÛÙHÈ9o«¹/èJNˆ9alùê¥ùcêˆYH9.#ze 9«àK9à®HØÚÈ9fï¹¨!Â‹ËÈ9æí9£©HÚÝÈ9fç¹§iK™[™\™\ˆ9.#zaãy¥¬9b¨:/oxà ÛY
+ÔHÈ™Y›Ü™K\]Z]9¥í¹¢¢º/æy.*¹¨!ùoåùïkˆYK‹ËÈ:+ªyê¥ùcèÈÛÜÙH[™\ˆ9¥/º(c9ç'ù«hùæ¡:e 9«àxà ‚›]\Ô]Z][™ÈH˜[ÙNÂ˜ÛÛœÝ]]Ü™Y[X[™XÛÝ™\žSÙÈHÜ™X]SÙÙÙ\Š	Ø]]XÜ™Y[X[\™XÛÝ™\žIÊNÂ‚™[˜Ý[Ûˆ™XY™[][˜ÚXÝ]š]TÛÝ\˜Ù\Ê
+Nˆ™[][˜Ú\ÞPXÝ]š]TÛÝ\˜Ù\ÈÂˆ™]\›ˆÂˆ[žTÙ\ÜÚ[Û’[•\›Žˆ
+
+HOˆÂˆÛÛœÝXZÙ\ˆHÙ]XZÙ\’Y”™XYJ
+NÂˆ™]\›ˆXZÙ\ˆÈ[žTÙ\ÜÚ[Û’[•\›ŠXZÙ\ŠHˆ˜[ÙNÂˆKˆ\ÝÛ]YP˜XÚÙÜ›Ý[™Ù\ÜÚ[ÛœÎˆ
+
+HOˆ\ÝXÝ]™PÛ]YP˜XÚÙÜ›Ý[™XÝ]š]TÙ\ÜÚ[ÛœÊ
+Kˆ[žQÚÜÝÙ\ÜÚ[Û\ÞNˆ
+
+HOˆÙ]ÚÜÝÙ\ÜÚ[ÛXÝ]š]U˜XÚÙ\Š
+K˜[žTÙ\ÜÚ[Û\ÞJ
+KˆËÈ[—Ú[—Ø˜XÚÙÜ›Ý[™9æ¡˜\Ú9.#z, ùª(yg¢øà y.gù.#y¢¦9ë¥È[›š[™Ë9bcy.)9.*¹§iy®¤:`ïyç"ù.#yb,9k øà ‚ˆ[žP˜XÚÙÜ›Ý[™˜\Ú[›š[™Îˆ
+
+HO‚ˆÙ]XZÙ\’Y”™XYJ
+BˆË›\ÝXÝ]™TÙ\ÜÚ[ÛœÊ
+BˆœÛÛYJ
+Ù\ÜÚ[ÛŠHOˆÙ\ÜÚ[Û‹›\Ý˜XÚÙÜ›Ý[™\ÚÜÊ
+K›[™Ýˆ
+HÏÈ˜[ÙKˆËÈÚ[™HÛÝ9æ¡9aj:`ê9g*:`%9méy/g¹o ¹«iJ[ÙN‰ÜÝX›Z]	È9æ¡9fïˆÈ:)áºh¤Jy.#¹d#9«iy.èùb§¹d!:!ê¹âë9êâú+¬:-)‹ˆËÈ:`ïycëú ïy.#y/-:f£ù.îù/eH\›ˆ9¢%ˆØ\™XXÝ[Û‹9cê¹§éy. 9cb¹l,y¯#ù. 9cb¸à ‚ˆ[žPÚ[™TÛÝ›Ø”[›š[™Îˆ
+
+HOˆÙ]ÚÜÝÚ[™TÛÝ
+
+K˜[žR[™›YÚÛÜšÊ
+KˆËÈØÛÜHÈ\È›ØÙ\ÜÎˆKXYÙ[ZÛYX\ÈÚ\™YÚ]HÛÛ˜Ý\œ™[ˆËÈ]‹ÜXÚØYÙYØK\\ÜÚ]™X[œÝ[˜ÙK[™]È[›š[™ÈÝX˜YÙ[È\™H›ÝˆËÈH™X\ÛÛˆÈÛ\
+›Ý\Šˆ]Z]‚ˆ[žTTÝX˜YÙ[[›š[™Îˆ
+
+HO‚ˆ\ÐXÝ]™TTÝX˜YÙ[[œÔÞ[˜Ê]š›Ú[Š\™Ù]]
+	Ý\Ù\‘]IÊK	ÜKXYÙ[ZÛYIÊKÂˆÜÝYˆ›ØÙ\ÜËœYˆJKˆËÈØÜš\9ª(yo#ÈÈ™K\[ˆÛÚÈ:f-¹«­yæ¡[ˆ9.#yb&ùnîˆÙ\ÜÚ[Û‹9a¡ykf9§iy®¤9ç"ù.#yb,9k ù.ë8à ‚ˆ[žTØÚY[\”[”[›š[™Îˆ
+
+HOˆ™XY\]T™[][˜ÚØÚY[P\ÞJÙ]ØÚY[TÝÜ˜YÙRY’[š]X[^™Y
+
+JKˆNÂŸB‚˜ÛÛœÝ]]Ü™Y[X[™XÛÝ™\žHHÜ™X]P]]Ü™Y[X[™XÛÝ™\žJÂˆ[˜X›Yˆ›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰È	‰ˆ\š\ÔXÚØYÙYˆ\™ÝŽˆ›ØÙ\ÜË˜\™Ý‹œÛXÙJJKˆ™YYÔ™XÛÝ™\žNˆ
+
+HOˆ]]X[˜YÙ\‹›™YYÐÜ™Y[X[›ØÙ\ÜÔ™XÛÝ™\žJ
+Kˆ™XYØÜ™Y[”Ý]Nˆ
+
+HOˆÝÙ\“[Ûš]Ü‹™Ù]Þ\Ý[RYTÝ]JJKˆ\Ô]Z][™Îˆ
+
+HOˆ\Ô]Z][™Ëˆ\Ð\ÞNˆ
+
+HO‚ˆ\Õ\]T™[][˜Ú\ÞPXÝ]š]JÂˆ™XYÞ[˜Ú›Û›Ý\Ð\ÞNˆ
+
+HO‚ˆ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+Hˆ]]X[˜YÙ\‹š\Ð]]›ÝÐ\ÞJ
+HˆÙ]\]T™[][˜ÚÛÛ›Û\œÊ
+K›[™Ýˆˆ\Ò[‘›YÚ™[[ÝR[›ÚÙ\Ê
+Kˆ™XYØÚY[P\ÞNˆ\Þ[˜È
+
+HO‚ˆ
+]ØZ]]˜[X]T™[][˜Ú\ÞPXÝ]š]J™XY™[][˜ÚXÝ]š]TÛÝ\˜Ù\Ê
+JJK˜\ÞKˆJKˆ™[][˜Úˆ
+\™ÜÊHOˆÂˆ\œ™[][˜Ú
+È\™ÜÈJNÂˆ\œ]Z]
+
+NÈËÈ›Ü›X[Y™XÞXÛNˆ›\ÚÝÜ˜YÙH[™\ÜÜÙH˜XÚÙÜ›Ý[™Ù\šXÙ\Ë‚ˆKˆØÚY[Nˆ
+Ø[˜XÚË[^S\ÊHOˆÙ][Y[Ý]
+Ø[˜XÚË[^S\ÊKˆØ[˜Ù[ˆ
+[™JHOˆÛX\•[Y[Ý]
+[™H\È™]\›•\O\[ÙˆÙ][Y[Ý]ŠKˆÛ‘]™[ˆ
+]™[
+HOˆ]]Ü™Y[X[™XÛÝ™\žSÙËš[™›Ê]™[
+KŸJNÂ‚›]Ú[™ÝÜÕ˜^Nˆ˜^H[H[Â‹ËÈ9odùbcyæ¡9¢f9ææ:#ç9cexà º+ëz* 9b!ù£h¹¥í¹ïkˆ[9."ù. 9«(ycìúe+¹£"y¥¬:+ëz* :aãynî¸à ‚›]Ú[™ÝÜÕ˜^SY[NˆY[H[H[Â‹ËÈ9mì¹o.yaî¹æ¡:#ç9ceyg*˜]]™HØ[˜XÚÈ9bcyoázhnù/çyåfK9clù/oú+ëz* 9b!ù£h¹®!y£¢y.¡¹odùbcyï$ùkf8à ‚˜ÛÛœÝXÝ]™UÚ[™ÝÜÕ˜^SY[\ÈH™]ÈÙ]Y[OŠ
+NÂ˜ÛÛœÝÚ[™ÝÜÕ˜^SÙÈHÜ™X]SÙÙÙ\Š	ÝÚ[™ÝÜË]˜^IÊNÂ˜ÛÛœÝÓÔÑWÐ‘RU’SÔ—Ô“ÓTÑSPÒ×ÑSVWÓTÈH—ÌÂ‚™[˜Ý[ÛˆZ[Ú[™ÝÜÕ˜^SY[J
+NˆY[HÂˆ™]\›ˆY[K˜Z[œ›ÛU[\]JÂˆÂˆX™[ˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜^SY[KœÚÝÉÊKˆÛXÚÎˆ
+
+HOˆ›ØÝ\ÓXZ[•Ú[™ÝÊ
+KˆKˆÈ\Nˆ	ÜÙ\\˜]Ü‰ÈKˆÂˆX™[ˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜^SY[Kœ]Z]	ÊKˆÛXÚÎˆ
+
+HOˆ]Z]œ›ÛUÚ[™ÝÜÕ˜^J
+KˆKˆJNÂŸB‚‹ÊŠˆ:+ëz* 9b!ù£h¹d#¹.(¹o ùï$ùkf9æ¡:#ç9ceK9."ù. 9«(ycìúe+¹£"y¥¬:+ëz* :aãynî¸à ˆ
+‹Â™[˜Ý[Ûˆ[˜[Y]UÚ[™ÝÜÕ˜^SY[J
+Nˆ›ÚYÂˆÚ[™ÝÜÕ˜^SY[HH[ÂŸB‚™[˜Ý[ÛˆÜ[•Ú[™ÝÜÕ˜^SY[J
+Nˆ›ÚYÂˆËÈ:/æy§hy¥éyoåù¦+úeoù§'ú+â¹¥«yåfyæ¡9.#y¦+ù.-9¥í¹£¤¹§éNˆ9."¹®.:`¨ù§hyo.y.#yaî¹æ¡YÈ9¦+úgfznæ9i,z-)J9.#y¢¦úe&JKˆËÈ9¢`9.éy¥éyoåúaã9§"y¬¨y§"z/æy. :(c9¦+ùc.¹b!ˆ¹cìúe+¹.¢ù.í¹¬¨yb,ˆ9.#ˆ¹.¢ù.í¹b,9.¡¹/aº#ç9cey¬¨yo.Hˆ9æ¡9e+ù. 9/§y£k¸à ‚ˆËÈ9a£y§"yå*9¢-ù¢©H¹cìúe+¹¬¨ycãyn¥ˆ9¥í‹9ab:+ªy.å¹ç"ú/æz(c8à ‚ˆËÈ9å*[™›È: #9.#y¦+ÈXYÎˆXÚØYÙY9æ¡:næ:+©9î©ùb*ùl,y¦+È[™›È
+ÙÙÙ\‹È9æ¡]™[:)èù§¤
+KˆËÈXYÈ9/&º(ªÈÚÝ[ÙÈ:/áù®é9£¢H8 %8 %:`¨ù¨-ùk ù l9ioyg*9e+ù. :g :) yk ùæ¡9g.¹¦kÊ9å*9¢-ù¢bù."¹æ¡9«hùo#ùc!JBˆËÈ:aã9.#y/&¹aî¹ã¬8à ºh¤yã¡ù."¹.gù.#y¢áyoàùb-ùlcÎˆ9cê¹§"yå*9¢-ùç'ùæ¡9cìúe+¹¢f9ææ9fï¹¨!ù¢cy/&º-l9b,:/æzaã8à ‚ˆÚ[™ÝÜÕ˜^SÙËš[™›Ê	Ý˜^HšYÚXÛXÚÈ™XÙZ]™YÜ[š[™È˜^HY[IÊNÂˆÜ\Ú[™ÝÜÕ˜^SY[OY[OŠÂˆ˜^NˆÚ[™ÝÜÕ˜^KˆY[NˆÚ[™ÝÜÕ˜^SY[KˆZ[Y[NˆZ[Ú[™ÝÜÕ˜^SY[Kˆ™]Z[“Y[Nˆ
+Y[JHOˆÂˆÚ[™ÝÜÕ˜^SY[HHY[NÂˆKˆ™]Z[XÝ]™SY[Nˆ
+Y[JHOˆÂˆXÝ]™UÚ[™ÝÜÕ˜^SY[\Ë˜Y
+Y[JNÂˆKˆ™[X\ÙPXÝ]™SY[Nˆ
+Y[JHOˆÂˆXÝ]™UÚ[™ÝÜÕ˜^SY[\Ë™[]JY[JNÂˆKˆÛ•[˜]˜Z[X›Nˆ
+™X\ÛÛŠHOˆÂˆÚ[™ÝÜÕ˜^SÙËØ\›Š	Ý˜^HY[H™\]Y\ÝYÚ]Ý]H]™H˜^HXÛÛ‰ËÈ™X\ÛÛˆJNÂˆKˆÛ‘\œ›ÜŽˆ
+\œ›ÜŠHOˆÂˆÚ[™ÝÜÕ˜^SÙË™\œ›ÜŠ	Ù˜Z[YÈÜ[ˆÚ[™ÝÜÈ˜^HY[IËÂˆ\œ›ÜŽˆ\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆÝš[™Ê\œ›ÜŠKˆJNÂˆKˆJNÂŸB‚™[˜Ý[Ûˆ]Z]œ›ÛUÚ[™ÝÜÕ˜^J
+Nˆ›ÚYÂˆ™\]Y\ÝÚ[™ÝÜÕ˜^T]Z]
+Âˆ\ÐXÝ]™U\›Žˆ
+
+HOˆÂˆžHÂˆ™]\›ˆ[žTÙ\ÜÚ[Û’[•\›ŠÙ]XZÙ\ÛÜ™J
+JNÂˆHØ]ÚÂˆËÈH˜Z[Y\ÞH›Ø™H]\Ý›Ý\›ˆH˜^H[È[ˆ[™ÝX\™Y^]]‚ˆ™]\›ˆYNÂˆBˆKˆÛÛ™š\›T]Z]ˆ
+
+HO‚ˆX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊÂˆ\Nˆ	ÝØ\›š[™ÉËˆ]Nˆ
+	Ý]P˜\‹˜ÛÜÙPÛÛ™š\›K]IÊKˆY\ÜØYÙNˆ
+	Ý]P˜\‹˜ÛÜÙPÛÛ™š\›K]IÊKˆ]Z[ˆ
+	Ý]P˜\‹˜ÛÜÙPÛÛ™š\›K™\ØÜš\[Û‰ÊKˆ]ÛœÎˆÝ
+	Ý]P˜\‹˜ÛÜÙPÛÛ™š\›K˜Ø[˜Ù[	ÊK
+	Ý]P˜\‹˜ÛÜÙPÛÛ™š\›K˜ÛÛ™š\›IÊWKˆY˜][YˆˆØ[˜Ù[Yˆˆ›Ó[šÎˆYKˆJHOOHKˆ]Z]ˆ
+
+HOˆ\œ]Z]
+
+KˆJNÂŸB‚™[˜Ý[Ûˆ\Ý›ÞUÚ[™ÝÜÕ˜^J
+Nˆ›ÚYÂˆÚ[™ÝÜÕ˜^OË™\Ý›ÞJ
+NÂˆÚ[™ÝÜÕ˜^HH[ÂˆÚ[™ÝÜÕ˜^SY[HH[ÂŸB‚™[˜Ý[Ûˆ[œÝ\™UÚ[™ÝÜÕ˜^J
+Nˆ›ÛÛX[ˆÂˆYˆ
+Ú[™ÝÜÕ˜^H	‰ˆ]Ú[™ÝÜÕ˜^Kš\Ñ\Ý›ÞYY
+
+JH™]\›ˆYNÂ‚ˆ]˜^Nˆ˜^H[H[ÂˆžHÂˆÛÛœÝXÛÛ”]H\š\ÔXÚØYÙYˆÈ]š›Ú[Š›ØÙ\ÜËœ™\ÛÝ\˜Ù\Ô]	ÚXÛÛ‹œ™ÉÊBˆˆ]š›Ú[Š×Ù\›˜[YK	Ë‹‹Ë‹‹Ü™\ÛÝ\˜Ù\ËÚXÛÛ‹œ™ÉÊNÂˆÛÛœÝXÛÛˆH˜]]™R[XYÙK˜Ü™X]Qœ›ÛT]
+XÛÛ”]
+NÂˆYˆ
+XÛÛ‹š\Ñ[\J
+JH›ÝÈ™]È\œ›ÜŠ˜^HXÛÛˆ\È[\Nˆ	ÚXÛÛ”]X
+NÂˆ˜^HH™]È˜^JXÛÛ‹œ™\Ú^™JÈÚYˆM‹ZYÚˆMˆJJNÂˆ˜^KœÙ]ÛÛ\
+”S‘ÓSQJNÂˆ˜^K›ÛŠ	ØÛXÚÉË
+
+HOˆ›ØÝ\ÓXZ[•Ú[™ÝÊ
+JNÂˆ˜^K›ÛŠ	ÜšYÚXÛXÚÉË
+
+HOˆÜ[•Ú[™ÝÜÕ˜^SY[J
+JNÂˆÚ[™ÝÜÕ˜^HH˜^NÂˆÚ[™ÝÜÕ˜^SY[HH[Âˆ™]\›ˆYNÂˆHØ]Ú
+\œŠHÂˆËÈ9fï¹¨!ùcëú ïymì¹îãú/æù.¡º`&¹çéyc.¹gçÎˆ9cê¹ïkˆ[9/&¹åfy."ù. 9.*¹.ãydãyn¥9méºe+¸à ycm9a£y.gùo%yå*9.#yb,9æ¡ˆËÈ9`íyl.9fï¹¨!Ê\Ý›ÞUÚ[™ÝÜÕ˜^H9¤n9.#yb,9k Ë9cìúe+¹.gù¬¨y§"z#ç9ceycëùo.Jxà ‚ˆžHÂˆ˜^OË™\Ý›ÞJ
+NÂˆHØ]ÚÂˆÊˆ9mì¹îãù¬¨y.¡‹9oïyåiH
+‹ÂˆBˆÚ[™ÝÜÕ˜^SÙË™\œ›ÜŠ	Ù˜Z[YÈÜ™X]HÚ[™ÝÜÈ˜^HXÛÛ‰ËÂˆ\œ›ÜŽˆ\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠKˆJNÂˆÚ[™ÝÜÕ˜^HH[ÂˆÚ[™ÝÜÕ˜^SY[HH[Âˆ™]\›ˆ˜[ÙNÂˆBŸB‚™[˜Ý[ÛˆYSXZ[•Ú[™ÝÕÕÚ[™ÝÜÕ˜^JXZ[•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝÊNˆ›ÚYÂˆYˆ
+[œÝ\™UÚ[™ÝÜÕ˜^J
+JHÂˆYUÚ[™ÝÕÕÚ[™ÝÜÕ˜^JXZ[•Ú[™ÝÊNÂˆ™]\›ŽÂˆBˆX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊXZ[•Ú[™ÝËÂˆ\Nˆ	Ù\œ›Ü‰Ëˆ]Nˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜^Q\œ›Ü‹]IÊKˆY\ÜØYÙNˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜^Q\œ›Ü‹›Y\ÜØYÙIÊKˆJNÂŸB‚™[˜Ý[Ûˆ\UÚ[™ÝÜÐÛÜÙP™Z]š[ÜŠˆXZ[•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝËˆ™Z]š[ÜŽˆÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ŠNˆ›ÚYÂˆYˆ
+™Z]š[ÜˆOOH	Ý˜^IÊHÂˆYSXZ[•Ú[™ÝÕÕÚ[™ÝÜÕ˜^JXZ[•Ú[™ÝÊNÂˆH[ÙHÂˆ\œ]Z]
+
+NÂˆBŸB‚™[˜Ý[ÛˆÚÝÓ˜]]™UÚ[™ÝÜÐÛÜÙP™Z]š[Ü”›Û\
+
+NˆÚ[™ÝÜÐÛÜÙP™Z]š[ÜˆÂˆÛÛœÝÜ[ÛœÈHÂˆ\Nˆ	Ü]Y\Ý[Û‰È\ÈÛÛœÝˆ]Nˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\]IÊKˆY\ÜØYÙNˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\›Y\ÜØYÙIÊKˆ]Z[ˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\™]Z[	ÊKˆ]ÛœÎˆÂˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙP™Z]š[Ü‹˜^IÊKˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙP™Z]š[Ü‹œ]Z]	ÊKˆKˆY˜][YˆˆØ[˜Ù[Yˆˆ›Ó[šÎˆYKˆNÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆÛÛœÝÚÚXÙHBˆXZ[•Ú[™ÝÈ	‰ˆ[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+BˆÈX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊXZ[•Ú[™ÝËÜ[ÛœÊBˆˆX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊÜ[ÛœÊNÂˆ™]\›ˆÚÚXÙHOOHHÈ	Ü]Z]	Èˆ	Ý˜^IÎÂŸB‚™[˜Ý[ÛˆÚÝÓ˜]]™S[^ÛÜÙP™Z]š[Ü”›Û\
+
+Nˆ[^ÛÜÙP™Z]š[ÜˆÂˆÛÛœÝÜ[ÛœÈHÂˆ\Nˆ	Ü]Y\Ý[Û‰È\ÈÛÛœÝˆ]Nˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\]IÊKˆY\ÜØYÙNˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\›Y\ÜØYÙIÊKˆ]Z[ˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙT›Û\›[^]Z[	ÊKˆ]ÛœÎˆÂˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙP™Z]š[Ü‹›Z[š[Z^™IÊKˆ
+	ÜÙ][™ÜËÚ[™ÝÐ™Z]š[Ü‹˜ÛÜÙP™Z]š[Ü‹œ]Z]	ÊKˆKˆY˜][YˆˆØ[˜Ù[Yˆˆ›Ó[šÎˆYKˆNÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆÛÛœÝÚÚXÙHBˆXZ[•Ú[™ÝÈ	‰ˆ[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+BˆÈX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊXZ[•Ú[™ÝËÜ[ÛœÊBˆˆX[ÙËœÚÝÓY\ÜØYÙP›ÞÞ[˜ÊÜ[ÛœÊNÂˆ™]\›ˆÚÚXÙHOOHHÈ	Ü]Z]	Èˆ	ÛZ[š[Z^™IÎÂŸB‚˜ÛÛœÝÚ[™ÝÜÐÛÜÙT›Û\˜[˜XÚÈHÜ™X]PÛÜÙP™Z]š[Ü”›Û\˜[˜XÚÐÛÛ›Û\ŠˆÂˆ™XY™Z]š[ÜŽˆ
+
+HOˆ™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+KÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ˆÚÝÔ™[™\™\”›Û\ˆ
+
+HOˆÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+[XZ[•Ú[™ÝÊH™]\›ŽÂˆ™\]Y\ÝXZ[•Ú[™ÝÐÛÜÙP™Z]š[ÜŠˆXZ[•Ú[™ÝËˆÒS‘Õ×Ð‘RU’SÔ—ÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—Ô‘TUQTÕQÐÒS“‘Sˆ
+NÂˆKˆÚÝÓ˜]]™T›Û\ˆÚÝÓ˜]]™UÚ[™ÝÜÐÛÜÙP™Z]š[Ü”›Û\ˆ\œÚ\Ý™Z]š[ÜŽˆÜš]UÚ[™ÝÜÐÛÜÙP™Z]š[Ü‹ˆ\P™Z]š[ÜŽˆ
+™Z]š[ÜŠHOˆÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+XZ[•Ú[™ÝÈ	‰ˆ[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHÂˆ\UÚ[™ÝÜÐÛÜÙP™Z]š[ÜŠXZ[•Ú[™ÝË™Z]š[ÜŠNÂˆH[ÙHÂˆ\œ]Z]
+
+NÂˆBˆKˆØÚY[Nˆ
+Ø[˜XÚË[^S\ÊHOˆÙ][Y[Ý]
+Ø[˜XÚË[^S\ÊKˆØ[˜Ù[ˆ
+[™JHOˆÛX\•[Y[Ý]
+[™H\È™]\›•\O\[ÙˆÙ][Y[Ý]ŠKˆKˆÓÔÑWÐ‘RU’SÔ—Ô“ÓTÑSPÒ×ÑSVWÓTËŠNÂ‚˜ÛÛœÝ[^ÛÜÙT›Û\˜[˜XÚÈHÜ™X]PÛÜÙP™Z]š[Ü”›Û\˜[˜XÚÐÛÛ›Û\ŠˆÂˆ™XY™Z]š[ÜŽˆ
+
+HOˆ™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+K›[^ÛÜÙP™Z]š[Ü‹ˆÚÝÔ™[™\™\”›Û\ˆ
+
+HOˆÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+[XZ[•Ú[™ÝÊH™]\›ŽÂˆ™\]Y\ÝXZ[•Ú[™ÝÐÛÜÙP™Z]š[ÜŠˆXZ[•Ú[™ÝËˆÒS‘Õ×Ð‘RU’SÔ—ÓS•VÐÓÔÑWÐ‘RU’SÔ—Ô‘TUQTÕQÐÒS“‘Sˆ
+NÂˆKˆÚÝÓ˜]]™T›Û\ˆÚÝÓ˜]]™S[^ÛÜÙP™Z]š[Ü”›Û\ˆ\œÚ\Ý™Z]š[ÜŽˆÜš]S[^ÛÜÙP™Z]š[Ü‹ˆ\P™Z]š[ÜŽˆ
+™Z]š[ÜŠHOˆÂˆÛÛœÝXZ[•Ú[™ÝÈHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+XZ[•Ú[™ÝÈ	‰ˆ[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHÂˆ\S[^XZ[•Ú[™ÝÐÛÜÙP™Z]š[ÜŠXZ[•Ú[™ÝË™Z]š[Ü‹
+
+HOˆ\œ]Z]
+
+JNÂˆH[ÙHÂˆ\œ]Z]
+
+NÂˆBˆKˆØÚY[Nˆ
+Ø[˜XÚË[^S\ÊHOˆÙ][Y[Ý]
+Ø[˜XÚË[^S\ÊKˆØ[˜Ù[ˆ
+[™JHOˆÛX\•[Y[Ý]
+[™H\È™]\›•\O\[ÙˆÙ][Y[Ý]ŠKˆKˆÓÔÑWÐ‘RU’SÔ—Ô“ÓTÑSPÒ×ÑSVWÓTËŠNÂ‚˜\›ÛŠ	Ø™Y›Ü™K\]Z]	Ë
+
+HOˆÂˆ\Ô]Z][™ÈHYNÂˆ\ÜÜÙTT[[YT™XÛÝ™\žOËŠ
+NÂˆ™]žTT[[YPY\“™]ÛÜšÔ™XÛÝ™\žHH[Âˆ\ÜÜÙTT[[YT™XÛÝ™\žHH[ÂˆÚ[™ÝÜÐÛÜÙT›Û\˜[˜XÚË™\ÜÜÙJ
+NÂˆ[^ÛÜÙT›Û\˜[˜XÚË™\ÜÜÙJ
+NÂˆ\Ý›ÞUÚ[™ÝÜÕ˜^J
+NÂˆ\ÜÜÙU\]T™\Ù[][Û”™XÛÝ™\žJ
+NÂˆ]]Ü™Y[X[™XÛÝ™\žK™\ÜÜÙJ
+NÂŸJNÂ‚™[˜Ý[Ûˆ[™U\]T™\Ù[][Û“ØÚÊ
+Nˆ›ÚYÂˆ\]T™\Ù[][Û”™XÛÝ™\žOË›Û”ØÜ™Y[“ØÚÊ
+NÂŸB‚™[˜Ý[Ûˆ[™U\]T™\Ù[][Û•[›ØÚÊ
+Nˆ›ÚYÂˆ\]T™\Ù[][Û”™XÛÝ™\žOË›Û”ØÜ™Y[•[›ØÚÊ
+NÂŸB‚™[˜Ý[Ûˆ[™T›ÝšY\“[Ù[Þ\Ý[T™\Ý[YJ
+Nˆ›ÚYÂˆ›ÚY™\]Y\Ý›ÝšY\“[Ù[]]Ô™Yœ™\Ú
+	ÜÞ\Ý[K\™\Ý[YIÊNÂŸB‚™[˜Ý[Ûˆ[™T›ÝšY\“[Ù[ØÜ™Y[•[›ØÚÊ
+Nˆ›ÚYÂˆ›ÚY™\]Y\Ý›ÝšY\“[Ù[]]Ô™Yœ™\Ú
+	ÜØÜ™Y[‹][›ØÚÉÊNÂŸB‚™[˜Ý[Ûˆ[š]X[^™U\]T™\Ù[][Û”™XÛÝ™\žJ
+Nˆ›ÚYÂˆYˆ
+]\]T™\Ù[][Û”™XÛÝ™\žH\]T™\Ù[][Û”™XÛÝ™\žR[š]X[^™Y
+H™]\›ŽÂˆ\]T™\Ù[][Û”™XÛÝ™\žR[š]X[^™YHYNÂˆÝÙ\“[Ûš]Ü‹›ÛŠ	ÛØÚË\ØÜ™Y[‰Ë[™U\]T™\Ù[][Û“ØÚÊNÂˆÝÙ\“[Ûš]Ü‹›ÛŠ	Ý[›ØÚË\ØÜ™Y[‰Ë[™U\]T™\Ù[][Û•[›ØÚÊNÂˆ\]T™\Ù[][Û”™XÛÝ™\žK˜\›J
+NÂˆ\]T™\Ù[][Û“ÙËš[™›Ê	Ø\›YYÛ™K\ÚÝ\]HÚ[™ÝÈ™XÛÝ™\žIÊNÂŸB‚™[˜Ý[Ûˆ\ÜÜÙU\]T™\Ù[][Û”™XÛÝ™\žJ
+Nˆ›ÚYÂˆYˆ
+]\]T™\Ù[][Û”™XÛÝ™\žR[š]X[^™Y
+H™]\›ŽÂˆÝÙ\“[Ûš]Ü‹œ™[[Ý™S\Ý[™\Š	ÛØÚË\ØÜ™Y[‰Ë[™U\]T™\Ù[][Û“ØÚÊNÂˆÝÙ\“[Ûš]Ü‹œ™[[Ý™S\Ý[™\Š	Ý[›ØÚË\ØÜ™Y[‰Ë[™U\]T™\Ù[][Û•[›ØÚÊNÂˆ\]T™\Ù[][Û”™XÛÝ™\žOË™\ÜÜÙJ
+NÂˆ\]T™\Ù[][Û”™XÛÝ™\žR[š]X[^™YH˜[ÙNÂŸB‚™[˜Ý[Ûˆ\Ñ›ØÝ\ÙY\Ú[™ÝÊ
+Nˆ›ÛÛX[ˆÂˆ™]\›ˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+KœÛÛYJ
+Ú[ŠHOˆ\Ñ›ØÝ\ÙY\ÛÛ[Ú[™ÝÊÚ[ŠJNÂŸB‚™[˜Ý[ÛˆÞ[˜Ð\›ØÝ\ÔÝ]J
+Nˆ›ÚYÂˆÛÛœÝ\›ØÝ\ÙYH\Ñ›ØÝ\ÙY\Ú[™ÝÊ
+NÂˆ›ÝšY\“[Ù[›ØÝ\Ô™Yœ™\Ú˜XÚÙ\‹œÞ[˜Ê\›ØÝ\ÙY
+NÂˆÙ]YÙ[\Û[™Ù\šXÙJ
+OËœÙ]\›ØÝ\ÙY
+\›ØÝ\ÙY
+NÂŸB‚™[˜Ý[ÛˆØÚY[P\›ØÝ\ÔÞ[˜Ê
+Nˆ›ÚYÂˆYˆ
+\›ØÝ\ÔÞ[˜Õ[Y\ŠHÛX\•[Y[Ý]
+\›ØÝ\ÔÞ[˜Õ[Y\ŠNÂˆ\›ØÝ\ÔÞ[˜Õ[Y\ˆHÙ][Y[Ý]
+
+
+HOˆÂˆ\›ØÝ\ÔÞ[˜Õ[Y\ˆH[ÂˆÞ[˜Ð\›ØÝ\ÔÝ]J
+NÂˆK
+NÂŸB‚˜\›ÛŠ	Øœ›ÝÜÙ\‹]Ú[™ÝËY›ØÝ\ÉË
+Ù]™[Ú[ŠHOˆÂˆ™]žTT[[YPY\“™]ÛÜšÔ™XÛÝ™\žOËŠ
+NÂˆYˆ
+Ú[ˆOOHXZ[•Ú[™ÝÔ™YŠH\]T™\Ù[][Û”™XÛÝ™\žOË›Û•Ú[™ÝÑ›ØÝ\ÙY
+
+NÂˆYˆ
+\›ØÝ\ÔÞ[˜Õ[Y\ŠHÂˆÛX\•[Y[Ý]
+\›ØÝ\ÔÞ[˜Õ[Y\ŠNÂˆ\›ØÝ\ÔÞ[˜Õ[Y\ˆH[ÂˆBˆÛÛœÝ›ØÝ\ÙY\ÛÛ[H\Ð\ÛÛ[Ú[™ÝÊÚ[ŠNÂˆÞ[˜Ð\›ØÝ\ÔÝ]J
+NÂˆYˆ
+›ØÝ\ÙY\ÛÛ[
+HÂˆÞ[˜ÔYÚ[“X\šÙ]›ÜXÝ]™SÝÛ™\ŠÌÌ
+NÂˆËÈÐ]][™Þ\Ý[HÙ][™ÜÈX^HÛÛ\]HÝ]ÚYHÚ[™Kˆ›ØÝ\È\ÈBˆËÈY]Y]K[Û›H˜[˜XÚÈØZÙK]\ˆXXÚ[™[™ÈYÚ[ˆ\È™KX\ÜÙ\ÜÙY]ˆËÈ›ÈÝÜ™Y˜[YHÜ›ÜÜÙ\ÈHÚ[™ÙH\Ë‚ˆÛÛœÝ[™[™ÑÚÜÝYÈH™]ÈÙ]
+ˆ
+Ù]ÚÜÝÙ]\[\˜XÝ[ÛœšYÙJ
+OËœ[™[™ÔÛ˜\ÚÝÊ
+HÏÈ×JK›X\
+ˆ
+È™\]Y\ÝJHOˆ™\]Y\Ý™ÚÜÝšYˆ
+Kˆ
+NÂˆ›Üˆ
+ÛÛœÝÚÜÝYÙˆ[™[™ÑÚÜÝYÊHÂˆÙ]ÚÜÝÙ]\Ú[™ÙP\Ê
+KØZÙJÚÜÝYÈÛÝ\˜ÙNˆ	Ù›ØÝ\ÉÈJNÂˆBˆBŸJNÂ‚˜\›ÛŠ	Øœ›ÝÜÙ\‹]Ú[™ÝËX›\‰Ë
+
+HOˆÂˆØÚY[P\›ØÝ\ÔÞ[˜Ê
+NÂŸJNÂ‚‹ËÈXXÈ8£&È9fç¹od¹ag9n¥H
+ÛÙ^™]šY]ÈŠNˆÚ[™ÝÈˆÛÜÙH:#ç9cezhny.#ya£y¬ê9a£XØÙ[\˜]Ü‚‹ËÈ9d#‹8£&È:gh™[™\™\ˆ9æ¡	ØÛÜÙK]X‹[Ü‹]Ú[™ÝÉÈ9­¢:-.K9/aˆÐ]]9ænùoeyo.yê¥ùëbB‹ËÈ:ggˆ\XÛÛ[9ê¥ùcèù.#y£ ˆXZ[“^[Ý]ÈÚYX˜\•Ú[™ÝÓ^[Ý]: f¹á)¹k ù.ë9¥íˆ8£&È9/&‚‹ËÈ9i,y¥b8à º/æzaã9kîz/æyìnùê¥ùcèùg*XZ[ˆ9/©ú(iH™Y›Ü™KZ[œ]Y]™[9ag9n¥K:+ëy.bHH9c§ùå'È›ÛB‹ËÈÛÜÙH
+Ú[‹˜ÛÜÙJ
+Jxà ˜\XÛÛ[9b)9k¦¹¥/¹g*9£"ze+¹¥í¹b.ù`fˆ8 %8 %X\šÐ\ÛÛ[Ú[™ÝÂ‹ËÈ9g*9ê¥ùcèù§¡:`(9k£9¢$9d#¹¢cy¢dù¨!Ëœ›ÝÜÙ\‹]Ú[™ÝËXÜ™X]Y9d#9«iHš\™H9¥íº/æ9ç"ù.#yb,8à ‚‹ËÈ9.áH\Ú[ŽˆÚ[‹Û[^9§+9l,y¬¨y§"yn¥9å*:#ç9ceKÝ›
+ÕÈ9g*:/æy.¦ùê¥ùcèù."¹c¡¹cìº(c9..¹l,y¦+ù¥è9¤ãy/g8à ‚šYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊHÂˆ\›ÛŠ	Øœ›ÝÜÙ\‹]Ú[™ÝËXÜ™X]Y	Ë
+Ù]™[Ú[ŠHOˆÂˆÚ[‹ÙXÛÛ[Ë›ÛŠ	Ø™Y›Ü™KZ[œ]Y]™[	Ë
+]™[[œ]
+HOˆÂˆYˆ
+[œ]\HOOH	ÚÙ^QÝÛ‰ÊH™]\›ŽÂˆËÈ9¬ê9¡#ù.#z) yæí9£©HYˆ
+\Ð\ÛÛ[Ú[™ÝÊÚ[ŠJH™]\›ˆ8 %8 %9k ù¦+È\HÝX\™ˆËÈ9£ä9bcH™]\›ˆ9/&¹¢¢¹d#¹îëyæ¡Ú[ˆ9¥-¹ê¡9¢$™]™\¸à ‚ˆÛÛœÝ\ÐÛÛ[ˆ›ÛÛX[ˆH\Ð\ÛÛ[Ú[™ÝÊÚ[ŠNÂˆYˆ
+\ÐÛÛ[
+H™]\›ŽÂˆÛÛœÝÛÛX›ÜÈHÙ]\ÚÜÝ]ÝÜ™J
+K™Ù]Y™™XÝ]™PÛÛX›ÜÊ	ØÛÜÙK]X‹[Ü‹]Ú[™ÝÉÊNÂˆYˆ
+XÛÛX›ÜËœÛÛYJ
+ÊHOˆX]Ú\Ñ[XÝ›Û’[œ]
+[œ]ÊJJH™]\›ŽÂˆ]™[œ™]™[Y˜][
+
+NÂˆYˆ
+]Ú[‹š\Ñ\Ý›ÞYY
+
+JHÚ[‹˜ÛÜÙJ
+NÂˆJNÂˆJNÂŸB‚™[˜Ý[Ûˆ\SXZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ê
+Nˆ›ÚYÂˆÛÛœÝÚ[ˆHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+]Ú[ˆÚ[‹š\Ñ\Ý›ÞYY
+
+HÚ[‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆÚ[‹ÙXÛÛ[ËœÙ]˜XÚÙÜ›Ý[™›Ý[™ÊXZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ð[ÝÙY
+NÂŸB‚™[˜Ý[ÛˆÙ]XZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ñ›ÜXÝ]™U\›Š\Ô[›š[™Õ\›Žˆ›ÛÛX[ŠNˆ›ÚYÂˆÛÛœÝ™^[ÝÙYHZ\Ô[›š[™Õ\›ŽÂˆYˆ
+XZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ð[ÝÙYOOH™^[ÝÙY
+H™]\›ŽÂˆXZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ð[ÝÙYH™^[ÝÙYÂˆ\SXZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ê
+NÂŸB‚™[˜Ý[Ûˆ›ØÝ\ÓXZ[•Ú[™ÝÊ
+Nˆ›ÛÛX[ˆÂˆÛÛœÝÚ[ˆHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+]Ú[ˆÚ[‹š\Ñ\Ý›ÞYY
+
+JH™]\›ˆ˜[ÙNÂˆYˆ
+]Ú[‹š\Õš\ÚX›J
+JHÚ[‹œÚÝÊ
+NÂˆYˆ
+Ú[‹š\ÓZ[š[Z^™Y
+
+JHÚ[‹œ™\ÝÜ™J
+NÂˆÚ[‹™›ØÝ\Ê
+NÂˆËÈXXÓÔÈ9."¹.ã¹am¹k ùbcycì9n¥9å*
+9i ˆÐ]]9£¢9§`ùd#¹æ¡9­cú)â9fj
+H9¢búaã9¢ïùfç¹á)¹à®K9cezghˆËÈÚ[‹™›ØÝ\Ê
+H9.#ycëúghù¢`9§"z, ùå*9¥®z`ïy¦+ùå*9¢-ù¦/¹o#Èº) yfç¹b,\¹æ¡9g.¹¦kËÝX[:+ëy.by. :!í8à ‚ˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊH\™›ØÝ\ÊÈÝX[ˆYHJNÂˆ™]\›ˆYNÂŸB‚™[˜Ý[Ûˆ›Ý[™YÙV›ÛÛQ˜XÝÜŠ˜XÝÜŽˆ[X™\ŠNˆ[X™\ˆÂˆ™]\›ˆX]œ›Ý[™
+˜XÝÜˆÈQÑWÖ“ÓÓWÑPÕÔ—ÔÕT
+H
+ˆQÑWÖ“ÓÓWÑPÕÔ—ÔÕTÂŸB‚™[˜Ý[ÛˆÛ[\YÙV›ÛÛQ˜XÝÜŠ˜XÝÜŽˆ[X™\ŠNˆ[X™\ˆÂˆ™]\›ˆX]›Z[ŠˆQÑWÖ“ÓÓWÑPÕÔ—ÓPVˆX]›X^
+QÑWÖ“ÓÓWÑPÕÔ—ÓRS‹›Ý[™YÙV›ÛÛQ˜XÝÜŠ˜XÝÜŠJKˆ
+NÂŸB‚™[˜Ý[Ûˆ\TYÙV›ÛÛS]™[
+XZ[•Ú[™ÝÎˆœ›ÝÜÙ\•Ú[™ÝË™^˜XÝÜŽˆ[X™\ŠNˆ[X™\ˆÂˆÛÛœÝ›ÛÛQ˜XÝÜˆHÛ[\YÙV›ÛÛQ˜XÝÜŠ™^˜XÝÜŠNÂˆ\P\X\˜[˜ÙUÕÚ[™ÝÊXZ[•Ú[™ÝËÈÚ[™ÝÖ›ÛÛNˆ›ÛÛQ˜XÝÜˆJNÂˆ™]\›ˆ›ÛÛQ˜XÝÜŽÂŸB‚‹ËÈ8¥ 8¥ Ý\ÝÛHT“ØÚ[YH
+Ú[™N‹ËË‹‹ˆ
+È9c¡¹cìˆ[XZÙ\Ž‹ËË‹‹ŠH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9oázhnùg*\Ú[”™XYJ
+H9.bùbcy¬ê9a£‚‹ËÈH™YÚ\Ý\‘Y\[šÔ›ÝØÛÛ
+
+H:, ÈÙ]\ÑY˜][›ÝØÛÛÛY[
+Ú[™ÝÜËÓ[^‹ËÈ9a¦y¬ê9a£:(jÈ™\ÚÝÜ[žNÈXXÓÔÈ:-l[™›Ëœ\Ý9«i:, ùå*9¦+ùag9n¥JB‹ËÈH\›ÛŠ	ÛÜ[‹]\›	ÊH9¦+ÈXXÓÔË[Û›H9.¢ù.í‹9a­ùd+ùbª9¥í¹.gù/&¹g*™XYH9.bùbcHš\™K‹ËÈ9£ä9bcH]XÚ9¢cz ïy£©y/cÂØ]ÚÚ[™U™\œÚ[Û”Ý\\™\Ý[
+
+NÂšYˆ
+Z\ÐÚ[™T\œÛÛ˜[[[YJ
+JH™YÚ\Ý\‘Y\[šÔ›ÝØÛÛ
+
+NÂ˜\›ÛŠ	ÛÜ[‹]\›	Ë
+]™[\›
+HOˆÂˆ]™[œ™]™[Y˜][
+
+NÂˆ[™R[˜ÛÛZ[™ÑY\[šÊ\›	ÛÜ[‹]\›	ÊNÂŸJNÂ‚‹ËÈXXÓÔÈš[™\ˆ¹¢dùo 9¥®yo#È8¡¤ˆÚ[™Hˆ9aiycèÎ¹hì9¦#ˆÑ[™QØÝ[Y[\\È9£©ycåÂ‹ËÈX›XË™›Û\ˆ9d#‹š[™\ˆ9¢¢¹æë¹oez-ëùo¡:`&º/áÈÜ[‹Yš[H9.¢ù.í¹£ª:/áù§iH
+9a­ùd+ùbªÈ9mìº/ä:(c‹ËÈ:`ïz-l9«i:-ëùo¡
+xà ¹.¢ù.í¹.gùcëú ïz(ªù¥¡ù.íº)é¹cäN‹˜Ú[™H9¡#ú+áº-l9cã9aîú(áyaiK9am¹/fy¥¡ù.í‚‹ËÈ:gfznæ9oïyåixà ‚‹ËÂ‹ËÈ9oázhnùg*\Ú[”™XYJ
+H9.bùbcH]XÚ9.#ˆÜ[‹]\›9d#9ä!ˆ
+9a­ùd+ùbª9¥êy.£ˆ™XYH:)é¹cäJxà ‚‹ËÂ‹ËÈÚ[™ÝÜÈÈ[^9.#z)é¹cäy«i9.¢ù.í‹9¥è:g 9nlùcì9b!¹¥+øà ™œËœÝ]Þ[˜È9¦+ùd#9«iz, ùå*9..ú/æùê"Â‹ËÈ:f.ùhgˆL\Ë9cê¹g*9å*9¢-ù..ùbª9à®Hš[™\ˆ9¥íº)é¹cäK:gg¹àëz-ëùo¡9cëù£©ycåøà ‚˜\›ÛŠ	ÛÜ[‹Yš[IË
+]™[š[T]
+HOˆÂˆ]™[œ™]™[Y˜][
+
+NÂˆËÈXXÈ9cã9aîÈ˜Ú[™JÑ[™QØÝ[Y[\\È9alú e
+Nº(áyaiH
+È9`g:gh9¥¡ù.í¹kf9g*9 )ÂˆËÈ9¨(zj£9g*9i!9ä!¹fj9a¡z`ê9k£9¢$8à ‚ˆYˆ
+š[T]ÓÝÙ\Ø\ÙJ
+K™[™ÕÚ]
+	Ë˜Ú[™IÊJHÂˆ›ÚY[™R[˜ÛÛZ[™ÐÚ[™Qš[Jš[T]	ÛÜ[‹Yš[IÊNÂˆ™]\›ŽÂˆBˆžHÂˆYˆ
+YœËœÝ]Þ[˜Êš[T]
+Kš\Ñ\™XÝÜžJ
+JH™]\›ŽÂˆHØ]ÚÂˆ™]\›ŽÈËÈ:-ëùo¡9.#ykf9g*È9§`úfd9.#z-¬È8¡¤ˆ:gfznæ9oïyåiBˆBˆ[™R[˜ÛÛZ[™ÓÜ[‘›Û\Šš[T]	ÛÜ[‹Yš[IÊNÂŸJNÂ‚‹ËÈ8¥ 8¥ Ú[™ÛH[œÝ[˜ÙHØÚÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‹ËÈ9«hùn.]ˆ9.#ˆXÚØYÙY9. 9o¢ùd+ùå*8à º/æy¦+ù¢¢ˆÔÈ9fè9­ìzdïŠÚ[™N‹ËÙ›ØÝ\È9£¢9§`ú/å9fçˆÂ‹ËÈÚ[™N‹ËÜÙ\ÜÚ[Ûˆ9ëbJKÈ9cìúe+ˆº`&º/áÈÚ[™H9¢dùo ˆ: #9¢âz-mùæ¡9ë+9.£9.*º/æùê"È™Y\™XÝ9¢$‹ËÈº f¹á)¹mìº/ä:(c9ê¥ùcèÈˆ9æ¡9e+ù. 9§.¹b-¸ %8 %9.)9.*¹âë9êâÈ[XÝ›Ûˆ:/æùê"ù.búeí9¬¨y§"yb*ùæ¡:`&º`dú ïy.©9£©yá)¹à®xà ‚‹ËÂ‹ËÈ:e y£"H›]›Üˆ9b!¹gçÊ™\ÛÛ™TÚ[™ÛR[œÝ[˜ÙSØÚÕ\Ù\‘]Q\ŠNœXÚØYÙY:e yç'ùk§‚‹ËÈ\Ù\‘]J™[X\ÙH9.búeí9ceyk§¹/¢ÊNÙ]ˆ:e H\Ù\‘]O‹Ù]‹\Ú[™ÛKZ[œÝ[˜ÙK[ØÚØ‹ËÈ9kd9æë¹oeJ]ˆ9.búeí9ceyk§¹/¢øà y­ìzdïˆ™Y\™XÝ9/çy£ y§"y¥b
+xà ¹fè9«i]ˆ9.#¹«hùo#ùâb9cëù.éyalyn¤Â‹ËÈ9cã9o 8 %8 %:/æy¦+ù¦#¹èk¹¥+ù£ yæ¡9méy/g9­`K:-ê9k§¹/¢ùnm¹cäyå,HÔS]HÐS
+È\ÞWÝ[Y[Ý]8à \ØÚY[\‚‹ËÈˆ9î©ùc§ùkd:+©:h¡¸à X]]™\XÙ[Y[\™]žH9ëby¥è¹§"y.ìº(ày¥-¹¥fÊ9.#ˆK\\ÜÚ]™H9alyn¤ùi&¹o ‹ËÈ9d#9. 9ieÊxà ŒŒ‹LËLNH9¦ïº+ªH]ˆ9.#ˆXÚØYÙY9¢¨¹d#9. 9¢¢ºe J9/ëˆ]ˆ9­ìzdï¹a­ùd+ùbª:aãyi#B‹ËÈ9k§¹/¢ÊK:+ëù/)9.¡ˆ]ˆ
+È™[X\ÙH9cã9o Œ‹LËLŒ9£"H›]›Üˆ9b!¹gçù h¹i#K9.)9.*¹æë¹¨!ùd#9¥í¹/çy/cøà ‚‹ËÂ‹ËÈ]ˆK\\ÜÚ]™X9.ãyk£9aj:-ìú/áúe N¹k ùæ¡9ak9o 9idyî©¹¦+ù.#ˆš[X\žH9aly.ªù¥l9£k¹.îù¡#ùi&¹o 9. 9.*‚‹ËÈš[X\žH9d#¹cëùnmº(c9.îù¡#ùi&¹.*ˆ™]šY]øà ¹«i9ª(yo#ù¬¨y§"HÙXÛÛ™Z[œÝ[˜ÙH™Y\™XÝY\[šÂ‹ËÈ:$/yb,9dê¹.*¹k§¹/¢ùå,yodùbcHÔÈ9ccú+«¹¬ê9a£9od¹lg¹a¬ùk¦¸à ›ØØ[ˆ:i¥¹«(yo 9n¤ù¥í¹/&¹cêº+îù¨.9kîB‹ËÈØÚ[XWÝ™\œÚ[Û¸à yk£9¥mZYÜ˜][Ûˆ\ÝÜžH9.#ˆÔSØÛÛ\[š[ÛˆÈ[[YH9£!ùî®NÂ‹ËÈ[™[™ÈÈ:-¡ybcHÈšY:`ïy¢ä¹îçyd+ùbª8à œ\ÜÚ]™H:!ê¹mìy.#z/àyéîËÜ™\Z\ˆØÚ[XK9nm¹å*9i&‚‹ËÈ™XY\ˆX\ÙH:f.ù«h¹.bùd#¹æ¡š[X\žH9¢¨º-äHZYÜ˜][Û¸à ‚‹ËÈ:f¥9é®ù¥l9£k¹k§¹/¢ú-lKZ\ÛÛ]YÏO9d#ykeÏ—X
+9âë9êâÈ\Ù\‘]H8¡¤ˆ9âë9êâúe ygçË:)àHØÜËÙ]‹\[\ËÙ\ÚÝÜY]™[ÜY[›Y
+xà ‚šYˆ
+ˆÙ]Ú[™U™\œÚ[Û“ØÚÔØÛÜJ
+HOOH[ˆÚÝ[™\]Y\ÝÚ[™ÛR[œÝ[˜ÙSØÚÊÂˆ\ÔXÚØYÙYˆ\š\ÔXÚØYÙYˆØÚY[\”\ÜÚ]™Nˆ›ØÙ\ÜË™[‹–ÔÐÒQST—ÔTÔÒU‘HOOH	ÌIËˆJBŠHÂˆÛÛœÝ™X[\Ù\‘]Q\ˆH\™Ù]]
+	Ý\Ù\‘]IÊNÂˆÛÛœÝØÚÔØÛÜQ\ˆBˆÙ]Ú[™U™\œÚ[Û“ØÚÔØÛÜJ
+HOOH	Ü›Ùš[IÂˆÈ™X[\Ù\‘]Q\‚ˆˆÙ]Ú[™U™\œÚ[Û“ØÚÔØÛÜJ
+HOOH	Ù]‰ÂˆÈ]š›Ú[Š™X[\Ù\‘]Q\‹	Ù]‹\Ú[™ÛKZ[œÝ[˜ÙK[ØÚÉÊBˆˆ™\ÛÛ™TÚ[™ÛR[œÝ[˜ÙSØÚÕ\Ù\‘]Q\ŠÂˆ\ÔXÚØYÙYˆ\š\ÔXÚØYÙYˆ\Ù\‘]Q\Žˆ™X[\Ù\‘]Q\‹ˆJNÂˆ]ÛÝSØÚÎˆ›ÛÛX[ŽÂˆYˆ
+ØÚÔØÛÜQ\ˆOOH™X[\Ù\‘]Q\ŠHÂˆÛÝSØÚÈH\œ™\]Y\ÝÚ[™ÛR[œÝ[˜ÙSØÚÊ
+NÂˆH[ÙHÂˆËÈ[XÝ›Ûˆ9¬¨y§"z!ê¹k¦¹.bze y/g9å*9gçùæ¡TNºe y¥¡ù.íˆÈÛØÚÙ]9£"z, ùå*9¥í¹b.ùæ¡\Ù\‘]BˆËÈ:-ëùo¡9å'ù¢$8à º/æzaã9g*9d#9«iyê¥ùcèùa¡y.-9¥í¹b!ù£hˆ\Ù\‘]H9a£z/æ9c§ø %8 %9..ú/æùê"ùceyî¯ùê"Ë9.+zeíˆËÈ9.#y/&¹§"yam¹k È”È:)à¹kçùb,9.-9¥í¹`/úe ynî¹êâùd#¹a¡z`ê:`&º`dù.#ˆ\Ù\‘]H9d#¹îëycå¹`/9¥è9aløà ‚ˆœË›ZÙ\”Þ[˜ÊØÚÔØÛÜQ\‹È™XÝ\œÚ]™NˆYHJNÂˆ\œÙ]]
+	Ý\Ù\‘]IËØÚÔØÛÜQ\ŠNÂˆžHÂˆÛÝSØÚÈH\œ™\]Y\ÝÚ[™ÛR[œÝ[˜ÙSØÚÊ
+NÂˆHš[˜[HÂˆ\œÙ]]
+	Ý\Ù\‘]IË™X[\Ù\‘]Q\ŠNÂˆBˆBˆYˆ
+YÛÝSØÚÊHÂˆX\šÑ\ÚÝÜ]”Ý\\˜Z[Y
+ˆ	ÔÒS‘ÓWÒS”ÕSÑWÓÕÓ‘Q	Ëˆ	Ð[›Ý\ˆÚ[™H[œÝ[˜ÙH[™XYHÝÛœÈ\ÈÚ[™ÛKZ[œÝ[˜ÙHØÚÈØÛÜK‰ËˆÈ\Ù\‘]Q\Žˆ™X[\Ù\‘]Q\‹ØÚÔØÛÜQ\ˆKˆ
+NÂˆ\œ]Z]
+
+NÂˆH[ÙHÂˆ™XÛÜ™Ú[™U™\œÚ[ÛXÝ]™J
+NÂˆ\›ÛŠ	ÜÙXÛÛ™Z[œÝ[˜ÙIË
+Ù]™[\™ÝŠHOˆÂˆËÈÚ[™ÝÜÎˆ9å*9¢-ùà®HÚ[™N‹ËÊ9¢%¹c¡¹cìˆ[XZÙ\Ž‹ËÊzdï¹£©HÈ9cìúe+ˆº`&º/áÈÚ[™H9¢dùo ˆ9¥í‹ˆËÈÔÈ9/&¹a£z-mù. 9.*¹§+\9k§¹/¢ÎÈ9cey/¢úe y¢¢¹k È™Y\™XÝ9¢$ÙXÛÛ™Z[œÝ[˜ÙH9.¢ù.í‹ˆËÈT“9¢%ˆK[Ü[‹Y›Û\ˆ9cà¹¥l:`ïyg*\™Ýˆ:aã8à ›XXÓÔÈ9.#z-l:/æy.*º-ëùo¡
+:-lÜ[‹]\›
+KˆËÈ[^9å,H™\ÚÝÜ9a¬ùk¦¸à ‚ˆËÂˆËÈ9.)9ìnùaiycèù.¤¹¥©H
+[ÙHYŠN˜\™Ýˆ9g*9ã¬9k§ºaã9cê¹/&¹§"yam¹. 9/a¹i ¹§§9¢bùméydoy.é:(c9d#9¥í‚ˆËÈ9îæy.¡¹.)9éãK9/&9abY\[šÈT“
+9c¡¹cìº+ëy.byab:(c[XZÙ\Ž‹ËÈ9«åK[Ü[‹Y›Û\‚ˆËÈ9¥êy. 9.*¹âb9§+9."¹î¯ÊK:`oùacycã\Ü]ÚÈ9cã˜]šYØ]H:+ªH™[™\™\ˆ9ç"ùb,9. :eêº #:/áÂˆËÈ9æ¡9.+zeí9  xà ‚ˆÛÛœÝ\›Hš[™Y\[šÒ[\™ÝŠ\™ÝŠNÂˆYˆ
+\›
+HÂˆ™YXÝÛÛœÝ[YYY\[šÒ[\™ÝŠ\™Ý‹\›
+NÂˆ[™R[˜ÛÛZ[™ÑY\[šÊ\›	ÜÙXÛÛ™Z[œÝ[˜ÙIÊNÂˆH[ÙHÂˆÛÛœÝÜ[‘›Û\ˆHš[™Ü[‘›Û\’[\™ÝŠ\™ÝŠNÂˆYˆ
+Ü[‘›Û\ŠHÂˆ[™R[˜ÛÛZ[™ÓÜ[‘›Û\ŠÜ[‘›Û\‹	ÜÙXÛÛ™Z[œÝ[˜ÙIÊNÂˆH[ÙHÂˆËÈ9cã9aîùmì¹alú e9æ¡˜Ú[™JÚ[™ÝÜÊNº(áyaiH
+È9`g:gh8à ‚ˆÛÛœÝÜ[”Ú\™Qš[HHš[™Ü[”Ú\™Qš[R[\™ÝŠ\™ÝŠNÂˆYˆ
+Ü[”Ú\™Qš[JHÂˆ[™R[˜ÛÛZ[™ÔÚ\™Qš[JÜ[”Ú\™Qš[K	ÜÙXÛÛ™Z[œÝ[˜ÙIÊNÂˆH[ÙHÂˆÛÛœÝÚ[™Qš[HHš[™Ú[™Qš[R[\™ÝŠ\™ÝŠNÂˆYˆ
+Ú[™Qš[JH›ÚY[™R[˜ÛÛZ[™ÐÚ[™Qš[JÚ[™Qš[K	ÜÙXÛÛ™Z[œÝ[˜ÙIÊNÂˆBˆBˆBˆËÈ9êëùà®y®!ycezf.ù¥«y§'úeí
+Ý\\Ú[™ÝÐÜ™X][Û[ÝÙYY˜[ÙJyé y«h¹nî¹ê¥Î‚ˆËÈ9d)¹b&H™[ØY9æ¡9ª(ygeùî©ÈÙ[™Þ[˜È9¢o¹.#yb,[™\ˆ9æí9£©yæoylcË9.%9ê¥ùcèù/&¹n)¹ç`ˆËÈ9àæ9á&yêëùà®yîåz/áÈ¹¢ây.#yb,9®!ycey.#y¥/º(c¹æ¡:f.ù¥«z+ëy.bxà ™Y\[[šÈ9b!¹cäy.#ycåùolydãBˆËÈ
+Y\[šÈ9cê¹d$ymì¹§"yê¥ùcèù¢¥z`$‹ù£¤ºf'Ë9.#ynî¹ê¥Êxà ‚ˆYˆ
+Ý\\Ú[™ÝÐÜ™X][Û[ÝÙY	‰ˆY›ØÝ\ÓXZ[•Ú[™ÝÊ
+JHÂˆÜ™X]UÚ[™ÝÊ
+NÂˆBˆJNÂˆBŸB‚šYˆ
+ˆ\š\ÔÚ[™ÛR[œÝ[˜ÙSØÚÊ
+Hˆ
+Ù]Ú[™U™\œÚ[Û“ØÚÔØÛÜJ
+HOOH[	‰‚ˆ\ÚÝ[™\]Y\ÝÚ[™ÛR[œÝ[˜ÙSØÚÊÂˆ\ÔXÚØYÙYˆ\š\ÔXÚØYÙYˆØÚY[\”\ÜÚ]™Nˆ›ØÙ\ÜË™[‹–ÔÐÒQST—ÔTÔÒU‘HOOH	ÌIËˆJJBŠBˆ[]™\Ú[™U™\œÚ[Û“Ü[‘]™[Ê
+NÂ‚‹ËÈ9a­ùd+ùbª\™Ýˆ9¢jù£ãÈ8 %Ú[™ÝÜÈ9."ºi¥¹«(yà®zdï¹£©HÈ9cìúe+ˆº`&º/áÈÚ[™H9¢dùo ˆ9d+ùbª\‹ËÈ9¥í‹T“9¢%ˆK[Ü[‹Y›Û\ˆ9g*›ØÙ\ÜË˜\™Ýˆ9§*ùl/¸à ›XXÓÔÈY\[šÈ:-lÜ[‹]\›‹ËÈ
+9mì¹g*9."ºghˆ]XÚ
+K:/æzaã9¢jùb,9.gù.#y/&ºaãyi#H\Ü]ÚÈK[Ü[‹Y›Û\ˆ9¦+ÈÚ[™ÝÜË[Û›B‹ËÈ9aiycèÈ
+XXÈ:-lÒ][PÛÛ[\\ÈÈÜ[‹Yš[H9.¢ù.íŠK9.gù.#y/&¹g*XXÈ\™Ýˆ9aî¹ã¬8à ‚‹ËÂ‹ËÈ9d#ÙXÛÛ™Z[œÝ[˜ÙN¹.)9ìnùaiycèù.¤¹¥©K9/&9abY\[šÈT“8à ‚šYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊHÂˆÛÛœÝÛÛÝ\\›Hš[™Y\[šÒ[\™ÝŠ›ØÙ\ÜË˜\™ÝŠNÂˆYˆ
+ÛÛÝ\\›
+HÂˆ™YXÝÛÛœÝ[YYY\[šÒ[\™ÝŠ›ØÙ\ÜË˜\™Ý‹ÛÛÝ\\›
+NÂˆ[™R[˜ÛÛZ[™ÑY\[šÊÛÛÝ\\›	ØÛÛ\Ý\X\™Ý‰ÊNÂˆH[ÙHÂˆÛÛœÝÛÛÝ\Ü[‘›Û\ˆHš[™Ü[‘›Û\’[\™ÝŠ›ØÙ\ÜË˜\™ÝŠNÂˆYˆ
+ÛÛÝ\Ü[‘›Û\ŠHÂˆ[™R[˜ÛÛZ[™ÓÜ[‘›Û\ŠÛÛÝ\Ü[‘›Û\‹	ØÛÛ\Ý\X\™Ý‰ÊNÂˆH[ÙHÂˆËÈ9cã9aîùmì¹alú e9æ¡˜Ú[™H9a­ùd+ùbª
+Ú[™ÝÜÊNº(áyaiycäyå'ùg*9ê¥ùcèùb&ùnî¹bcK:i¥¹n)ÂˆËÈ\ÝÞ[˜È9clùd*ù¥¬9¡#ú+á‹:gh¹§oùë+9. 9n)ùl,y/cJ:)á9b&HÊxà ‚ˆÛÛœÝÛÛÝ\Ú\™Qš[HHš[™Ü[”Ú\™Qš[R[\™ÝŠ›ØÙ\ÜË˜\™ÝŠNÂˆYˆ
+ÛÛÝ\Ú\™Qš[JHÂˆ[™R[˜ÛÛZ[™ÔÚ\™Qš[JÛÛÝ\Ú\™Qš[K	ØÛÛ\Ý\X\™Ý‰ÊNÂˆH[ÙHÂˆÛÛœÝÛÛÝ\Ú[™HHš[™Ú[™Qš[R[\™ÝŠ›ØÙ\ÜË˜\™ÝŠNÂˆYˆ
+ÛÛÝ\Ú[™JH›ÚY[™R[˜ÛÛZ[™ÐÚ[™Qš[JÛÛÝ\Ú[™K	ØÛÛ\Ý\X\™Ý‰ÊNÂˆBˆBˆBŸB‚‹ËÈ9d+ùbª9¥í¹l'z+åz!ê¹¬ê9a£Ú[™ÝÜÈ9cìúe+º#ç9ceJ9¦/¹é.¹¥¡ù¨b:-l”S‘ÓSQJxà ™š\™KX[™Y›Ü™Ù]‹ËÈ9k£9aj9.#zf.ùhg¹d+ùbª9­`yê"Îùi,z-)y.áHØ\›ˆÙøà º+éº)àH›Û\ÛÛ^Y[KÈ9ª(ygeùi-9¬ê:aâ¸à ‚‹ËÂ‹ËÈ9/cyïk¹g*Ú[™ÛKZ[œÝ[˜ÙH:e y.bùd#‹9/aˆ\œ]Z]
+
+H9.#y.+y«hºhm¹l`¹d#9«iy.èùè K9ë+9.£9k§¹/¢Â‹ËÈ
+ÛÝSØÚÏY˜[ÙJy.ãy/&¹¢iú(c9b,:/æzaã8 %8 %9."y.*º!ê¹¡":`ïy¦+ùn`¹ëbH
+È9aj9d'ºe&K:aãyi#y¢iú(c9¥è9k¬Ë‹ËÈ9.#y..¹«i9b¨:eê9£©øà ‚šYˆ
+\š\ÔXÚØYÙY
+HÂˆ›ÚY™YÚ\Ý\‘›Û\ÛÛ^Y[J
+NÂˆËÈÚ[™ÝÜÈ˜Ú[™H9¥¡ù.í¹alú e:!ê¹¬ê9a£
+9cã9aîú(áyaiy¡#ú+áŠxà ¹d#9«/ˆ™\ÝYY™›Ü9cèùo¡8à ‚ˆ™YÚ\Ý\Ú[™Qš[P\ÜÛØÚX][ÛŠ
+NÂˆËÈ9dàyâc9¥.yd#yoêù£mù¥®yo#ú!ê¹¡"
+XZÙ\‹›šÈ8¡¤ˆÚ[™K›šÎùmëºaãù¦í9¥¬9.#zaãz-äyk¢z(áyfjˆËÈ9kf:aãùå*9¢-úgh:/æzaã9£h¹d#Jxà ¹d#9«/ˆ™\ÝYY™›Ü9cèùo¡:+éº)àyª(ygeùi-9¬ê:aâ¸à ‚ˆ›ÚYX[Ú[™ÝÜÔÚÜÝ]Ê
+NÂŸB‚˜ÛÛœÝÜ™X]UÚ[™ÝÈH
+
+HOˆÂˆ]™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\Žˆ™]\›•\O\[ÙˆÙ][Y[Ý]ˆ[H[ÂˆÛÛœÝ]›Ü›SÜ[ÛœÈBˆ›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÂˆÈÈ]P˜\”Ý[Nˆ	ÚY[‰È\ÈÛÛœÝ˜Y™šXÓYÚÜÚ][ÛŽˆÈˆL‹NˆMˆHBˆˆÈœ˜[YNˆ˜[ÙHNÂ‚ˆËÈ:i¥¹«(yà®yaîù¦+ùd)º`#ù/(9îæzhmzgh¸à ºnæ:+©YJÝØ[ÝÏy.#z`#ù/(
+K9ëby.íù.£ˆ[XÝ›ÛˆXXÓÔÂˆËÈXØÙ\š\œÝ[Ý\ÙH:næ:+©9`/ùå*9¢-ùg*Ù][™ÜÈ8¡¤ˆ9ê¥ùcèú(c9..ºaã9cëùalù£¢xà ›XXÓÔÈ9."‚ˆËÈXØÙ\š\œÝ[Ý\ÙH9¦+ÈÛØÛØH9î©ùcà¹¥l9cê¹g*9ê¥ùcèùb&ùnî¹¥íº+îù. 9«(K9¢`9.éy.ãˆ\Ù\‘]BˆËÈ:$/yææ9¥¡ù.íº+îùcåŠ™[™\™\ˆ9«ãù«(y¥.ybª:`ïy/&ˆTÈ9d#9«iz$/yææ
+K9å*9¢-ùb!ùk£9o 9alúg :) zaãyd+ÂˆËÈ9n¥9å*XXÓÔÈ9/©ù¢cyå'ù¥b8à •Ú[™ÝÜÈ9."¹«i9cà¹¥l9¦+È›Ë[Ü
+Ú›ÛZ][H9oïyåiJKÚ[™ÝÜÈ9/©ÂˆËÈ9¥b9§§9å,H™[™\™\ˆ9æ¡ÝØ[ÝÐXÝ]˜][ÛÛXÚÈÓHY\\ˆ9¢où£©K9clù¥í¹å'ù¥b8à ‚ˆÛÛœÝÝØ[ÝÐXÝ]˜][ÛÛXÚÈH™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+KœÝØ[ÝÐXÝ]˜][ÛÛXÚÎÂ‚ˆËÈÚ[™ÝÜÈ\Ù\ÈH™[™\™\ˆ[YK[[ÙHZ\œ›Üˆ™Y›Ü™HHš\œÝœ›ÝÜÙ\•Ú[™ÝÈ^\ÝÎÂˆËÈZ\ÜÚ[™ËÚ[˜[YZ\œ›ÜœÈ[™Ý\ˆ]›Ü›\ÈÙY\H˜]]™HÔË][YH˜[˜XÚË‚ˆËÈXXÎ¹b&ùnî¹§'ùclú`#ù¦#¹n¥JÜÚYX˜\ˆ9§d:-*
+[XÝ›ÛˆÙ]˜XÚÙÜ›Ý[™ÛÛÜˆ:/ä:(c9¥í¹¥.H[H9.#ycëúgh9¦+ÈšXœ˜[˜ÞH9.#z`#ùhàyî®9æ¡9¨.yfèúggˆÒS‘H9æ«º ©›ÙH9.#z`#ù¦#¹/&º!ê¹á-¹æå¹/cË:)áº)ây¥è9olydãJBˆÛÛœÝ\œÚ\ÝY[YHH›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰ÈÈ™XYÚ[™ÝÕ[YTÛ˜\ÚÝ
+
+Hˆ[ÂˆÛÛœÝ\Ñ\šÈBˆ›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰ÂˆÈ™\ÛÛ™P\[YR\Ñ\šÊˆ˜]]™U[YKœÚÝ[\ÙQ\šÐÛÛÜœËˆ\œÚ\ÝY[YOË›[ÙKˆ\œÚ\ÝY[YOËœ™\ÛÛ™Y\Ñ\šËˆ
+Bˆˆ˜]]™U[YKœÚÝ[\ÙQ\šÐÛÛÜœÎÂˆÛÛœÝ™ÐÛÛÜˆH›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÈÈ	ÈÌ	Èˆ\Ñ\šÈÈ	ÈÌYŒYŒYIÈˆ	ÈÙŽŽ‰ÎÂˆÛÛœÝÚ[˜XÚÙ›ÜÛÛ™šYÈH™\ÛÛ™UšXœ˜[˜ÞPÛÛ™šYÊˆ\œÚ\ÝY[YOË™˜[Z[RYÏÈ	ØÚ[™IËˆ\Ñ\šËˆ›ØÙ\ÜËœ]›Ü›Kˆ
+NÂ‚ˆËÈÚ[™ÝÈÝ]H\œÚ\Ý[˜ÙH
+‹UÔÕLJNˆ™[Y[X™\œÈÜÚ][ÛˆÈÚ^™HÈX^[Z^™YˆËÈÈ[ØÜ™Y[ˆXÜ›ÜÜÈ][˜Ú\Ëˆ˜[È˜XÚÈÈHY˜][È™[ÝÈÛˆš\œÝˆËÈ][˜ÚÜˆYˆHØ]™YÝ]H\ÈÙ™‹\ØÜ™Y[ˆ
+HXˆÛ[\È›Üˆ\ÊK‚ˆËÈÝÜ˜YÙNˆ\Ù\‘]O‹ÝÚ[™ÝË\Ý]KšœÛÛ‚ˆËÈ9¥.yå*:hm¹l`ˆ[\Ü: #9.#y¦+ú/ä:(c9¥íˆ™\]Z\™H8 %8 %š]H9¢cz ïH[™H:/æÈXZ[ˆ9.©ùâj{ï#ˆËÈ9d)¹b&HXÚØYÙY\9fèœHÚ\ÝY9n ùl`
+È[XÝ›Û‹\XÚØYÙ\ˆ9cê¹¢jÂˆËÈ\ËÙ\ÚÝÜÛ›ÙWÛ[Ù[\È: #9¢ïù.#yb,:/æy.*¹c!{ï#:/ä:(c9¥í¹¢©HØ[››Ýš[™[Ù[xà ‚ˆÛÛœÝXZ[•Ú[™ÝÔÝ]Qš[HH	ÝÚ[™ÝË\Ý]KšœÛÛ‰ÎÂˆËÈ™XYH›YÈ™Y›Ü™HHÙY\\ˆ˜[Y]\È›Ý[™Îˆ]\ØØ\™È\ÓX^[Z^™YˆËÈ[Û™ÈÚ]Ù™‹\ØÜ™Y[ˆ›Ý[™ËÚXÚ\È^XÝHHYXÛÜÙYÈ[Ûš]Ü‹X\ÛY\ˆËÈ™[][˜ÚØ\ÙHÚ\™HÙHÝ[Ø[ÈÛÛYH˜XÚÈX^[Z^™Y‚ˆÛÛœÝ\œÚ\ÝYX^[Z^™YH™XY\œÚ\ÝYÚ[™ÝÓX^[Z^™Y
+ˆ]š›Ú[Š\™Ù]]
+	Ý\Ù\‘]IÊKXZ[•Ú[™ÝÔÝ]Qš[JKˆ
+NÂˆÛÛœÝXZ[•Ú[™ÝÔÝ]HHÚ[™ÝÔÝ]RÙY\\ŠÂˆš[NˆXZ[•Ú[™ÝÔÝ]Qš[KˆY˜][ÚYˆLŽˆY˜][ZYÚˆˆËÈ\Z[™È[ØÜ™Y[ˆÚ[HHY[ˆXXÓÔÈÚ[™ÝÈ\ÈÝ[Ý\[™ÈØ[‚ˆËÈX]™HH™\ÝÜ™YÚ[™ÝÈÚ]Ý]˜]]™H˜Y™šXÈYÚË‚ˆ[ØÜ™Y[Žˆ›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ËˆJNÂˆÛÛœÝÚÝ[™\ÝÜ™SXXÑ[ØÜ™Y[ˆH›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰È	‰ˆXZ[•Ú[™ÝÔÝ]Kš\Ñ[ØÜ™Y[ŽÂˆÛÛœÝÚÝ[™\ÝÜ™SX^[Z^™YBˆ\ÚÝ[™\ÝÜ™SXXÑ[ØÜ™Y[ˆ	‰ˆ
+\œÚ\ÝYX^[Z^™Y›ÛÛX[ŠXZ[•Ú[™ÝÔÝ]Kš\ÓX^[Z^™Y
+JNÂ‚ˆÛÛœÝXZ[•Ú[™ÝÈH™]Èœ›ÝÜÙ\•Ú[™ÝÊÂˆˆXZ[•Ú[™ÝÔÝ]KžˆNˆXZ[•Ú[™ÝÔÝ]KžKˆÚYˆXZ[•Ú[™ÝÔÝ]KÚYˆZYÚˆXZ[•Ú[™ÝÔÝ]KšZYÚˆZ[•ÚYˆˆZ[’ZYÚˆŒˆ]Nˆ”S‘ÓSQKˆXÛÛŽˆ\š\ÔXÚØYÙYˆÈ]š›Ú[Š›ØÙ\ÜËœ™\ÛÝ\˜Ù\Ô]	ÚXÛÛ‹œ™ÉÊBˆˆ]š›Ú[Š×Ù\›˜[YK	Ë‹‹Ë‹‹Ü™\ÛÝ\˜Ù\ËÚXÛÛ‹œ™ÉÊKˆ]]ÒYSY[P˜\ŽˆYKˆÚÝÎˆ˜[ÙKˆ˜XÚÙÜ›Ý[™ÛÛÜŽˆ™ÐÛÛÜ‹ˆ‹‹Š›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰È	‰ˆÚ[˜XÚÙ›ÜÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[ˆÈÂˆ˜XÚÙÜ›Ý[™X]\šX[ˆÚ[˜XÚÙ›ÜÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[ˆ˜XÚÙÜ›Ý[™ÛÛÜŽˆÚ[˜XÚÙ›ÜÛÛ™šYË˜˜XÚÙÜ›Ý[™ÛÛÜ‹ˆBˆˆßJKˆ‹‹Š›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÈÈÈšXœ˜[˜ÞNˆ	ÚY	È\ÈÛÛœÝHˆßJKËÈ9b&ùnî¹§'ù§d:-*9.#¹ï.¹ç yk¦¹ê/ù. :!í
+Y
+Nú/ä:(c9¥í¹£"y..úh¦9¥ãùîãÈ\UÚ[™ÝÕšXœ˜[˜ÞH9/ë¹«hÂˆXØÙ\š\œÝ[Ý\ÙNˆ\ÝØ[ÝÐXÝ]˜][ÛÛXÚËˆ‹‹œ]›Ü›SÜ[ÛœËˆÙX”™Y™\™[˜Ù\ÎˆÂˆ™[ØYˆ]š›Ú[Š×Ù\›˜[YK	Ü™[ØYšœÉÊKˆY][Û˜[\™Ý[Y[ÎˆÂˆÜ™X]UÚ[™ÝÐ˜XÚÙ›ÜX]\šX[\™Ý[Y[
+Ú[˜XÚÙ›ÜÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[ÏÈ	Û›Û™IÊKˆKˆÜ[ÚXÚÎˆ˜[ÙKˆËÈ:næ:+©9/çyåfHÚ›ÛZ][H9d#¹cì:" ¹­`{ï&ùcê¹§"HXÝ]™H\›ˆ9¢%ˆ\›Z[˜[Ü˜XÙH9§'úeí9¢cyå,BˆËÈÙ]XZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ñ›ÜXÝ]™U\›ˆ9.-9¥í¹alúeë{ï#:`oùacyd#¹cìYH9n.:jnú %ùå-xà ‚ˆ˜XÚÙÜ›Ý[™›Ý[™ÎˆYKˆËÈ”Ðˆ\ÙH¹o 9d+ùmc9ieÈÙXšY]Ï˜9¨!ùëo‹9îæHÙX‹Xœ›ÝÜÙ\ˆYÚ[ˆ9å*8à ‚ˆËÈ9k¢yaj™YœÈ9aj:`ê9g*Ú[X]XÚ]ÙXšY]È:f-¹«­z(ªÈ\™[™\ˆ9o.¹b-º)¡¹æå‚ˆËÈ
+ÙXšY]Ë\ÙXÝ\š]KÊK™[™\™\ˆ9êëùa¦yæ¡9lg¹ )ù.#y/&¹è-9gcÈÝY\Ý:f¥9é®øà ‚ˆËÈ™Z\ÚHÐ]]:-lÚ[[˜]šYØ]H:!ê¹k¦¹.bHØÚ[YH
+È9..ùê¥ú!êº.ªÈÙXÛÛ[ËˆËÈ:-çùmc9ieÈÙXšY]È9¦+ù.)9§hyâë9êâú-ëùo¡9.#ycåùolydãxà ‚ˆÙXšY]ÕYÎˆYKˆËÈš[H›ÜÈ\™H[™YžH™[™\™\ˆ]XÚY[ÙÛØ˜[Y›Ü[™\œË‚ˆËÈÈ›Ý]Ú›ÛZ][H˜]šYØ]HHXZ[ˆÚ[™ÝÈÈHØØ[›ÜY]ˆËÈÚ[ˆH]›Ü›K\ÜXÚYšXÈ˜YÈ]™[Z\ÜÙ\ÈH\™Ù]‚ˆ˜]šYØ]SÛ‘˜YÑ›Üˆ˜[ÙKˆKˆJNÂˆX\šÐ\ÛÛ[Ú[™ÝÊXZ[•Ú[™ÝÊNÂˆ[œÝ[Ù[XÝ[ÛÛÛ^Y[JXZ[•Ú[™ÝÊNÂˆ[œÝ[Ú[™ÝÔ™\ÜÛœÚ]™[™\ÜÑXYÛ›ÜÝXÜÊXZ[•Ú[™ÝËÈX™[ˆ	ÛXZ[‰ÈJNÂˆXZ[•Ú[™ÝÔ™YˆHXZ[•Ú[™ÝÎÂˆ\SXZ[•Ú[™ÝÐ˜XÚÙÜ›Ý[™›Ý[™Ê
+NÂˆ\TYÙV›ÛÛS]™[
+XZ[•Ú[™ÝËÙ]\œÚ\ÝYÚ[™ÝÖ›ÛÛJ
+JNÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	ÙYYš[š\Ú[ØY	Ë
+
+HOˆÂˆYˆ
+XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆ\TYÙV›ÛÛS]™[
+XZ[•Ú[™ÝËÙ]\œÚ\ÝYÚ[™ÝÖ›ÛÛJ
+JNÂˆJNÂˆËÈY\[šÈ9ª(ygeù£ y§"yd#9. 9.*ˆXZ[•Ú[™ÝÈ9o%yå*8 %:)èù§¤9aî¹æ¡T“:`&º/áÈÙXÛÛ[ËœÙ[™ˆËÈ9£ª9îæH™[™\™\ˆ
+Ú[›™[	ÙY\[[šÎ›˜]šYØ]IÊxà ¹alùê¥ù¥í¹d#9«iy®!yên‹:`oùacyîæymìºe 9«àBˆËÈ9æ¡œ›ÝÜÙ\•Ú[™ÝÈ9cäHTÈ:)é¹cäH	ÓØš™XÝ\È™Y[ˆ\Ý›ÞYY	øà ‚ˆÙ]Y\[šÓXZ[•Ú[™ÝÊXZ[•Ú[™ÝÊNÂˆXZ[•Ú[™ÝË›Û˜ÙJ	ØÛÜÙY	Ë
+
+HOˆÂˆYˆ
+™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\ŠHÂˆÛX\•[Y[Ý]
+™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\ŠNÂˆ™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\ˆH[ÂˆBˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹™\Ý›ÞUÚ[™ÝÊ
+NÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœ™\Ù]
+
+NÂˆœØ•Ú[™ÝÐÛÛ›Û\‹™\Ý›ÞUÚ[™ÝÊ
+NÂˆÚÜÝ[™[Ú[™ÝÜÐÛÛ›Û\‹™\Ý›ÞP[Ú[™ÝÜÊ
+NÂˆYˆ
+XZ[•Ú[™ÝÔ™YˆOOHXZ[•Ú[™ÝÊHXZ[•Ú[™ÝÔ™YˆH[ÂˆÙ]Y\[šÓXZ[•Ú[™ÝÊ[
+NÂˆJNÂˆËÈXZ[‹]Ú[™ÝÈÛÜÙHÛXÞH\È^XÚ]™XØ]\ÙHY[ˆ][]HÚ[™ÝÜÈ
+›Ü‚ˆËÈ^[\HH™]Ø\›YYÛØ˜[›ÚXÙHÝ™\›^JHØ[ˆÙY\H›ØÙ\ÜÈ[]™K‚ˆXZ[•Ú[™ÝË›ÛŠ	ØÛÜÙIË
+]™[
+HOˆÂˆYˆ
+\Ô]Z][™ÊH™]\›ŽÂˆËÈXXÓÔÎˆÙY\HÚ[™ÝÈ
+È™[™\™\ˆ[]™H[™YHÛ›KÛÈØÚÈXÝ]˜][Û‚ˆËÈØ[ˆ™\ÝÜ™H]Ú]Ý]™[[Ý[[™ÈH™[™\™\‹‚ˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊHÂˆ]™[œ™]™[Y˜][
+
+NÂˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹šYUÚ]ÝÛ™\Š
+NÂˆYˆ
+XZ[•Ú[™ÝËš\Ñ[ØÜ™Y[Š
+JHÂˆXZ[•Ú[™ÝË›Û˜ÙJ	ÛX]™KY[\ØÜ™Y[‰Ë
+
+HOˆÂˆYˆ
+[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHXZ[•Ú[™ÝËšYJ
+NÂˆJNÂˆXZ[•Ú[™ÝËœÙ][ØÜ™Y[Š˜[ÙJNÂˆH[ÙHÂˆXZ[•Ú[™ÝËšYJ
+NÂˆBˆ™]\›ŽÂˆBˆËÈÚ[™ÝÜÈ[™[^\ÚÈÛ˜ÙHÛˆš\œÝÛÜÙK[ˆ™]\ÙHH\œÚ\ÝYÚÚXÙK‚ˆËÈHÙY\\[›š[™ÈXÝ[Ûˆ›ÛÝÜÈXXÚ]›Ü›Nˆ˜^HÛˆÚ[™ÝÜËZ[š[Z^™HÛˆ[^‚ˆ]™[œ™]™[Y˜][
+
+NÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰ÊHÂˆÛÛœÝ™Z]š[ÜˆH™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+KÚ[™ÝÜÐÛÜÙP™Z]š[ÜŽÂˆYˆ
+X™Z]š[ÜŠHÂˆÚ[™ÝÜÐÛÜÙT›Û\˜[˜XÚËœ™\]Y\Ý
+
+NÂˆ™]\›ŽÂˆBˆ\UÚ[™ÝÜÐÛÜÙP™Z]š[ÜŠXZ[•Ú[™ÝË™Z]š[ÜŠNÂˆ™]\›ŽÂˆBˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Û[^	ÊHÂˆÛÛœÝ™Z]š[ÜˆH™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+K›[^ÛÜÙP™Z]š[ÜŽÂˆYˆ
+X™Z]š[ÜŠHÂˆ[^ÛÜÙT›Û\˜[˜XÚËœ™\]Y\Ý
+
+NÂˆ™]\›ŽÂˆBˆ\S[^XZ[•Ú[™ÝÐÛÜÙP™Z]š[ÜŠXZ[•Ú[™ÝË™Z]š[Ü‹
+
+HOˆ\œ]Z]
+
+JNÂˆ™]\›ŽÂˆBˆ\œ]Z]
+
+NÂˆJNÂˆ›ÚY[œÝ\™SXZ[\™\Ù[˜ÙJ	ÛXZ[‹]Ú[™ÝËXÜ™X]Y	ËXZ[•Ú[™ÝÊNÂ‚ˆ[œÝ[\XØ][Û“Y[JˆXZ[•Ú[™ÝËˆÝ\œ™[\XØ][Û“Y[SØØ[HÏÈÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+Kˆ
+NÂ‚ˆËÈÚ[™ÝÜÈÈ[^9¬¨y§"HXXÈ9n¥9å*:#ç9ceHXØÙ[\˜]Ü¸à ¹..ùê¥ùcèùd£9/&º+çybkùê¥ùcèú`ïz-lˆËÈ9d#9. 9.*¹ê¥ùcèùî©ùk¢z(áyfj;ï#9doy.é9cäyfç¹k§ºfay£©y¥-¹£"ze+¹æ¡9ê¥ùcèûï&ÓXXÈ9k¢z(áyfj9/&¹æí9£©H›Ë[Ü8à ‚ˆ[œÝ[™]ÓXZÙ\•Ú[™ÝÔÚÜÝ]
+XZ[•Ú[™ÝÊNÂ‚ˆËÈ™YÚ\Ý\ˆ™Y›Ü™HÝ]H™\ÝÜ˜][ÛˆÛÈH[š]X[˜[œÚ][Ûˆ\È˜XÚÙY‚ˆ[œÝ[Ú[™ÝÑ[ØÜ™Y[”Ý]Pœ›ØYØ\Ý
+XZ[•Ú[™ÝËÂˆËÈXXÓÔÈˆ›ÈÛ™Ù\ˆ[Z]ÈÚ[[X]™KY[\ØÜ™Y[‹ˆ™\Ú^™H]XÝÈBˆËÈ[š[X][ÛˆÝ\ÛÈ˜Y™šXË[YÚY[™È™]\›œÈ™Y›Ü™HH[™]™[‚ˆÙ]\Ü^P›Ý[™Îˆ
+›Ý[™ÊHOˆØÜ™Y[‹™Ù]\Ü^SX]Ú[™Ê›Ý[™ÊK˜›Ý[™ËˆJNÂ‚ˆËÈÚ\™H™\Ú^™HÈ[Ý™HÈX^[Z^™HÈ[ØÜ™Y[ˆ\Ý[™\œÈ]\œÚ\ÝBˆËÈÝ]HÈ\ÚÈÛˆÛÜÙXˆ]\Ý[ˆ™Y›Ü™H[žH\Ù\ˆ™\Ú^™H]™[š\™\Ë‚ˆXZ[•Ú[™ÝÔÝ]K›X[˜YÙJXZ[•Ú[™ÝÊNÂˆYˆ
+ÚÝ[™\ÝÜ™SX^[Z^™Y	‰ˆ[XZ[•Ú[™ÝËš\ÓX^[Z^™Y
+
+JHXZ[•Ú[™ÝË›X^[Z^™J
+NÂˆËÈÚ[™ÝÜÈØ[ˆ˜[œÚY[H[›X^[Z^™H\š[™È\Ü^KÑH™K[^[Ý]ˆXXÓÔÂˆËÈÝÛœÈ]È˜]]™H›ÛÛH™Z]š[Ü‹ÛÈÈ›Ý[œÝ[HÚ[™ÝÜÈ™XÛÝ™\žBˆËÈÝ]HXXÚ[™H\™K‚ˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰ÊHÂˆÛÛœÝX^[Z^™T™XÛÝ™\žHH[œÝ[XZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žJXZ[•Ú[™ÝËØÜ™Y[‹Âˆ\›YYˆÚÝ[™\ÝÜ™SX^[Z^™YˆÙÎˆÜ™X]TØÚY[\“ÙÙÙ\Š	ÛXZ[‹]Ú[™ÝË[X^[Z^™K\™XÛÝ™\žIÊKˆJNÂˆXZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\ˆHX^[Z^™T™XÛÝ™\žNÂˆÛÛœÝ™[[Ý™S˜]]™T™\ÝÜ™R[[H[œÝ[XZ[•Ú[™ÝÓ˜]]™T™\ÝÜ™R[[
+ˆXZ[•Ú[™ÝËˆX^[Z^™T™XÛÝ™\žK››ÝYžU\Ù\•[›X^[Z^™R[[ˆ
+NÂˆXZ[•Ú[™ÝË›Û˜ÙJ	ØÛÜÙY	Ë
+
+HOˆÂˆ™[[Ý™S˜]]™T™\ÝÜ™R[[
+
+NÂˆYˆ
+XZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\ˆOOHX^[Z^™T™XÛÝ™\žJHÂˆXZ[•Ú[™ÝÓX^[Z^™T™XÛÝ™\žPÛÛ›Û\ˆH[ÂˆBˆJNÂˆB‚ˆËÈ]‹[Û›N‘ŒLˆ9b!ù£hˆ]•ÛÛÈ9æ¡9ag9n¥z`&º`døà º-l™Y›Ü™KZ[œ]Y]™[9g*XZ[ˆ9/©ÂˆËÈ9¢é¹¢*‹9£"ze+¹¨.y§+9.#z/æÈ™[™\™\ˆ8 %8 %9.#ycåúhmzgh¹a¡yoêù£múe+¹ìîùîçÈÈ:/¤ùaiyá)¹à®HÈ:#ç9ceBˆËÈXØÙ[\˜]Üˆ9¬ê9a£9â­¹  yolydãK9.îù/eH]ˆ9ã«ùh ú`ïy/çz+àz ïyo 8à ‘ŒLˆ9§*º(ªùn¥9å*9a¡y.îù/eBˆËÈ9oêù£múe+¹ch9å*9¥è9cã:)é¹cäzhãºfjNù«hùo#ùc!J\š\ÔXÚØYÙY
+y.#y£ º/oK:fí¹¦­:g,¸à ‚ˆYˆ
+X\š\ÔXÚØYÙY
+HÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	Ø™Y›Ü™KZ[œ]Y]™[	Ë
+Ù]™[[œ]
+HOˆÂˆYˆ
+[œ]\HOOH	ÚÙ^QÝÛ‰È	‰ˆ[œ]šÙ^HOOH	ÑŒL‰ÊHÂˆXZ[•Ú[™ÝËÙXÛÛ[ËÙÙÛQ]•ÛÛÊ
+NÂˆBˆJNÂˆB‚ˆËÈÚÝÈÚ[™ÝÈÛ›HY\ˆÛÛ[\È™[™\™Y8 %[[Z[˜]\È[YH›\ÚˆXZ[•Ú[™ÝË›Û˜ÙJ	Ü™XYK]Ë\ÚÝÉË
+
+HOˆÂˆÚÝÓXZ[•Ú[™ÝÐ[™™\ÝÜ™Q[ØÜ™Y[ŠXZ[•Ú[™ÝËÂˆ™\ÝÜ™Q[ØÜ™Y[ŽˆÚÝ[™\ÝÜ™SXXÑ[ØÜ™Y[‹ˆJNÂˆ™Yœ™\ÚÚ[™ÝÜÐ\˜YÙJ
+NÂˆYˆ
+X\š\ÔXÚØYÙY\ÐÚ[™U™\œÚ[Û“][˜Ú[™[™Ê
+JBˆX\šÑ\ÚÝÜ]•Ú[™ÝÔ™XYJXZ[•Ú[™ÝËÙXÛÛ[Ë™Ù]ÔÔ›ØÙ\ÜÒY
+
+JNÂˆ›ÚY[ÛÛ\]\•\ÙTÛ[ÚÙRY”™\]Y\ÝY
+
+NÂˆËÈ:-a9®¤9å*:aãùê¥ùcèù.#yn¥9.#¹..ùê¥ùcèúi¥¹n)ù.¢HÔxà ¹..ùê¥ùcèùcëú)àyd#¹a£yd#¹cì9k£9¢$œ›ÝÜÙ\•Ú[™Ýøà BˆËÈ™[™\™\ˆ9d£:i¥¹.ïz/æùê"ùoêùáiúh¡9àë{ï&ùfçº, ùîäyk¦¹odù.èù..ùê¥ùcèûï#:aãynî‹ú` 9aî¹d#¹.#y/&¹b&ùnî¹ki9a/ùê¥øà ‚ˆ™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\ˆHÙ][Y[Ý]
+
+
+HOˆÂˆ™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\ˆH[ÂˆYˆ
+\Ô]Z][™ÈXZ[•Ú[™ÝÔ™YˆOOHXZ[•Ú[™ÝÈXZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹œÙ]ØØ[JˆÝ\œ™[\XØ][Û“Y[SØØ[HÏÈÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+Kˆ
+NÂˆ™\ÛÝ\˜ÙU\ØYÙUÚ[™ÝÐÛÛ›Û\‹œ™]Ø\›J
+NÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœÙ]ØØ[JˆÝ\œ™[\XØ][Û“Y[SØØ[HÏÈÙ]™Y™\œ™Y\XØ][Û“ØØ[J
+Kˆ
+NÂˆ™[[ÝQ\ÚÝÜšY]Ù\•Ú[™ÝÜËœ™]Ø\›J
+NÂˆËÈ9cìù/©ù¨#ùkd9ê¥ùcèúh¡9àëN¹i#yb.ú-a9®¤9å*:aãùê¥ùcèùª(yo#Ë9..ùê¥ùcèùcëú)àyd#¹d#¹cì9b&ùnî‚ˆËÈ:f¤:%ãÈœ›ÝÜÙ\•Ú[™ÝÈ9nm¹b¨:/oz/núaãÈ™[™\™\‹9d#¹îëH]XÚ9à®yaîù.áHÚÝÊÙ›ØÝ\øà ‚ˆœØ•Ú[™ÝÐÛÛ›Û\‹œ™]Ø\›J
+NÂˆËÈ9£ä¹.íºgh¹§où/çy£ y£"zg 9b&ùnî»ï&¹b!¹é®ùâ­¹  y.#z-ê:aãyd+ù h¹i#{ï#9i&¹k§¹/¢ù.gù.#yg*9d+ùbª9§'ùaj:aãúh¡9àëxà ‚ˆKWÍL
+NÂˆ™\ÛÝ\˜ÙU\ØYÙT™]Ø\›U[Y\‹[œ™YËŠ
+NÂˆËÈ9¥éyoåù."¹¢©yæ¡9d+ùbª:(iy/(ºaáúfáˆ
+È:!,y¥cù¦+ùd#9«iyæ¡:aãy­.Ë9oázhnú+ªy..ùê¥ùcèùab9aî¹§iJ9a¡z`ê9a£yníº/çÈM\ËˆËÈ:`oùo :i¥¹n)ùæ¡SÈ9.¢yå*
+xà ¹¬¨y§"yo¡z(iy/(9¨!ú+¬9¥í¹¦+úfí¹¢$9§+›Ë[Ü8à ‚ˆØÚY[TÝ\\˜XÚÙš[
+
+NÂˆËÈÜ[˜X^HÝXØÙ\ÜÙ[HÝ\H\]Y›ØÙ\ÜÈÚ[HXXÓÔÈ™Y\Ù\ÂˆËÈœ›Û[ÜÝXÝ]˜][Ûˆ]HØÚËÛÙÚ[ˆÚ[™ÝËˆ™\Ù[][Ûˆ\È›Ý[‚ˆËÈ[œÝ[][Û‹ZX[ÚYÛ˜[È™]Z[ˆHÛ™K\ÚÝ›ØÝ\ÈÜ˜[›Üˆ[›ØÚË‚ˆ\]T™\Ù[][Û”™XÛÝ™\žOË›Û•Ú[™ÝÔ™XYJ
+NÂˆYˆ
+›ØÙ\ÜË™[‹“ÔS—ÑU•ÓÓÈOOH	ÌIÊHÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›Ü[‘]•ÛÛÊ
+NÂˆBˆËÈ9a­ùd+ùbª:f-¹«­yï$ùkf9æ¡Y\[šÈÈK[Ü[‹Y›Û\ˆ^[ØY9å,HXZ[“^[Ý][Ý[9d#‚ˆËÈ:`&º/áÈTÈ	ÙY\[[šÎZÙK\[™[™ÉÈ9..ùbª9¢âycå¹­¢:-.H
+:)àHY\[šËÈ[™[™ÂˆËÈY™™\ˆ9¬ê:aâŠxà º/æy¨-ù§*¹ænùoeyå*9¢-ùa­ùd+ùbª9d#¹k£9¢$™Z\ÚHÐ]]8¡¤ˆXZ[“^[Ý]9ë+9. 9«(BˆËÈ[Ý[8¡¤ˆ9d#9. 9§hH[:-ëùo¡9­¢:-.H^[ØY9.#y/&¹fè9..¹ænùoey­`yê"ú-ìú/áú #9.(¹i,y¡#ùfï¸à ‚ˆJNÂ‚ˆËÈ:(ázil9bª9å.úeî:eê9æ¡9ag9n¥y/èycíøà ¹..ùê¥ùg*[›š[™È\›ˆ9§'úeí9/&¹alù£¢H˜XÚÙÜ›Ý[™›Ý[™ËˆËÈ:`¨ù.bùd#ˆ™[™\™\ˆ9æ¡š\ÚXš[]TÝ]H9l,y.#ya£ycãy¦(9ç'ùk§¹cëú)ày )Ë9îáº" º)àyª(ygeùi-9¬ê:aâ¸à ‚ˆÙ]ÚÜÝ›ÙT[[YTÝ\][\ÛÛ^™XY\Š
+
+HOˆÂˆ]ØœÙ\™YXZ[•Ú[™ÝÔÝ]N‚ˆ	ØXœÙ[	È	ÚY[‰È	ÛZ[š[Z^™Y	È	Ýš\ÚX›K][™›ØÝ\ÙY	È	Ù›ØÝ\ÙY	È	Ý[šÛ›ÝÛ‰ÈH	Ý[šÛ›ÝÛ‰ÎÂˆžHÂˆYˆ
+XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	ØXœÙ[	ÎÂˆ[ÙHYˆ
+XZ[•Ú[™ÝËš\ÓZ[š[Z^™Y
+
+JHØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	ÛZ[š[Z^™Y	ÎÂˆ[ÙHYˆ
+[XZ[•Ú[™ÝËš\Õš\ÚX›J
+JHØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	ÚY[‰ÎÂˆ[ÙHYˆ
+XZ[•Ú[™ÝËš\Ñ›ØÝ\ÙY
+
+JHØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	Ù›ØÝ\ÙY	ÎÂˆ[ÙHØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	Ýš\ÚX›K][™›ØÝ\ÙY	ÎÂˆHØ]ÚÂˆØœÙ\™YXZ[•Ú[™ÝÔÝ]HH	Ý[šÛ›ÝÛ‰ÎÂˆBˆ]ØœÙ\™YØÜ™Y[”Ý]Nˆ	ØXÝ]™IÈ	ÚYIÈ	ÛØÚÙY	È	Ý[šÛ›ÝÛ‰ÈH	Ý[šÛ›ÝÛ‰ÎÂˆžHÂˆÛÛœÝÝ]HHÝÙ\“[Ûš]Ü‹™Ù]Þ\Ý[RYTÝ]JŒ
+NÂˆYˆ
+Ý]HOOH	ØXÝ]™IÈÝ]HOOH	ÚYIÈÝ]HOOH	ÛØÚÙY	ÊHÂˆØœÙ\™YØÜ™Y[”Ý]HHÝ]NÂˆBˆHØ]ÚÂˆØœÙ\™YØÜ™Y[”Ý]HH	Ý[šÛ›ÝÛ‰ÎÂˆBˆ™]\›ˆÈØœÙ\™YXZ[•Ú[™ÝÔÝ]KØœÙ\™YØÜ™Y[”Ý]HNÂˆJNÂˆ[œÝ[Ú[™ÝÒY[œ›ØYØ\Ý
+XZ[•Ú[™ÝÊNÂˆËÈÙ^X›Ø\™[ÈÚ[ˆHÚ[™ÝÈÛÛY\È˜XÚÈœ›ÛHYHÈZ[š[Z^™HÈØÚË‚ˆ]XÚÛÜšÓÝY\ÛÙ^Ú[™ÝÔ™]™X[
+XZ[•Ú[™ÝÊNÂ‚ˆËÈ\˜YÙH9¢¥yolyodùbcy.îùb¨yalù¬ê9 .ù¥l;ï&ùê¥ùcèú f¹á)¹.#yëby.£º+îùk£9¢`9§"y.îùb¨{ï#9.#y®!y .ù¥l8à ‚ˆËÈYÙ[\Û[™ÛX\Ý\™\ÜÚ[Ûˆ9d#9¨-ù£"H\9î©ùá)¹à®yb)9¥«N¹..ùê¥È›\ˆ9b,8à#9g*9¥¬9ê¥ùcèù¢dùo 8à#BˆËÈ9æ¡9/&º+çybkùê¥ù¥í‹9å*9¢-ù.ãyg*Ú[™H9a¡K9.#z ïy¢¢ˆ\›ØÝ\ÙY9ïkˆ˜[Ùxà ‚‚ˆËÈš[™Z[‹\YÙNˆ›ÜØ\™Ú›ÛZ][IÜÈX]Ú™\Ý[È˜XÚÈÈH™[™\™\ˆÝ™\›^K‚ˆËÈH™[™\™\ˆš]™\Èš[™[”YÙHÈÝÜš[™[”YÙHšXHTÈ
+ÙYH™YÚ\Ý\’\Ò[™\œÊK‚ˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	Ù›Ý[™Z[‹\YÙIË
+Ù]™[™\Ý[
+HOˆÂˆXZ[•Ú[™ÝËÙXÛÛ[ËœÙ[™
+	Ùš[™Z[‹\YÙNœ™\Ý[	ËÂˆ™\]Y\ÝYˆ™\Ý[œ™\]Y\ÝYˆXÝ]™SX]ÚÜ™[˜[ˆ™\Ý[˜XÝ]™SX]ÚÜ™[˜[ˆX]Ú\Îˆ™\Ý[›X]Ú\Ëˆš[˜[\]Nˆ™\Ý[™š[˜[\]KˆJNÂˆJNÂ‚ˆËÈÛØ˜[˜]šYØ][ÛˆÝX\™8 %[žH
+ÊH[šÈ]šY\ÈÈ˜]šYØ]HBˆËÈXZ[ˆÚ[™ÝÈÜˆÜ[ˆH™]ÈÚ[™ÝÈ\È™Y\™XÝYÈHÞ\Ý[Hœ›ÝÜÙ\‹‚ˆËÂˆËÈ]ˆØ]™X]ˆ[ˆ]ˆH™[™\™\ˆ]Ù[ˆ\ÈÜÝY]‹ËÛØØ[ÜÝÜ‹ˆËÈÛÈH˜Z]™H
+ÊHÚXÚÈÛÝ[[ÛÈÙ[™Ý\ˆÝÛˆ[\›˜[˜]šYØ][ÛœÂˆËÈ
+K™Ëˆ›ÝYšXØ][Û‹XÛXÚÈ8¡¤ˆ˜]šYØ]J	ËØØËXYÙ[ÏY‰ÊJHÝ]ÈHÞ\Ý[BˆËÈœ›ÝÜÙ\‹ˆÚ][\ÝH]ˆÙ\™\ˆÜšYÚ[ˆÛÈÛ›HYH^\›˜[ÈXZÈÝ]‚ˆËÈ›ÙXÝ[ÛˆØYÈšXHš[N‹ËÈÚXÚ™]™\ˆX]Ú\ÈH
+ÊHÚXÚËÛÈBˆËÈÚ][\Ý\ÈH›Ë[Ü\™K‚ˆÛÛœÝ]“ÜšYÚ[ˆHPRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“ˆÈ™]ÈT“
+PRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“
+K›ÜšYÚ[‚ˆˆ[ÂˆÛÛœÝ\Ò[\›˜[\›H
+\›ˆÝš[™ÊNˆ›ÛÛX[ˆOˆÂˆYˆ
+Y]“ÜšYÚ[ŠH™]\›ˆ˜[ÙNÂˆžHÂˆ™]\›ˆ™]ÈT“
+\›
+K›ÜšYÚ[ˆOOH]“ÜšYÚ[ŽÂˆHØ]ÚÂˆ™]\›ˆ˜[ÙNÂˆBˆNÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	ÝÚ[[˜]šYØ]IË
+]™[\›
+HOˆÂˆYˆ
+\Ò[\›˜[\›
+\›
+JH™]\›ŽÂˆÛÛœÝ\œÙYH™]ÈT“
+\›
+NÂˆYˆ
+\œÙYœ›ÝØÛÛOOH	Ú‰È\œÙYœ›ÝØÛÛOOH	ÚÎ‰ÊHÂˆ]™[œ™]™[Y˜][
+
+NÂˆÚ[›Ü[‘^\›˜[
+\›
+NÂˆBˆJNÂˆXZ[•Ú[™ÝËÙXÛÛ[ËœÙ]Ú[™ÝÓÜ[’[™\Š
+È\›JHOˆÂˆYˆ
+\Ò[\›˜[\›
+\›
+JH™]\›ˆÈXÝ[ÛŽˆ	Ø[ÝÉÈNÂˆÛÛœÝ\œÙYH™]ÈT“
+\›
+NÂˆYˆ
+\œÙYœ›ÝØÛÛOOH	Ú‰È\œÙYœ›ÝØÛÛOOH	ÚÎ‰ÊHÂˆÚ[›Ü[‘^\›˜[
+\›
+NÂˆBˆ™]\›ˆÈXÝ[ÛŽˆ	Ù[žIÈNÂˆJNÂ‚ˆËÈ8¥ 8¥ ™[™\™\ˆ9b¨:/oyi,z-)ycëú)à¹­bù )Ê]ˆ
+È›Ù
+x¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ˆËÈ:näylcù."yaa9o'ù.éybcyaj9¦+øà#9däyo.xà#N¹..ú/æùê"ù¥éyoåúfí¹ååz/îxà yê¥ùcèù¬.:/ç:näyç`8à º/æzaã9¢¢¹k ù.ë9aj:`ê9£©z/æÂˆËÈ9îçù. 9¥éyoåÎÙ]ˆ9."ùcè9b¨™[™\™\›ÛÝÝX\™:-¡y¥íº!ê¹bª™[ØY:!ê¹¡"8à ‚ˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	Ü™[ØYY\œ›Ü‰Ë
+ÙK™[ØY]\œ›ÜŠHOˆÂˆ™[™\™\‘ÝX\™ÙË™\œ›ÜŠ™[ØYY\œ›Üˆ]IÜ™[ØY]H\œ›ÜIÙ\œ›Ü‹›Y\ÜØYÙ_X
+NÂˆJNÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠ	ØÛÛœÛÛK[Y\ÜØYÙIË
+]Z[ÊHOˆÂˆËÈ\œ›Üˆ9 dº+¬ÝØ\›š[™È9.áH]Š™XXÝ]ˆ9dbº+i¹ëbyfjºgìù.#z/æùå'ù.©ù¥éyoåÊxà ¹¢*¹¥«zf,º-¡zeoùh!¹¨"9b-ùlcøà ‚ˆËÂˆËÈ8¦¨;î#È:/æzaã9b.ù¡#ùå*™[™\™\‹XÛÛœÛÛX: #9.#y¦+È™[™\™\‹YÝX\™º/k9cäyæ¡9¦+ÊŠ¹®,¹§äú/æùê"ù.îù¡#ÂˆËÈÛÛœÛÛH9«hù¥¡ÊŠ‹9cëú ïyn)¹å*9¢-ùa¡yk®J9b§ú ïy.èùè yæ¡ÛÛœÛÛK™\œ›Üˆ:aã9æ¡9­¢9 kù¥¡ù§+8à y¤'9í(º+ãxà BˆËÈ9ë+9."y¥®yn¤ù¢dùaî¹æ¡^[ØY8à T™XXÝ:e&z+ëú/®yåc:aã9æ¡›ÜÊxà ¹¥éyoåù."¹¢©yæ¡9§iy®¤9æoyd#yceycê¹¥/º(cˆËÈ™[™\™\‹YÝX\™
+™[ØYY\œ›ÜˆÈ9b¨:/oyi,z-)HÈ›ÛÝÝX\™8 %8 %9æoylcù£¤¹§éyoázg 9.%9¥è9å*9¢-ùa¡yk®JKˆËÈ™[™\™\‹XÛÛœÛÛX9.#yg*9d#yceya¡xà ¹.): !y­íùå*9d#9. 9.*ˆØÛÜH9/&º+ªy¥m9ìnù®,¹§äú/æùê"ùa¡yk®z-çùç`9¥/º(cˆËÈ:/çycãxà#9®,¹§äú/æùê"ú/k9cäyæ¡9¥éyoåù¥m9ìnù.(¹o øà#JØÜËÙ]‹\[\ËÛÙË]\ØYX[™\™YXÝ[Û‹›Y0©ÌKŒŠxà ‚ˆÛÛœÝÈ]™[Y\ÜØYÙK[™S[X™\‹ÛÝ\˜ÙRYHH]Z[ÎÂˆYˆ
+]™[OOH	Ù\œ›Ü‰ÊHÂˆ™[™\™\ÛÛœÛÛSÙË™\œ›ÜŠˆ™[™\™\ˆÛÛœÛÛK™\œ›Üˆ	ÜÛÝ\˜ÙRYN‰Û[™S[X™\ŸH	ÛY\ÜØYÙKœÛXÙJŒ
+_Xˆ
+NÂˆH[ÙHYˆ
+]™[OOH	ÝØ\›š[™ÉÈ	‰ˆX\š\ÔXÚØYÙY
+HÂˆ™[™\™\ÛÛœÛÛSÙËØ\›Šˆ™[™\™\ˆÛÛœÛÛKØ\›ˆ	ÜÛÝ\˜ÙRYN‰Û[™S[X™\ŸH	ÛY\ÜØYÙKœÛXÙJŒ
+_Xˆ
+NÂˆBˆJNÂˆ]]“ØY™]šY\ÈHÂˆXZ[•Ú[™ÝËÙXÛÛ[Ë›ÛŠˆ	ÙYY˜Z[[ØY	Ëˆ
+ÙK\œ›ÜÛÙK\œ›Ü‘\ØÜš\[Û‹˜[Y]YT“\ÓXZ[‘œ˜[YJHOˆÂˆËÈLÈ
+T”—ÐP“Ô•Q
+H9¦+ù«hùn.9kï:"*¹.+y¥«J™[ØYÈ™Y\™XÝ
+K9.#y¦+ùi,z-)xà ‚ˆYˆ
+Z\ÓXZ[‘œ˜[YH\œ›ÜÛÙHOOHLÊH™]\›ŽÂˆ™[™\™\‘ÝX\™ÙË™\œ›ÜŠˆYY˜Z[[ØYÛÙOIÙ\œ›ÜÛÙ_H\ØÏIÙ\œ›Ü‘\ØÜš\[ÛŸH\›IÝ˜[Y]YT“Xˆ
+NÂˆËÈ]Žˆš]H]ˆÙ\™\ˆ9§*¹l,yîêˆÈ9çëy¦ ¹êç¹  H8¡¤ˆ9k¦¹«(z` :`oúaãz+åK9¦ïù.èù¬.9.aznäylcøà ‚ˆYˆ
+PRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“	‰ˆ]“ØY™]šY\ÈH	‰ˆ[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JHÂˆ]“ØY™]šY\È
+ÏHNÂˆÛÛœÝ[^S\ÈHL
+ˆ]“ØY™]šY\ÎÂˆ™[™\™\‘ÝX\™ÙËš[™›Ê™]žZ[™ÈØYT“[ˆ	Ù[^S\ß[\È
+][\	Ù]“ØY™]šY\ßKÍJX
+NÂˆÙ][Y[Ý]
+
+
+HOˆÂˆYˆ
+[XZ[•Ú[™ÝËš\Ñ\Ý›ÞYY
+
+JH›ÚYXZ[•Ú[™ÝË›ØYT“
+PRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“
+NÂˆK[^S\ÊNÂˆBˆKˆ
+NÂ‚ˆYˆ
+PRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“
+HÂˆXZ[•Ú[™ÝË›ØYT“
+PRS—ÕÒS‘Õ×Õ’UWÑU—ÔÑT•‘T—ÕT“
+NÂˆËÈ]‹[Û›H9d+ùbª9ç"úeê9âåÎœ™[™\™\ˆ9g*9ª(ygeù¬`¹`/9§'ùã'y«nÊÝ[H™X[™H9ëbJy¥íºhmzgh¹.#z)é¹cäBˆËÈYY˜Z[[ØY9e+ù. 9cëúgh9b)9£k¹¦+øà#:/çú/çù¬¨y§"y.îù/eH™[™\™\ˆ9/©ù/èycíøà#xà ¹kf9­.ù/èycíùå,BˆËÈ™[™\™\Ž›ÙÈTÈ9.#ˆÚXÚËY[š\›Û›Y[[™\ˆ9fçº, ÈX\šÐ[]™J
+J:)àH™YÚ\Ý\’\Ò[™\œÊxà ‚ˆ™[™\™\›ÛÝÝX\™Ë™\ÜÜÙJ
+NÂˆ™[™\™\›ÛÝÝX\™H™]È™[™\™\›ÛÝÝX\™
+XZ[•Ú[™ÝËÙXÛÛ[ËÂˆÙÑ\œ›ÜŽˆ
+\ÙÊHOˆ™[™\™\‘ÝX\™ÙË™\œ›ÜŠ\ÙÊKˆÙÒ[™›Îˆ
+\ÙÊHOˆ™[™\™\‘ÝX\™ÙËš[™›Ê\ÙÊKˆJNÂˆ™[™\™\›ÛÝÝX\™œÝ\
+
+NÂˆXZ[•Ú[™ÝË›Û˜ÙJ	ØÛÜÙY	Ë
+
+HOˆÂˆ™[™\™\›ÛÝÝX\™Ë™\ÜÜÙJ
+NÂˆ™[™\™\›ÛÝÝX\™H[ÂˆJNÂˆH[ÙHÂˆXZ[•Ú[™ÝË›ØYš[J]š›Ú[Š×Ù\›˜[YK‹‹Ü™[™\™\‹ÉÓPRS—ÕÒS‘Õ×Õ’UWÓSQ_KÚ[™^š[
+JNÂˆBŸNÂ‚›]\ÜÜÙTÚÚ[X]]ÔÞ[˜Ð]]\Ý[™\Žˆ
+
+
+HOˆ›ÚY
+H[H[Â›]\ÜÜÙT›ÝšY\XØÙ\ÜÐ]]\Ý[™\Žˆ
+
+
+HOˆ›ÚY
+H[H[Â›]YÚ[“X\šÙ]Þ[˜Ò[‘›YÚØÛÜNˆÝš[™È[H[Â›]\ÝYÚ[“X\šÙ]Þ[˜ÔØÛÜNˆÝš[™È[H[Â›]\ÝYÚ[“X\šÙ]Þ[˜Ð]HÂ›]YÚ[“X\šÙ]\š[ÙXÔÞ[˜Õ[Y\Žˆ™]\›•\O\[ÙˆÙ][\˜[ˆ[H[Â˜ÛÛœÝQÒS—ÓPT’ÑUÔT’SÑP×ÔÖS×ÓTÈHÌ
+ˆŒ
+ˆLÂ‚›]Ý\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Îˆ]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÈHÈ]X˜\ÙPž]\Îˆ[NÂ›]Ý\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÐÚXÚÙYH˜[ÙNÂ›]Ý\\]X˜\ÙTÚ^™UØ\›š[™ÓÝÛ™\”ØÛÜNˆÝš[™È[H[Â‚™[˜Ý[ÛˆÛÛXÝÝ\œ™[]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Ê
+Nˆ]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÈÂˆ™]\›ˆÛÛXÝ]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÊÂˆÙ]Ý\œ™[”]ˆØØ[‘Ù]Ý\œ™[”]ˆÙ]Ý\œ™[\Ù\’YˆÙ]Ý\œ™[ÛY[\Ù\’Yˆ™\ÛÛ™Q”]›Ü•\Ù\ŽˆÙ]”]›Ü•\Ù\‹ˆJNÂŸB‚™[˜Ý[Ûˆœ›ØYØ\Ý]X˜\ÙTÚ^™UØ\›š[™ÐÚ[™ÙY
+
+Nˆ›ÚYÂˆ›Üˆ
+ÛÛœÝÚ[ˆÙˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+JHÂˆYˆ
+]Ú[‹š\Ñ\Ý›ÞYY
+
+H	‰ˆ]Ú[‹ÙXÛÛ[Ëš\Ñ\Ý›ÞYY
+
+JHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+	Ù]X˜\ÙK\Ú^™K]Ø\›š[™Î˜Ú[™ÙY	ÊNÂˆBˆBŸB‚˜ÛÛœÝ]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\ˆHÜ™X]Q]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\Š
+
+HOˆÂˆœ›ØYØ\Ý]X˜\ÙTÚ^™UØ\›š[™ÐÚ[™ÙY
+
+NÂŸJNÂ‚˜\›Û˜ÙJ	ÝÚ[\]Z]	Ë
+
+HOˆ]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\‹™\ÜÜÙJ
+JNÂ‚™[˜Ý[Ûˆ™Xš[™]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\Š
+Nˆ›ÚYÂˆ]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÕØ]Ú\‹œ™Xš[™
+Ù]]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÑš[T]
+
+JNÂŸB‚‹ÊŠˆØ\\™HH]X˜\ÙHÚ^™HÛ˜ÙHY\ˆHš\œÝØØ[ˆÝ\\ÛÛ\]\Ëˆ
+‹Â™[˜Ý[ÛˆÚXÚÑ]X˜\ÙTÚ^™UØ\›š[™Ð]Ý\\
+
+Nˆ›ÚYÂˆÛÛœÝÝÛ™\”ØÛÜHHXÝ]™SÝÛ™\”ØÛÜRÙ^J
+NÂˆYˆ
+ˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÐÚXÚÙY	‰‚ˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÓÝÛ™\”ØÛÜHOOHÝÛ™\”ØÛÜBˆ
+Bˆ™]\›ŽÂˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÈHÛÛXÝÝ\œ™[]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Ê
+NÂˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÐÚXÚÙYHYNÂˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÓÝÛ™\”ØÛÜHHÝÛ™\”ØÛÜNÂˆÛY[ÙËš[™›Êˆ	Ù]X˜\ÙHÚ^™HØ\›š[™ÈÝ\\ÚXÚÈÛÛ\]Y	ËˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Ëˆ
+NÂˆœ›ØYØ\Ý]X˜\ÙTÚ^™UØ\›š[™ÐÚ[™ÙY
+
+NÂŸB‚‹ÊŠˆ[ˆX\šÙ]\ØÛÝ™\žH[™]]ÛX]XÈ\]\È›ÜˆHÝ\œ™[ÝX›HÝÛ™\‹ˆ
+‹Â™[˜Ý[ÛˆÞ[˜ÔYÚ[“X\šÙ]›ÜXÝ]™SÝÛ™\ŠZ[’[\˜[\ÈH
+Nˆ›ÚYÂˆÛÛœÝÙ\ÜÚ[ÛˆHÙ]XÝ]™P\Ù\ÜÚ[ÛŠ
+NÂˆYˆ
+\Ù\ÜÚ[Û‹™]SÝÛ™\’Y\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+JH™]\›ŽÂˆÛÛœÝØÛÜHHXÝ]™SÝÛ™\”ØÛÜRÙ^J
+NÂˆYˆ
+ØÛÜHOOHYÚ[“X\šÙ]Þ[˜Ò[‘›YÚØÛÜJH™]\›ŽÂˆÛÛœÝ›ÝÈH]K››ÝÊ
+NÂˆYˆ
+ØÛÜHOOH\ÝYÚ[“X\šÙ]Þ[˜ÔØÛÜH	‰ˆ›ÝÈH\ÝYÚ[“X\šÙ]Þ[˜Ð]Z[’[\˜[\ÊHÂˆ™]\›ŽÂˆBˆYÚ[“X\šÙ]Þ[˜Ò[‘›YÚØÛÜHHØÛÜNÂˆ\ÝYÚ[“X\šÙ]Þ[˜ÔØÛÜHHØÛÜNÂˆ\ÝYÚ[“X\šÙ]Þ[˜Ð]H›ÝÎÂˆ›ÚYÞ[˜ÑY˜][X\šÙ]YÚ[œÊ
+K™š[˜[J
+
+HOˆÂˆYˆ
+YÚ[“X\šÙ]Þ[˜Ò[‘›YÚØÛÜHOOHØÛÜJHYÚ[“X\šÙ]Þ[˜Ò[‘›YÚØÛÜHH[ÂˆJNÂŸB‚™[˜Ý[Ûˆ\œÙSÜ[Û˜[]šXÙS[šÑ]šXÙRY
+˜[YNˆ[šÛ›ÝÛŠNˆÝš[™È[[™Yš[™YÂˆYˆ
+˜[YHOOH[™Yš[™Y
+H™]\›ˆ[™Yš[™YÂˆYˆ
+˜[YHOOH[
+H™]\›ˆ[ÂˆÛÛœÝš[[YYH\[Ùˆ˜[YHOOH	ÜÝš[™ÉÈÈ˜[YKš[J
+Hˆ	ÉÎÂˆYˆ
+š[[YY›[™ÝOOHš[[YY›[™ÝˆMˆ˜[YHOOHš[[YY
+HÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	ÒS•SQÔTSTÉËˆ	Ù]šXÙS[šÑ]šXÙRY]\Ý™HH›Û‹Y[\Kš[[YYÝš[™ÈÙˆ][ÜÝMˆÚ\˜XÝ\œÈÜˆ[	Ëˆ
+NÂˆBˆ™]\›ˆš[[YYÂŸB‚˜ÛÛœÝ™YÚ\Ý\’\Ò[™\œÈH
+
+HOˆÂˆ\ÓXZ[‹š[™J	Ù]X˜\ÙK\Ú^™K]Ø\›š[™Î™Ù]\Ù][™ÜÉË
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆÛÛœÝÝ]HH™XY]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔÝ]J
+NÂˆ™]\›ˆÂˆ‹‹œÝ]K˜[YKˆ\ÐÝ\ÝÛZ^™YˆÝ]Kš\ÐÝ\ÝÛZ^™YˆY˜][™\ÚÛÚPŽˆQUSÑUPTÑWÔÒV‘WÕÐT“’S‘×Õ‘TÒÓÑÒP‹ˆNÂˆJNÂˆ\ÓXZ[‹š[™J	Ù]X˜\ÙK\Ú^™K]Ø\›š[™ÎœÙ]\Ù][™ÜÉË\Þ[˜È
+]™[^[ØYˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆÛÛœÝ\œÙYH\œÙQ]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔ]Ú
+^[ØY
+NÂˆYˆ
+	Ù\œ›Ü‰È[ˆ\œÙY
+H›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË\œÙY™\œ›ÜŠNÂˆ]ØZ]Üš]Q]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÊ\œÙYœ]Ú
+NÂˆÛÛœÝÝ]HH™XY]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔÝ]J
+NÂˆœ›ØYØ\Ý]X˜\ÙTÚ^™UØ\›š[™ÐÚ[™ÙY
+
+NÂˆ™]\›ˆÂˆ‹‹œÝ]K˜[YKˆ\ÐÝ\ÝÛZ^™YˆÝ]Kš\ÐÝ\ÝÛZ^™YˆY˜][™\ÚÛÚPŽˆQUSÑUPTÑWÔÒV‘WÕÐT“’S‘×Õ‘TÒÓÑÒP‹ˆNÂˆJNÂˆ\ÓXZ[‹š[™J	Ù]X˜\ÙK\Ú^™K]Ø\›š[™Îœ™\Ù]\Ù][™ÜÉË\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ]ØZ]™\Ù]]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÊ
+NÂˆÛÛœÝÝ]HH™XY]X˜\ÙTÚ^™UØ\›š[™ÔÙ][™ÜÔÝ]J
+NÂˆœ›ØYØ\Ý]X˜\ÙTÚ^™UØ\›š[™ÐÚ[™ÙY
+
+NÂˆ™]\›ˆÂˆ‹‹œÝ]K˜[YKˆ\ÐÝ\ÝÛZ^™YˆÝ]Kš\ÐÝ\ÝÛZ^™YˆY˜][™\ÚÛÚPŽˆQUSÑUPTÑWÔÒV‘WÕÐT“’S‘×Õ‘TÒÓÑÒP‹ˆNÂˆJNÂˆ\ÓXZ[‹š[™J	Ù]X˜\ÙK\Ú^™K]Ø\›š[™Î™Ù]\Ý]\ÉË
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆÝ\\]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\ÎÂˆJNÂˆ\ÓXZ[‹š[™J	Ù]X˜\ÙK\Ú^™K]Ø\›š[™Î›YX\Ý\™IË
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆÛÛXÝÝ\œ™[]X˜\ÙTÚ^™UØ\›š[™ÔÝ]\Ê
+NÂˆJNÂ‚ˆËÈš[™Hš[X\žH\Ú[™ÝËÚÚ\[™È˜[œÚY[][]Hœ›ÝÜÙ\•Ú[™ÝÜÈZÙBˆËÈH›ÚXÙKZ[œ]Ý™\›^H
+Z[š[Z^˜X›N™˜[ÙKX^[Z^˜X›N™˜[ÙJKˆ[XÝ›Û‰ÜÂˆËÈœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+HÜ™\š[™È\È›ÝÝX\˜[YYÈ™HÝX›HXÜ›ÜÜÂˆËÈ™\œÚ[ÛœÈÈ]›Ü›\ËÛÈÛ˜ÙHHÝ™\›^H\È™Y[ˆÜ[™YÛ˜ÙH[™Ý^\ÂˆËÈØXÚY
+ÙYH›ÚXÙKZ[œ]ÙÛØ˜[ÊKÌHÛÝ[™]\›ˆHÝ™\›^H8 %ÚXÚˆËÈÛÝ[Ú[[H›Ë[ÜÚ[™ÝË[Z[š[Z^™HÈÚ[™ÝË[X^[Z^™HTÈ[™XZÙHBˆËÈ]H˜\‰ÜÈZ[‹ÛX^]ÛœÈ\X\ˆ[œ™\ÜÛœÚ]™K‚ˆÛÛœÝÙ]Ú[™ÝÈH
+
+HOˆÂˆËÈ9..ùê¥ùcèù/&9ab8 %8 %8à#9g*9¥¬9ê¥ùcèù¢dùo 8à#yæ¡9bkùê¥ùcèù.gù¦+ù¦kº`&¹cëù§ 9l#ùc%¹ê¥ùcèË9.#z ïz+ªyk ùg*ˆËÈÙ][Ú[™ÝÜÊ
+H:aã:(ªÈ\ÓZ[š[Z^˜X›J
+H9doy.+yd#¹bªù£ H˜YÙHÈ›ÝYšXØ][ÛˆÂˆËÈ[ØÜ™Y[‹\Ý]H:/æy.¦øà#9..ùê¥ùcèú+ëy.bxà#yæ¡:, ùå*8à ‚ˆYˆ
+XZ[•Ú[™ÝÔ™Yˆ	‰ˆ[XZ[•Ú[™ÝÔ™Y‹š\Ñ\Ý›ÞYY
+
+JH™]\›ˆXZ[•Ú[™ÝÔ™YŽÂˆÛÛœÝÚ[™ÝÜÈHœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+NÂˆ™]\›ˆÚ[™ÝÜË™š[™
+
+ÊHOˆ]Ëš\Ñ\Ý›ÞYY
+
+H	‰ˆËš\ÓZ[š[Z^˜X›J
+JHÏÈÚ[™ÝÜÖÌNÂˆNÂ‚ˆ™YÚ\Ý\š[[™Ò\ÊÂˆÙ]XZ[•Ú[™ÝÎˆ
+
+HOˆXZ[•Ú[™ÝÔ™Y‹ˆ™\]Z\™T\œÛÛ˜[XØÛÝ[ˆ
+
+HOˆÂˆ™\]Z\™P\Ø\Xš[]Jˆ	ØØ[•\ÙPÚ[™PXØÛÝ[Ù\šXÙ\ÉËˆ	Ðš[[™È™\]Z\™\ÈH\œÛÛ˜[Ú[™HXØÛÝ[‰Ëˆ
+NÂˆYˆ
+]]X[˜YÙ\‹™Ù]]]Ý]J
+K\Ù\Ë›Y[X™\œÚ\Ú[™OOH	Ü\œÛÛ˜[	ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÔT“RTÔÒSÓ—ÑS’QQ	Ë	Ðš[[™È\ÈÛ›H]˜Z[X›HÈ\œÛÛ˜[XØÛÝ[Ë‰ÊNÂˆBˆKˆJNÂ‚ˆ[š]\˜YÙTÙ\šXÙJÂˆÙ]Ú[™ÝÎˆ
+
+HOˆÙ]Ú[™ÝÊ
+HÏÈ[ˆÛ”Ù\ÜÚ[Û][[Û“X\šÙYˆ
+Ù\ÜÚ[Û’Y
+HOˆÂˆÙ]YÙ[\Û[™Ù\šXÙJ
+OËš[™TÙ\ÜÚ[Û][[Û“X\šÙY
+Ù\ÜÚ[Û’Y
+NÂˆKˆÛ”Ù\ÜÚ[Û][[ÛÛX\™Yˆ
+Ù\ÜÚ[Û’Y[[
+HOˆÂˆÙ]YÙ[\Û[™Ù\šXÙJ
+OËš[™TÙ\ÜÚ[Û][[ÛÛX\™Y
+Ù\ÜÚ[Û’Y[[
+NÂˆKˆJNÂ‚ˆËÈ9ìîùîçùî©ú`&¹çé{ï"ÐÈYÙ[Ù\ÜÚ[Ûˆ9k£9¢$9¥í¹o.yaîˆÈ9cëú`"zhç¹.i¹éàz b»ï"Bˆ[š]›ÝYšXØ][Û”Ù\šXÙJÂˆÙ]Ú[™ÝÎˆ
+
+HOˆÙ]Ú[™ÝÊ
+HÏÈ[ˆ™Z\ÚR[KˆJNÂˆ[š]ÙXÛÛQÜ›Ý\›ÝYšXØ][Û’\Ê
+NÂˆ[š]YÙ[\Û[™Ù\šXÙJÂˆÙ]XZ[•Ú[™ÝÎˆ
+
+HOˆÙ]Ú[™ÝÊ
+HÏÈ[ˆ\Ô[›™Y™[[ÝQY[[ÛÛÜÙNˆ\ÐØÓYÜ•\Ü˜YR[‘›YÚˆÛ”Ù\ÜÚ[ÛXÝ]š]PÚ[™ÙNˆ
+XÝ]š]JHOˆÂˆ\]R[œ]]šXÙTÙ\ÜÚ[ÛXÝ]š]JXÝ]š]JNÂˆKˆJOËœÙ]\›ØÝ\ÙY
+\Ñ›ØÝ\ÙY\Ú[™ÝÊ
+JNÂˆËÈ9k¦¹d$H™\^N¹oêùáiùcêº(iycäyîæyb&¹k£9¢$Ù\ÜÚ[ÛœÈ:+¨ºf!yæ¡:`¨ù. 9cì9£©ùb-¹êëøà º"éy¬¯únæ:+©9noù¤«BˆËÈ:`&º`dù¢aùaî‹9«ãù«(HÝXœØÜšX™H:`ïy/&¹¢¢ˆÊ9/&º+çy¥l
+H9æ¡9n)úaãyi#yàc9îæyam¹k ù¢`9§"y£©ùb-¹êëËˆËÈ9i&¹£©ùb-¹êëúaãz/çºhã¹¦­9.+y/&¹.¤¹æî9£)9â!¹kîy¥®yæ¡9cëúgh9/(:/¤ùê¥ùcèøà ‚ˆÙ]Ù\ÜÚ[ÛœÔÝXœØÜšX™Y\Ý[™\Š
+ÛÛ›Û\‘]šXÙRY
+HOˆÂˆÙ]YÙ[\Û[™Ù\šXÙJ
+OËœ™\^TÙ\ÜÚ[ÛXÝ]š]J
+^[ØY
+HOˆÂˆ\ÚÙ\ÜÚ[ÛXÝ]š]UÐÛÛ›Û\ŠÛÛ›Û\‘]šXÙRY^[ØY
+NÂˆJNÂˆJNÂ‚ˆËÈ8à#9g*9¥¬9ê¥ùcèù¢dùo 8à#y/&º+çyi&¹o 8 %8 %9¥¬9nî¹. 9.*¹k£9¥m9ê¥ùcèùk¦¹/cyb,:+éHÙ\ÜÚ[Û‹9b'yiâÈ›Ý[™È9cå¹..ùê¥øà ‚ˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK“ÔS—ÔÑTÔÒSÓ—ÒS—Ó‘U×ÕÒS‘ÕËˆ
+]™[Ù\ÜÚ[Û’Yˆ[šÛ›ÝÛ‹]šXÙRY˜]Îˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[ÙˆÙ\ÜÚ[Û’YOOH	ÜÝš[™ÉÈÙ\ÜÚ[Û’Y›[™ÝOOH
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜÙ\ÜÚ[Û’Y™\]Z\™Y	ÊNÂˆBˆÛÛœÝ]šXÙRYH\œÙSÜ[Û˜[]šXÙS[šÑ]šXÙRY
+]šXÙRY˜]ÊNÂˆÛÛœÝÛÝ\˜ÙUÚ[™ÝÈHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠNÂˆÜ[”Ù\ÜÚ[Û’[“™]ÕÚ[™ÝÊÙ\ÜÚ[Û’YÛÝ\˜ÙUÚ[™ÝÈÏÈXZ[•Ú[™ÝÔ™Y‹]šXÙRY
+NÂˆKˆ
+NÂ‚ˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK“ÔS—ÔÑTÔÒSÓ—ÒS—Ó‘U×ÕÒS‘Õ×ÒQ—Ñ“ÔQÓÕUÒQKˆ
+]™[Ù\ÜÚ[Û’Yˆ[šÛ›ÝÛ‹]šXÙRY˜]Îˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[ÙˆÙ\ÜÚ[Û’YOOH	ÜÝš[™ÉÈÙ\ÜÚ[Û’Y›[™ÝOOH
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜÙ\ÜÚ[Û’Y™\]Z\™Y	ÊNÂˆBˆÛÛœÝ]šXÙRYH\œÙSÜ[Û˜[]šXÙS[šÑ]šXÙRY
+]šXÙRY˜]ÊNÂˆÛÛœÝÛÝ\˜ÙUÚ[™ÝÈHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠNÂˆËÈH™[™\™\ˆ›Ü›X[H[™ÈH™]šY]È[[YYX][H™Y›Ü™H[›ÚÚ[™ÂˆËÈ\ÈÚXÚËˆÝÜYØZ[ˆ\™HÛÈH[^YY˜YÙ[™ÒTÈØ[››ÝX]™HBˆËÈ˜[œÚY[Ø\™š\ÚX›HY\ˆH›Ü\È[™XYH™Y[ˆÛ\ÜÚYšYY‚ˆËÈÙY\HÝÛ™\ˆÚXÚÈÛÈH[^YYTÈœ›ÛHÛ™HÚ[™ÝÈØ[››ÝÝÜBˆËÈ™]Ù\ˆ˜YÈ][™XYHÝ\Y[ˆ[›Ý\ˆÚ[™ÝË‚ˆYˆ
+ÛÝ\˜ÙUÚ[™ÝÊH[™Ù\ÜÚ[Û‘˜YÔ™]šY]ÊÛÝ\˜ÙUÚ[™ÝÊNÂˆÛÛœÝ˜]]™T™\Ý[HÛÝ\˜ÙUÚ[™ÝÂˆÈÛÛœÝ[YS˜]]™TÙ\ÜÚ[Û‘˜YÓÜ[”™\Ý[
+ÛÝ\˜ÙUÚ[™ÝËÙ\ÜÚ[Û’Y]šXÙRY
+Bˆˆ[ÂˆYˆ
+˜]]™T™\Ý[OOH[
+H™]\›ˆ˜]]™T™\Ý[Âˆ™]\›ˆÜ[”Ù\ÜÚ[Û’[“™]ÕÚ[™ÝÒY‘›ÜYÝ]ÚYJˆÙ\ÜÚ[Û’YˆXZ[•Ú[™ÝÔ™Y‹ˆÛÝ\˜ÙUÚ[™ÝËˆ]šXÙRYˆ
+NÂˆKˆ
+NÂ‚ˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK”ÑTÔÒSÓ—ÑQ×Ô‘U’QU×ÔÕT•ˆ
+]™[X™[˜]Îˆ[šÛ›ÝÛ‹Ù\ÜÚ[Û’Yˆ[šÛ›ÝÛ‹]šXÙRY˜]Îˆ[šÛ›ÝÛ‹[]T˜]Îˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[ÙˆX™[˜]ÈOOH	ÜÝš[™ÉÈ\[ÙˆÙ\ÜÚ[Û’YOOH	ÜÝš[™ÉÈÙ\ÜÚ[Û’Y›[™ÝOOH
+HÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÛX™[[™Ù\ÜÚ[Û’Y™\]Z\™Y	ÊNÂˆBˆÛÛœÝ]šXÙRYH\œÙSÜ[Û˜[]šXÙS[šÑ]šXÙRY
+]šXÙRY˜]ÊNÂˆÛÛœÝ[]HH\œÙTÙ\ÜÚ[Û‘˜YÔ™]šY]Ô[]J[]T˜]ÊNÂˆYˆ
+\[]JHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	Ú[˜[YÙ\ÜÚ[Ûˆ˜YÈ™]šY]È[]IÊNÂˆBˆÛÛœÝÛÝ\˜ÙUÚ[™ÝÈHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠNÂˆYˆ
+\ÛÝ\˜ÙUÚ[™ÝÈÛÝ\˜ÙUÚ[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆ™YÚ[”Ù\ÜÚ[Û‘˜YÔ™]šY]ÊˆÛÝ\˜ÙUÚ[™ÝËˆ[˜Ø]TÙ\ÜÚ[Û‘˜YÔ™]šY]ÓX™[
+X™[˜]ÊKˆÙ\ÜÚ[Û’Yˆ]šXÙRYˆ[]Kˆ
+NÂˆKˆ
+NÂ‚ˆ\ÓXZ[‹›ÛŠPRÑT—ÔÑS‘”ÑTÔÒSÓ—ÑQ×Ô‘U’QU×ÑS‘
+]™[˜YÑ[™]\Ô˜]Îˆ[šÛ›ÝÛŠHOˆÂˆËÈš\™KX[™Y›Ü™Ù]Ø[\œÈØ[››Ý™XÙZ]™H[ˆTÈ\œ›Ü‹ˆ›ÜÝ[HÜ‚ˆËÈ[\ÝYÙ[™\œÈ[œÝXYÙˆ›ÝÚ[™È›ÝYÚ[XÝ›Û‰ÜÈ]™[[Z]\‹‚ˆYˆ
+Z\Õ\ÝY\™[™\™\‘]™[
+]™[
+JH™]\›ŽÂˆÛÛœÝÛÝ\˜ÙUÚ[™ÝÈHœ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠNÂˆYˆ
+\ÛÝ\˜ÙUÚ[™ÝÈÛÝ\˜ÙUÚ[™ÝËš\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆÛÛœÝ™XÙZ]™Y]\ÈH]K››ÝÊ
+NÂˆ[™Ù\ÜÚ[Û‘˜YÔ™]šY]ÊÛÝ\˜ÙUÚ[™ÝÊNÂˆYˆ
+X\š\ÔXÚØYÙY
+HÂˆÛÛœÝ˜YÑ[™]\ÈBˆ\[Ùˆ˜YÑ[™]\Ô˜]ÈOOH	Û[X™\‰È	‰‚ˆ[X™\‹š\Ñš[š]J˜YÑ[™]\Ô˜]ÊH	‰‚ˆX]˜XœÊ™XÙZ]™Y]\ÈH˜YÑ[™]\Ô˜]ÊHHŒÌˆÈ˜YÑ[™]\Ô˜]Âˆˆ[ÂˆÙ\ÜÚ[Û‘˜YÔ™]šY]ÓÙËš[™›Êˆ”ÓÓ‹œÝš[™ÚYžJÂˆ]™[ˆ	ÜÙ\ÜÚ[Û‘˜YÔ™]šY]Ë™[™™\Ü]ÚY	Ëˆ™[™\™\•ÓXZ[“\Îˆ˜YÑ[™]\ÈOOH[È[ˆX]›X^
+™XÙZ]™Y]\ÈH˜YÑ[™]\ÊKˆYP\Q\Ü]Ú\Îˆ]K››ÝÊ
+HH™XÙZ]™Y]\ËˆJKˆ
+NÂˆBˆJNÂ‚ˆËÈM9«æùã®ùä ÊŒH]Y]9å*9¢-ú(àya¬ú`#ùhàyî®Œ‹LËLMÊN¹.áHÒS‘H˜[Z[H9d+ùå*9«æùã®ùä ú`#ùhàyî®ÂˆËÈ9am¹.åˆ˜[Z[H9 h¹i#y.#z`#ù¦#¸à ›XXÓÔÈ:-lÙ]šXœ˜[˜ÞH
+È:`#ù¦#¹n¥NÕÚ[™ÝÜÈLH:-lÙ]˜XÚÙÜ›Ý[™X]\šX[ˆËÈ
+XÜž[XËÛZXØK:)àH™\ÛÛ™UšXœ˜[˜ÞPÛÛ™šYÊKÚ[™ÝÜÈLÓ[^9fçº` 9.#z`#ù¦#ˆÝ\™˜XÙxà ‚ˆËÈ˜[Z[H9b!ù£h¹¥í¹îãÈTÈ[YN˜\K]šXœ˜[˜ÞH:/ä:(c9¥í¹bª9  z, ùå*9d#9«iy..ùê¥ùcèù.#¹aj:`ê9bkùê¥ùcèøà ‚ˆ[˜Ý[Ûˆ\UÚ[™ÝÕšXœ˜[˜ÞJ˜[Z[RYˆÝš[™Ë\Ñ\šÎˆ›ÛÛX[ŠNˆ›ÚYÂˆÛÛœÝÚ[ˆHXZ[•Ú[™ÝÔ™YŽÂˆYˆ
+]Ú[ˆÚ[‹š\Ñ\Ý›ÞYY
+
+JH™]\›ŽÂˆÛÛœÝÛÛ™šYÈH™\ÛÛ™UšXœ˜[˜ÞPÛÛ™šYÊ˜[Z[RY\Ñ\šË›ØÙ\ÜËœ]›Ü›JNÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	Ù\Ú[‰ÊHÂˆÚ[‹œÙ]šXœ˜[˜ÞJÛÛ™šYËšXœ˜[˜ÞH\È	Ý[™\‹]Ú[™ÝÉÈ[
+NÂˆBˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰È	‰ˆÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[
+HÂˆÚ[‹œÙ]˜XÚÙÜ›Ý[™X]\šX[
+ÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[
+NÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+ÒS‘Õ×ÐPÒÑ“ÔÓPUT’PSÐÒS‘ÑQÐÒS“‘SÛÛ™šYË˜˜XÚÙÜ›Ý[™X]\šX[
+NÂˆBˆÚ[‹œÙ]˜XÚÙÜ›Ý[™ÛÛÜŠÛÛ™šYË˜˜XÚÙÜ›Ý[™ÛÛÜŠNÂˆ\UšXœ˜[˜ÞUÔÙXÛÛ™\žUÚ[™ÝÜÊ˜[Z[RY\Ñ\šÊNÂˆB‚ˆ\ÓXZ[‹›ÛŠ	Ý[YN˜\K]šXœ˜[˜ÞIË
+]™[˜]Ô^[ØYˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆÛÛœÝ^[ØYH\œÙUÚ[™ÝÕ[YUšXœ˜[˜ÞT^[ØY
+˜]Ô^[ØY
+NÂˆYˆ
+\^[ØY
+H™]\›ŽÂˆYˆ
+^[ØY›[ÙHOOH[™Yš[™Y^[ØYœÞ\Ý[S[ÙQ›ÛÝÜÔÞ\Ý[HOOH[™Yš[™Y
+H™]\›ŽÂˆYˆ
+›ØÙ\ÜËœ]›Ü›HOOH	ÝÚ[ŒÌ‰ÊHÂˆÜš]UÚ[™ÝÕ[YTÛ˜\ÚÝ
+ˆ^[ØY›[ÙKˆ^[ØYš\Ñ\šËˆ^[ØY™˜[Z[RYˆ^[ØYœÞ\Ý[S[ÙQ›ÛÝÜÔÞ\Ý[Kˆ
+NÂˆBˆ™[Y[X™\”™\ÛÛ™Y\[YJ^[ØYš\Ñ\šÊNÂˆ\UÚ[™ÝÕšXœ˜[˜ÞJ^[ØY™˜[Z[RY^[ØYš\Ñ\šÊNÂˆJNÂ‚ˆ\ÓXZ[‹›ÛŠ	ÙÙ]X\]™\œÚ[Û‰Ë
+]™[
+HOˆÂˆ]™[œ™]\›•˜[YHH\™Ù]™\œÚ[ÛŠ
+NÂˆJNÂ‚ˆ\ÓXZ[‹›ÛŠ	ÙÙ][ÜË\™[X\ÙIË
+]™[
+HOˆÂˆ]™[œ™]\›•˜[YHHÜËœ™[X\ÙJ
+NÂˆJNÂ‚ˆËÈ:i¥¹d+ù.«º"lºeê9æ¡9d#9«iy/&º+çyî¯ùí(Š:)àH]]Ù\ÜÚ[Û’[ÊNœ™[™\™\ˆ›ÛÝÝ˜\9g*ˆËÈ9.îù/ey®,¹§äùbcyb)9k¦¸à#9ç'úi¥¹d+øà#KØØ[ÝÜ˜YÙH9..¹ên¹/a¹..ú/æùê"ù£ y§"ykf:aãù/&º+çJ9£ y.ayc%‚ˆËÈ™Yœ™\ÚÚÙ[ˆÈØØ[9ª(yo#Êy¥í¹.#yo¥ù¯à9­.ù.«º"lºeê9d)¹b&ymì¹ænùoey¦¥ú"l¹å*9¢-ù/&¹ab9ç"ùb,ˆËÈ9.«º"lºi¥¹n)øà ¹oázhnÈÙ[™Þ[˜ø %8 %9b)9k¦¹cäyå'ùg*:i¥¹n)ù.bùbcK9o ¹«iHTÈ:-m¹.#y."¸à ‚ˆ\ÓXZ[‹›ÛŠ	Ø]]š\Ë\\œÚ\ÝY\Ù\ÜÚ[Û‹Z[\Þ[˜ÉË
+]™[
+HOˆÂˆ]™[œ™]\›•˜[YHH\Ô\œÚ\ÝYÙ\ÜÚ[Û’[
+È\Ù\‘]T]ˆ\™Ù]]
+	Ý\Ù\‘]IÊHJNÂˆJNÂ‚ˆ\ÓXZ[‹›ÛŠ	ÙÙ]X\Y\Ü^K]™\œÚ[Û‹Z[™›ÉË
+]™[
+HOˆÂˆ]™[œ™]\›•˜[YHHÙ]\\Ü^U™\œÚ[Û’[™›Ê
+NÂˆJNÂ‚ˆËÈ™[™\™\ˆ8¡¤ˆXZ[ˆ9¥éyoåú/k9cäNº-l[šYšYYÙÙÙ\ˆ9æ¡Üš]Qœ›ÛT™[™\™\‹ˆËÈ:+ªHXZ[ˆ9æ¡]™[š[\ˆ9å'ù¥b
+ØÛÜH9b¨Žˆ9bcyï 9.éyc.¹b!¹§iy®¤
+xà ‚ˆ\ÓXZ[‹›ÛŠˆ	Ü™[™\™\Ž›ÙÉËˆ
+ˆÙKˆ]™[ˆ	Ý˜XÙIÈ	ÙXYÉÈ	Ú[™›ÉÈ	ÝØ\›‰È	Ù\œ›Ü‰È	Ù˜][	ËˆØÛÜNˆÝš[™Ëˆ\ÙÎˆÝš[™Ëˆ
+HOˆÂˆËÈ™[™\™\ˆ: ïycäy¥éyoåÈH”È9mìº-äz-mù§iH8¡¤ˆ:)èúfi]ˆ9d+ùbª9ç"úeê9âåÊ:)àH™[™\™\‹X›ÛÝYÝX\™Êxà ‚ˆ™[™\™\›ÛÝÝX\™Ë›X\šÐ[]™J
+NÂˆÜš]Qœ›ÛT™[™\™\Š]™[ØÛÜK\ÙÊNÂˆKˆ
+NÂ‚ˆËÈXZÙ\ˆY[[ÜžH9d+ùbªTÈ8 %8 %™[™\™\‹Ú[™^Þ9g*™XXÝ[Ý[9bcz, ùå*;ï#9å*XZ[ˆ9ç'ù`/ˆËÈ9d#9«iHØØ[ÝÜ˜YÙH9nmº/àyéîù¥éÈÜ[Ý];ï&ù¥í¹§.º/ç9¥êy.£ˆÜ\Ú9d#¹¢cy¬ê9a£9æ¡9.©9.¤¹o#ÈXZÙ\ŽŠ‚ˆËÈ[™\»ï#9fè9«i9âë9êâù£ä9bcy£ º/oxà º/àyéîùcê¹/&¹a¦y£ y.ayc%¹`/;ï#9nm¹g*XZÙ\ˆ9mìº(ªùam¹k ùd+ùbª:-ëùo¡9§¡:`(ˆËÈ9¥íºhn¹n)ˆ\ØX›H9ã¬9§"HX[˜YÙ\»ï&ù.#y/&¹..º/àyéîú #9..ùbª9§¡:`(XZÙ\¸à ¹«hùn.ÙÙÛKÜ™\Ù]9.ãyg*ˆËÈ™YÚ\Ý\‹È9.+y¬ê9a£;ï#9fè9..¹k ù.ë9/§z-eˆÜ\Ú9k£9¢$9d#¹æ¡9k£9¥mYÙ[[[Yxà ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK“QSSÔ–WÑÑUÔÑUS‘ÔË\Þ[˜È
+
+HOˆÂˆ™]\›ˆ™XYY[[ÜžTÙ][™ÜÊ
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK“QSSÔ–WÑÑUÔÑUS‘Ô×ÔÕUK\Þ[˜È
+
+HOˆÂˆ™]\›ˆY[[ÜžTÙ][™ÜÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK“QSSÔ–WÔ‘TÑT•‘WÓQÐPÖWÓPRÑT—ÑTÐP“Qˆ\Þ[˜È
+ÙKYØXÞT™[™\™\•˜[YNˆ[šÛ›ÝÛŠHOˆÂˆÛÛœÝ\œÙYYØXÞT™[™\™\•˜[YHBˆYØXÞT™[™\™\•˜[YHOOHYHÈYHˆYØXÞT™[™\™\•˜[YHOOH˜[ÙHÈ˜[ÙHˆ[ÂˆžHÂˆÛÛœÝÙ][™ÜÈH™\Ù\™SYØXÞSXZÙ\“Y[[ÜžQ\ØX›Y
+\œÙYYØXÞT™[™\™\•˜[YJNÂˆËÈ™[™\™\ˆZYÜ˜][Ûˆ9cëú ïy¦f¹.£ˆÜ\Ú9b&ùnîˆXZÙ\¸à ¹£ y.ayc%¹..ˆ˜[ÙH9d#¹oázhnùêâùclùd#9«iBˆËÈ9mì¹kf9g*9æ¡X[˜YÙ\»ï#:`oùacyodùbcz/æùê"ùîéùîëy£"y¥éùæ¡[˜X›Y]YH9d+ùbª9¥¬Ù\ÜÚ[Û¸à ‚ˆÛÛœÝXZÙ\ˆHÙ]XZÙ\’Y”™XYJ
+NÂˆYˆ
+\Ù][™ÜË›XZÙ\ˆ	‰ˆXZÙ\Ë›XZÙ\“Y[[ÜžOËš\Ñ[˜X›Y
+
+JHÂˆ]ØZ]XZÙ\‹›XZÙ\“Y[[ÜžK™\ØX›J
+NÂˆ]ØZ]XZÙ\‹œÙ]YÙ[Y[[ÜžJ	ØÛ]YKXÛÙIËÙ][™ÜË˜Û]YPÛÙJNÂˆ]ØZ]XZÙ\‹œÙ]YÙ[Y[[ÜžJ	ØÛÙ^	ËÙ][™ÜË˜ÛÙ^
+NÂˆBˆ™]\›ˆÙ][™ÜÎÂˆHØ]Ú
+\œŠHÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	ÒS•T“S	ËˆY[[ÜžHÙ][™ÜÈZYÜ˜][Ûˆ˜Z[Yˆ	Ù\œˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ‹›Y\ÜØYÙHˆÝš[™Ê\œŠ_Xˆ
+NÂˆBˆKˆ
+NÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK’SWÑQUSÔÑUS‘Ô×ÑÑU\Þ[˜È
+ÙK˜]ÐÚ[›™[ˆ[šÛ›ÝÛŠHOˆÂˆ™]\›ˆ[QY˜][Ù][™ÜÕÚ\™J\œÙR[QY˜][Ù][™ÜÐÚ[›™[
+˜]ÐÚ[›™[
+JNÂˆJNÂˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK’SWÑQUSÔÑUS‘Ô×ÔÑUˆ\Þ[˜È
+ÙK]Úˆ[šÛ›ÝÛ‹˜]ÐÚ[›™[ˆ[šÛ›ÝÛŠHOˆÂˆÛÛœÝÚ[›™[H\œÙR[QY˜][Ù][™ÜÐÚ[›™[
+˜]ÐÚ[›™[
+NÂˆÛÛœÝ\œÙY]ÚH\œÙR[QY˜][Ù][™ÜÔ]Ú
+]Ú
+NÂˆÜš]R[QY˜][Ù][™ÜÔ]Ú
+\œÙY]ÚÚ[›™[
+NÂˆ™]\›ˆ[QY˜][Ù][™ÜÕÚ\™JÚ[›™[
+NÂˆKˆ
+NÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK’SWÑQUSÔÑUS‘Ô×Ô‘TÑU\Þ[˜È
+ÙK˜]ÐÚ[›™[ˆ[šÛ›ÝÛŠHOˆÂˆÛÛœÝÚ[›™[H\œÙR[QY˜][Ù][™ÜÐÚ[›™[
+˜]ÐÚ[›™[
+NÂˆYˆ
+Ú[›™[
+HÂˆ™\Ù][QY˜][Ù][™ÜÐÚ[›™[
+Ú[›™[
+NÂˆH[ÙHÂˆ™\Ù][QY˜][Ù][™ÜÑÛØ˜[
+
+NÂˆBˆ™]\›ˆ[QY˜][Ù][™ÜÕÚ\™JÚ[›™[
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÕPQÑS•ÓSÑSÔÑUS‘Ô×ÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆÝX˜YÙ[[Ù[Ù][™ÜÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÕPQÑS•ÓSÑSÔÑUS‘Ô×ÔÑU\Þ[˜È
+]™[]Úˆ[šÛ›ÝÛŠHOˆÂˆËÈ9§+Ú[›™[9mì¹caùî©ù..¹cëú)é¹cäz/æùê"ùë¨yä!Š:/kùalËúaãyd+ù§+9g,ÛÙ^9/&º+çJyæ¡9¤ãy/gˆËÈ9oázhnùab:j£:+àz, ùå*9¥®y¦+ùcëù/èy..ù®,¹§äùfj9.#z ïz+ªy.îù¡#ùcå¹o¥ÈÚ[›™[9æ¡œ˜[YKÕÙX•šY]ÂˆËÈ9¥.ya¦HÝÛ™\‹\ØÛÜY:acyïk¹nmºaãyd+ù/&º+çJÛÙ^™]šY]ÈJxà ‚ˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆËÈ:acykîy. :!í9 )ù£"xà#]Ú9d"9nm¹odùbcykf9`ª8à#yb)9k¦Ž¹§"y¥b9ª(yg¢ù..ˆ[9¥í¹§iy®¤9o.¹b-¹®!yên‹ˆËÈ9d#9¥í¹ag9/cøà#9®!yª(yg¢ù¯#ù®!y§iy®¤8à#y.#¸à#9ª(yg¢ù§*¹£!ùk¦¹¥í¹æ¡›ÝšY\‹[Û›H]Ú8à#y.)9ìnùki9a/ùa¦yaixà ‚ˆÛÛœÝÝ\œ™[H™XYÝX˜YÙ[[Ù[Ù][™ÜÊ
+NÂˆÛÛœÝ\œÙYH™XÛÛ˜Ú[TÝX˜YÙ[[Ù[Ù][™ÜÔ]Ú
+ˆ\œÙTÝX˜YÙ[[Ù[Ù][™ÜÔ]Ú
+]Ú
+KˆÝ\œ™[ˆ
+NÂˆËÈÛÙ^9æ¡XÈ9¬ê9aiyg*9aly.ªÈ\\Ù\™\ˆ9æ¡Ü]Ûˆ9¥í¹b.Ë9cæ9¦í:)é¹câ¹¬ê9aize+¹.%9§"ykf9­.ÂˆËÈXZÙ\ˆ9¥íº-lY™\œ™YÛÙ^™\Ý\9¢iú(c9/dÊ9ênºeì¹clú/kúaãyd+Ë\ÞH:$/yææ9d#¹níº/çùadyã¬
+NÂˆËÈ9¥èXZÙ\Š9d+ùbª9¥êy§'Ëùmì¹alÊy¥í¹¥¬Ü]Ûˆ9i*yá-¹ã¬:+îù¥¬9`/9æí9£©z$/yææ8à ‚ˆÛÛœÝ™YYÐÛÙ^™\Ý\BˆÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙY
+Ý\œ™[È‹‹˜Ý\œ™[‹‹œ\œÙYJH	‰ˆÙ]XZÙ\’Y”™XYJ
+HOOH[ÂˆYˆ
+[™YYÐÛÙ^™\Ý\
+HÂˆÜš]TÝX˜YÙ[[Ù[Ù][™ÜÔ]Ú
+\œÙY
+NÂˆ™]\›ˆÈ‹‹œÝX˜YÙ[[Ù[Ù][™ÜÕÚ\™J
+KÛÙ^™\Ý\Y™\œ™Yˆ˜[ÙHNÂˆBˆËÈ9¢iú(c9/dùæ¡™\\™J:/kùalù/&º+çJz-ê9i&¹.*ˆ]ØZ]9§'úeí9cëú ïycäyå'ùænùaî‹ùb!ùcíÎÜ\œÚ\Ý9£"BˆËÈ8à#:+íù¬`¹¥í¹b.ùæ¡9odùbcHÝÛ™\¸à#z)èù§¤:-ëùo¡9.#yîäyk¦ˆØÛÜH9/&¹¢¢ˆH9æ¡9/ë¹¥.ya¦z/æÈˆÈ9ænùaî‚ˆËÈ9doyd#yênºeí
+\Ù\ÜÚ[Û”Ý]K˜XÝ]™SÝÛ™\”ØÛÜRÙ^H9æ¡:-ê]ØZ]9a¦yaiyidyî©‹ÛÙ^ˆËÈ™]šY]ÈJxà º/áù§'ùclù¢ä‹9.#zgfznæ:$/yææ8à ‚ˆÛÛœÝÝÛ™\”ØÛÜRÙ^HHXÝ]™SÝÛ™\”ØÛÜRÙ^J
+NÂˆËÈ9§"y¥b9 )ÈHØÛÜH9§*¹cæ
+Š¹.%
+Šˆ9¬¨y§"HÝÛ™\ˆ›Ý[™\žH9g*:`%˜™YÚ[\Ù\ÜÚ[Û›Ý[™\žBˆËÈ9cê¹b¨›Ý[™\žQ\ØÛÜHÙ^H9æ¡Ù[™\˜][Ûˆ:) yëbH›Ý[™\žH9d#¹æ¡9ê,ùk¦¹/&º+çHÛÛ[Z]ˆËÈ9¢cycæ8 %8 %X\™ÝÛˆ9mì¹îãÈÛX\‘Y™\œ™YÛÙ^™\Ý\›Ü“ÝÛ™\›Ý[™\žH: #ØÛÜK[Û›BˆËÈ9¨à9§éy.ãy..ˆYH9æ¡9ê¥ùcèúaã:/áù§'ú+íù¬`¹/&ºaãy¥¬:$/yææùænú+¬
+ÛÙ^™]šY]ÈH9ë+:/kŠxà ‚ˆËÈ›Ý[™\žH9g*:`%9. 9o¢È˜Z[XÛÜÙY8à ‚ˆÛÛœÝÝ[˜[YH
+
+HO‚ˆZ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+H	‰ˆXÝ]™SÝÛ™\”ØÛÜRÙ^J
+HOOHÝÛ™\”ØÛÜRÙ^NÂˆ™]\›ˆ\PÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙUÚ]™\Ý\
+\Þ[˜È
+
+HOˆÂˆYˆ
+\Ý[˜[Y
+
+JHÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	Ô‘PÓÓ‘USÓ—ÑRSQ	Ëˆ	Ø\Ù\ÜÚ[ÛˆÚ[™ÙY\š[™ÈÛÙ^™\Ý\ÈÜš]H›ÜY	Ëˆ
+NÂˆBˆÜš]TÝX˜YÙ[[Ù[Ù][™ÜÔ]Ú
+\œÙY
+NÂˆ™]\›ˆÝX˜YÙ[[Ù[Ù][™ÜÕÚ\™J
+NÂˆËÈÝ[˜[Y9d#9¥í¹/(9îæy¢iú(c9/dÎ˜\ÞH:-ëùo¡\œÚ\Ý9.#¹ænú+¬9.búeí:/æ9§"y. 9.*ˆ]ØZ]:/®yåcˆËÈ:+éyê¥ùcèùa¡HÝÛ™\ˆ›Ý[™\žH9®!y£¢y¥éùænú+¬9d#‹9§+:+íù¬`¹.#yo¥ùa£HØÚY[JÛÙ^™]šY]ÂˆËÈH9ë+È:/kŠxà ‚ˆKÝ[˜[Y
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÕPQÑS•ÓSÑSÔÑUS‘Ô×Ô‘TÑU\Þ[˜È
+]™[
+HOˆÂˆËÈ9d#ÑUœ™\Ý\XØ\X›H9¤ãy/g9ab:j£9cëù/èy®,¹§äùfj
+ÛÙ^™]šY]ÈJxà ‚ˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆÛÛœÝ™YYÐÛÙ^™\Ý\BˆÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙY
+™XYÝX˜YÙ[[Ù[Ù][™ÜÊ
+KÕPQÑS•ÓSÑSÔÑUS‘Ô×ÑQUSÊH	‰‚ˆÙ]XZÙ\’Y”™XYJ
+HOOH[ÂˆYˆ
+[™YYÐÛÙ^™\Ý\
+HÂˆ™\Ù]ÝX˜YÙ[[Ù[Ù][™ÜÊ
+NÂˆ™]\›ˆÈ‹‹œÝX˜YÙ[[Ù[Ù][™ÜÕÚ\™J
+KÛÙ^™\Ý\Y™\œ™Yˆ˜[ÙHNÂˆBˆËÈ9d#ÑUº-ê]ØZ]9æ¡ÝÛ™\‹\ØÛÜY9a¦yaiyoázhnùîäyk¦ˆØÛÜK:/áù§'ùclù¢äŠÛÙ^™]šY]ÈJNÂˆËÈÝ[˜[Y9/(9îæy¢iú(c9/dùk¢9/cÈ\œÚ\Ý8¡¤¹ænú+¬9æ¡9ê¥ùcèË9nm¹¢¢ˆ›Ý[™\žH9g*:`%9nm¹aiyb)9k¦‚ˆËÈ
+ØÛÜHÙ^H9g*›Ý[™\žHÛÛ[Z]9bcy.#ycæÛÙ^™]šY]ÈH9ë+ËÍ:/kŠxà ‚ˆÛÛœÝÝÛ™\”ØÛÜRÙ^HHXÝ]™SÝÛ™\”ØÛÜRÙ^J
+NÂˆÛÛœÝÝ[˜[YH
+
+HO‚ˆZ\Ð\Ù\ÜÚ[Û›Ý[™\žT[™[™Ê
+H	‰ˆXÝ]™SÝÛ™\”ØÛÜRÙ^J
+HOOHÝÛ™\”ØÛÜRÙ^NÂˆ™]\›ˆ\PÛÙ^Ü]ÛÛÛ™šYÐÚ[™ÙUÚ]™\Ý\
+\Þ[˜È
+
+HOˆÂˆYˆ
+\Ý[˜[Y
+
+JHÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	Ô‘PÓÓ‘USÓ—ÑRSQ	Ëˆ	Ø\Ù\ÜÚ[ÛˆÚ[™ÙY\š[™ÈÛÙ^™\Ý\È™\Ù]›ÜY	Ëˆ
+NÂˆBˆ™\Ù]ÝX˜YÙ[[Ù[Ù][™ÜÊ
+NÂˆ™]\›ˆÝX˜YÙ[[Ù[Ù][™ÜÕÚ\™J
+NÂˆKÝ[˜[Y
+NÂˆJNÂ‚ˆËÈ:)áº)ây¨iz+¯¹ïkˆTÈ8 %8 %ÝÜ™H9.#ˆXZÙ\ˆ9cey/¢ù¥è9alË9£ä9bcy¬ê9a£;ï":)àHš\Ú[Û‹XœšYÙK\Ù][™ÜË\ÝÜ™{ï"xà ‚ˆËÈÑU9.gù¦+ùâny§`úacyïkºghº+îùcå»ï"›ÝšY\’YÛ[Ù[Yùo 9alûï"{ï#:gg¹cëù/èHÙ[™\ˆ9d#9¨-ù¢ä¹îç{ï"9.#ˆÑUÔ‘TÑU9kîzod;ï"xà ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK•’TÒSÓ—Ð”’QÑWÔÑUS‘Ô×ÑÑU\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆš\Ú[ÛœšYÙTÙ][™ÜÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK•’TÒSÓ—Ð”’QÑWÔÑUS‘Ô×ÔÑU\Þ[˜È
+]™[]Úˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆÛÛœÝ\œÙYH\œÙUš\Ú[ÛœšYÙTÙ][™ÜÔ]Ú
+]Ú
+NÂˆÜš]Uš\Ú[ÛœšYÙTÙ][™ÜÊ\œÙY
+NÂˆ™]\›ˆš\Ú[ÛœšYÙTÙ][™ÜÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK•’TÒSÓ—Ð”’QÑWÔÑUS‘Ô×Ô‘TÑU\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™\Ù]š\Ú[ÛœšYÙTÙ][™ÜÊ
+NÂˆ™]\›ˆš\Ú[ÛœšYÙTÙ][™ÜÕÚ\™J
+NÂˆJNÂ‚ˆËÈÛ]YHÛÙH:!ê¹bª9."¹."ù¥¡ùc¢ùï*zf"9`/TÈ8 %8 %ÝÜ™H:-çÈXZÙ\ˆ9cey/¢ù¥è9alË9£ä9bcy¬ê9a£8à ‚ˆËÈZ[\ÚÝÜÛ]YT[[YPÛÛ™šYË˜™Z]š[Ü‘›YÜÈ9¦+ùbª9  HÙ]\‹9."ù.*¹¥¬Ù\ÜÚ[Ûˆ:+îùb,9¥¬9`/8à ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÒSS•ÑSÔ–TQÔ‘U–WÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆÚ[[[˜Üž\Y™]žUÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÒSS•ÑSÔ–TQÔ‘U–WÔÑU\Þ[˜È
+ÙK[˜X›Yˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜÚ[[[˜Üž\Y™]žH[˜X›Y™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆÜš]TÚ[[[˜Üž\Y™]žQ[˜X›Y
+[˜X›Y
+NÂˆ™]\›ˆÂˆ‹‹œÚ[[[˜Üž\Y™]žUÚ\™J
+KˆY™™XÝ]™Nˆ	Ú[[YYX]IÈ\ÈÛÛœÝˆNÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÒSS•ÑSÔ–TQÔ‘U–WÔ‘TÑU\Þ[˜È
+
+HOˆÂˆ™\Ù]Ú[[[˜Üž\Y™]žTÙ][™ÜÊ
+NÂˆ™]\›ˆÂˆ‹‹œÚ[[[˜Üž\Y™]žUÚ\™J
+KˆY™™XÝ]™Nˆ	Ú[[YYX]IÈ\ÈÛÛœÝˆNÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÑTÔÒSÓ—Ô•S•SQWÑSPÒ×ÑÑU\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆÙ\ÜÚ[Û”[[YQ˜[˜XÚÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÑTÔÒSÓ—Ô•S•SQWÑSPÒ×ÔÑU\Þ[˜È
+]™[[˜X›Yˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜÙ\ÜÚ[Ûˆ[[YH˜[˜XÚÈ[˜X›Y™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆÜš]TÙ\ÜÚ[Û”[[YQ˜[˜XÚÑ[˜X›Y
+[˜X›Y
+NÂˆ™]\›ˆÈ‹‹œÙ\ÜÚ[Û”[[YQ˜[˜XÚÕÚ\™J
+KY™™XÝ]™Nˆ	Ú[[YYX]IÈ\ÈÛÛœÝNÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”ÑTÔÒSÓ—Ô•S•SQWÑSPÒ×Ô‘TÑU\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™\Ù]Ù\ÜÚ[Û”[[YQ˜[˜XÚÔÙ][™ÜÊ
+NÂˆ™]\›ˆÈ‹‹œÙ\ÜÚ[Û”[[YQ˜[˜XÚÕÚ\™J
+KY™™XÝ]™Nˆ	Ú[[YYX]IÈ\ÈÛÛœÝNÂˆJNÂ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÓÓTPÕSÓ—ÑÑUÔÕ\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆ™XYÛÛ\XÝ[Û”Ý
+
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÓÓTPÕSÓ—ÑÑUÔÕUK\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆÛÛ\XÝ[Û•Ú\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÓÓTPÕSÓ—Ô‘TÑUÔÕ\Þ[˜È
+]™[ÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ\ÜÙ\ÛÛ\XÝ[Û“]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆ™\Ù]ÛÛ\XÝ[Û”Ý
+
+NÂˆ™]\›ˆÛÛ\XÝ[Û•Ú\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑKÓÓTPÕSÓ—ÔÑUÔÕˆ\Þ[˜È
+]™[Ýˆ[šÛ›ÝÛ‹ÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[ÙˆÝOOH	Û[X™\‰ÈS[X™\‹š\Ñš[š]JÝ
+JHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ØÛÛ\XÝ[ÛˆÝ™\]Z\™Y
+[X™\ŠIÊNÂˆBˆ\ÜÙ\ÛÛ\XÝ[Û“]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆÜš]PÛÛ\XÝ[Û”Ý
+Ý
+NÂˆ™]\›ˆÛÛ\XÝ[Û•Ú\™J
+NÂˆKˆ
+NÂ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”WÐÓÓTPÕSÓ—ÑÑUÔÕ\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆ™XYPÛÛ\XÝ[Û”Ý
+
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”WÐÓÓTPÕSÓ—ÑÑUÔÕUK\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆPÛÛ\XÝ[Û•Ú\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK”WÐÓÓTPÕSÓ—Ô‘TÑUÔÕ\Þ[˜È
+]™[ÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ\ÜÙ\ÛÛ\XÝ[Û“]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆ™\Ù]PÛÛ\XÝ[Û”Ý
+
+NÂˆ™]\›ˆPÛÛ\XÝ[Û•Ú\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑK”WÐÓÓTPÕSÓ—ÔÑUÔÕˆ\Þ[˜È
+]™[Ýˆ[šÛ›ÝÛ‹ÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+\[ÙˆÝOOH	Û[X™\‰ÈS[X™\‹š\Ñš[š]JÝ
+JHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜHÛÛ\XÝ[ÛˆÝ™\]Z\™Y
+[X™\ŠIÊNÂˆBˆ\ÜÙ\ÛÛ\XÝ[Û“]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆÜš]TPÛÛ\XÝ[Û”Ý
+Ý
+NÂˆ™]\›ˆPÛÛ\XÝ[Û•Ú\™J
+NÂˆKˆ
+NÂ‚ˆËÈÚ[™ÝÈ™Z]š[Üˆ8 %8 %ÝØ[ÝÐXÝ]˜][ÛÛXÚÈ9/çy£ H™[™\™\ˆ:/ä:(c9¥í¹.¢ùk§¹¨!ùaáŽÂˆËÈÚ[™ÝÜÈÈ[^ÛÜÙH™Z]š[Üˆ9å,HXZ[ˆ:+îùa¦ynm¹¢iú(c8à ‚ˆ\ÓXZ[‹š[™JˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÔÕÐSÕ×ÐPÕUUSÓ—ÐÓPÒ×ÐÒS“‘Sˆ\Þ[˜È
+ÙK[˜X›Yˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÜÝØ[ÝÐXÝ]˜][ÛÛXÚÈ™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆÜš]TÝØ[ÝÐXÝ]˜][ÛÛXÚÊ[˜X›Y
+NÂˆ™]\›ˆÈÚÎˆYH\ÈÛÛœÝNÂˆKˆ
+NÂˆ\ÓXZ[‹š[™JÒS‘Õ×Ð‘RU’SÔ—ÑÑUÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘S\Þ[˜È
+
+HOˆÂˆ™]\›ˆ™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+KÚ[™ÝÜÐÛÜÙP™Z]š[ÜŽÂˆJNÂˆ\ÓXZ[‹š[™JˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘Sˆ\Þ[˜È
+ÙK™Z]š[ÜŽˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+Z\ÕÚ[™ÝÜÐÛÜÙP™Z]š[ÜŠ™Z]š[ÜŠJHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÕÚ[™ÝÜÈÛÜÙH™Z]š[Üˆ™\]Z\™Y
+]Z]˜^JIÊNÂˆBˆÚ[™ÝÜÐÛÜÙT›Û\˜[˜XÚË˜XÚÛ›ÝÛYÙJ
+NÂˆÜš]UÚ[™ÝÜÐÛÜÙP™Z]š[ÜŠ™Z]š[ÜŠNÂˆYˆ
+™Z]š[ÜˆOOH	Ü]Z]	ÊH\Ý›ÞUÚ[™ÝÜÕ˜^J
+NÂˆ™]\›ˆ™Z]š[ÜŽÂˆKˆ
+NÂˆ\ÓXZ[‹›ÛŠÒS‘Õ×Ð‘RU’SÔ—ÕÒS‘ÕÔ×ÐÓÔÑWÐ‘RU’SÔ—ÔÒÕÓ—ÐÒS“‘S
+]™[
+HOˆÂˆYˆ
+œ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠHOOHXZ[•Ú[™ÝÔ™YŠHÂˆÚ[™ÝÜÐÛÜÙT›Û\˜[˜XÚË˜XÚÛ›ÝÛYÙJ
+NÂˆBˆJNÂˆ\ÓXZ[‹š[™JÒS‘Õ×Ð‘RU’SÔ—ÑÑUÓS•VÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘S\Þ[˜È
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆ™]\›ˆ™XYÚ[™ÝÐ™Z]š[Ü”Ù][™ÜÊ
+K›[^ÛÜÙP™Z]š[ÜŽÂˆJNÂˆ\ÓXZ[‹š[™JˆÒS‘Õ×Ð‘RU’SÔ—ÔÑUÓS•VÐÓÔÑWÐ‘RU’SÔ—ÐÒS“‘Sˆ\Þ[˜È
+]™[™Z]š[ÜŽˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+Z\Ó[^ÛÜÙP™Z]š[ÜŠ™Z]š[ÜŠJHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	Ó[^ÛÜÙH™Z]š[Üˆ™\]Z\™Y
+]Z]Z[š[Z^™JIÊNÂˆBˆ[^ÛÜÙT›Û\˜[˜XÚË˜XÚÛ›ÝÛYÙJ
+NÂˆÜš]S[^ÛÜÙP™Z]š[ÜŠ™Z]š[ÜŠNÂˆ™]\›ˆ™Z]š[ÜŽÂˆKˆ
+NÂˆ\ÓXZ[‹›ÛŠÒS‘Õ×Ð‘RU’SÔ—ÓS•VÐÓÔÑWÐ‘RU’SÔ—ÔÒÕÓ—ÐÒS“‘S
+]™[
+HOˆÂˆ\ÜÙ\\ÝY\™[™\™\‘]™[
+]™[
+NÂˆYˆ
+œ›ÝÜÙ\•Ú[™ÝË™œ›ÛUÙXÛÛ[Ê]™[œÙ[™\ŠHOOHXZ[•Ú[™ÝÔ™YŠHÂˆ[^ÛÜÙT›Û\˜[˜XÚË˜XÚÛ›ÝÛYÙJ
+NÂˆBˆJNÂˆËÈÔ™]H9o 9alÈTÈ8 %8 %9d#ÛÛ\][[ÙH9ª(yo#Î‚ˆËÈÑU9îæH™[™\™\ˆ9d+ùbª9§'ùd#9«iHØØ[ÝÜ˜YÙH:eg9`ãÎÈÑU:$/H”ÓÓˆ9¥¡ù.íˆ
+È9¦í9¥¬ØXÚKˆËÈXÜ›ÝšY\œÈ\Ñ[˜X›Y9."ù«(HÙ\ÜÚ[Û‹œÝ\9¥íº+îùb,9¥¬9`/8à ¹mì¹o Ù\ÜÚ[Ûˆ9.#ycæ8à ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK“ÔÓSÑWÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆ™XYÜ[ÙTÙ][™ÜÊ
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK“ÔÓSÑWÔÑU\Þ[˜È
+ÙK[˜X›Yˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÛÜ[ÙH[˜X›Y™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆÜš]SÜ[ÙQ[˜X›Y
+[˜X›Y
+NÂˆ™]\›ˆÈY™™XÝ]™Nˆ	Û™^\Ù\ÜÚ[Û‰È\ÈÛÛœÝNÂˆJNÂ‚ˆËÈ9¦nº ïz`&º+«ùoeHTÈ8 %8 %:+¯¹ïk¹o 9alÈ
+È9¥l9£kˆÔ•Q
+:+¯¹ïkºhmyë¨yä!ˆRH:`&º`dÊK9£ä9bcy¬ê9a£8à ‚ˆ™YÚ\Ý\ÛÛXÝÒ\ÊÂˆ™\Ý\ÛÙ^Y\]][ÙPÚ[™ÙKˆÚ]ÝÛÛÙ^[š\›Û›Y[ˆØÚY[QY™\œ™YÛÙ^™\Ý\ˆ[˜[Y]TQ[š\›Û›Y[ˆJNÂ‚ˆËÈ: b¹i*ymc9aiyo 9alÈTÈ8 %8 %9.#ˆÛÛ\][[ÙH9d#9ä!¹£ä9bcy¬ê9a£‚ˆËÈ™[™\™\ˆ9d+ùbª›ÛÝÝ˜\9d#9«iHØØ[ÝÜ˜YÙH:eg9`ãË:/ç9¥êy.£ˆÜ\Ú9k£9¢$8à ‚ˆËÈÑU:-ëùo¡9¥èº$/H”ÓÓˆ9.gùêâùclù¢¢ˆÚ]Z\ÝÜžKY[X™Y\ˆ9æ¡:/ä:(c9¥íˆ[˜X›Y9b!ù£hˆ8 %8 %ˆËÈÙÙÛHÙ™ˆ9d#¹."ù. 9§hy¥¬9­¢9 kùl,y.#ya£yaizf'Ë9.#zg :) zaãyd+øà ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÒUÑSP‘QS‘×ÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆÚ][X™Y[™ÕÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JˆPRÑT—ÒT×ÒS•“ÒÑKÒUÑSP‘QS‘×ÔÑUˆ\Þ[˜È
+ÙK[˜X›Yˆ[šÛ›ÝÛ‹ÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ØÚ][X™Y[™È[˜X›Y™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆ\ÜÙ\Ú][X™Y[™Ó]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆYˆ
+[˜X›Y	‰ˆZ\ÐÚ][X™Y[™Ð]˜Z[X›J
+JHÂˆ›ÝÒ\Ñ\œ›ÜŠˆ	ÕS”ÕTÔ•QÐÐTP’SUIËˆ	ÐÚ][X™Y[™È\È›Ý]˜Z[X›H›Üˆ\ÈXØÛÝ[Üˆ™YÚ[Û‹‰Ëˆ
+NÂˆBˆËÈ9ab9¢¢¹å*9¢-ú`"y¢êyc§ùkd9a¦yaiyodùbcHÝÛ™\»ï&úe yëbyo¡y§'úeí9b!ùcíù/&ˆ˜Z[ÛÜÙY;ï#9.#y/&¹¢¢ˆH9æ¡:`"y¢êya¦yîæH¸à ‚ˆžHÂˆ]ØZ]Üš]PÚ][X™Y[™Ñ[˜X›Y
+[˜X›YÚ][X™Y[™ÑY˜][ÛÛ^
+
+JNÂˆHØ]Ú
+\œ›ÜŠHÂˆËÈ9a¦yaiycëú ïyg*:-ê:/æùê"úe y¢%ˆÝÛ™\ˆ›Ý[™\žH9."¹i,z-){ï&ù¥è:+®¹i ¹/ey£"yèàyææ9§ 9¥¬9ç'ù`/™XÛÛ˜Ú[{ï#ˆËÈ:`oùacHRH9¥-¹b,:e&z+ëù¥íˆ[[YH9.ãy¬¯ùå*9¥éùo 9aløà ‚ˆ]ØZ]ØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+NÂˆYˆ
+Z\Ò\Ñ\œ›ÜŠ\œ›ÜŠJHÂˆÜ™X]TØÚY[\“ÙÙÙ\Š	ØÚ]Y[X™Y[™Ë\Ù][™ÜÉÊK™\œ›ÜŠˆ	Ñ˜Z[YÈØ]™HÚ][X™Y[™ÈÙ][™ÜÉËˆÈ\œ›ÜŽˆ\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆÝš[™Ê\œ›ÜŠHKˆ
+NÂˆBˆ™]›ÝÐÚ][X™Y[™Ô\œÚ\Ý\œ›ÜŠ\œ›Ü‹	Ñ˜Z[YÈØ]™HÚ][X™Y[™ÈÙ][™ÜÉÊNÂˆBˆËÈ:/ä:(c9¥íˆ™XÛÛ˜Ú[H9 .ù¦+úaãz+îù§ 9¥¬:-)¹cíøà ¹clù/oùa¦yaiyk£9¢$9d#¹êâùb.ùb!ùcíûï#9¥éú+íù¬`¹.gù.#y/&¹æí9£©y£©ùb-¹¥¬:-)¹cíøà ‚ˆ]ØZ]ØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+NÂˆ™]\›ˆÚ][X™Y[™ÕÚ\™J
+NÂˆKˆ
+NÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÒUÑSP‘QS‘×Ô‘TÑU\Þ[˜È
+ÙKÝÛ™\Žˆ[šÛ›ÝÛŠHOˆÂˆ\ÜÙ\Ú][X™Y[™Ó]]][Û“ÝÛ™\ŠÝÛ™\ŠNÂˆžHÂˆ]ØZ]™\Ù]Ú][X™Y[™ÔÙ][™ÜÊÚ][X™Y[™ÑY˜][ÛÛ^
+
+JNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+NÂˆYˆ
+Z\Ò\Ñ\œ›ÜŠ\œ›ÜŠJHÂˆÜ™X]TØÚY[\“ÙÙÙ\Š	ØÚ]Y[X™Y[™Ë\Ù][™ÜÉÊK™\œ›ÜŠˆ	Ñ˜Z[YÈ™\Ù]Ú][X™Y[™ÈÙ][™ÜÉËˆÈ\œ›ÜŽˆ\œ›Üˆ[œÝ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆÝš[™Ê\œ›ÜŠHKˆ
+NÂˆBˆ™]›ÝÐÚ][X™Y[™Ô\œÚ\Ý\œ›ÜŠ\œ›Ü‹	Ñ˜Z[YÈ™\Ù]Ú][X™Y[™ÈÙ][™ÜÉÊNÂˆBˆ]ØZ]ØÚY[PÚ][X™Y[™Ô[[YT™XÛÛ˜Ú[J
+NÂˆ™]\›ˆÚ][X™Y[™ÕÚ\™J
+NÂˆJNÂ‚ˆËÈÚ]ØY™]HÙ][™ÜÈTÈ8 %8 %ÝÜ™H9âë9êâù.£ˆXZÙ\ˆ9cey/¢Ë9£ä9bcy¬ê9a£9.éy/¯È™[™\™\‚ˆËÈ9d+ùbª9¥í¹d#9«iy§+9g,:eg9`ãøà ”ÑU9cê¹olydãy.bùd#¹æ¡\›ˆ:/®yåc9mìº/ä:(c\›ˆ9.#z/ïy®«øà ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK‘ÒUÔÐQ‘UWÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆÚ]ØY™]UÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK‘ÒUÔÐQ‘UWÔÑU\Þ[˜È
+ÙK[˜X›Yˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[Ùˆ[˜X›YOOH	Ø›ÛÛX[‰ÊHÂˆ›ÝÒ\Ñ\œ›ÜŠ	ÒS•SQÔTSTÉË	ÙÚ]ØY™]H[˜X›Y™\]Z\™Y
+›ÛÛX[ŠIÊNÂˆBˆÜš]QÚ]ØY™]P]]ÔÛ˜\ÚÝ[˜X›Y
+[˜X›Y
+NÂˆ™]\›ˆÚ]ØY™]UÚ\™J
+NÂˆJNÂˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑK‘ÒUÔÐQ‘UWÔ‘TÑU\Þ[˜È
+
+HOˆÂˆ™\Ù]Ú]ØY™]TÙ][™ÜÊ
+NÂˆ™]\›ˆÚ]ØY™]UÚ\™J
+NÂˆJNÂ‚ˆËÈÛÙ^[[YH›Ý]HÑU8 %8 %9cìù."ú)ä¹å*:aãÈÚ\:+îÈ\\Ù\™\ˆ9odùbcHÜ]Ûˆ9a®ùîäùæ¡:bm9§`ù¬ê9aiy¥®yo#ÂˆËÈ
+Ø]]X™X\™\ˆH:-l:+¨ºf!HÈ[‹ZÙ^HH:-l9ïdyalÈÈ›ÝšY\‹[Ø]]H›ÞH9¬ê9aiy/¦ùn¥9eaˆÐ]]
+xà ‚ˆËÈ:` 9onyaj9l`:bm9§`ùo 9alùd#¹mì¹¥èÑU9cê¹/çyåfHÑUÜÜ]Ûˆ9aëz+àyoh¹  yå,H›ÝšY\ˆ:`"y¢êya¬ùk¦¸à ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÓÑVÔ•S•SQWÔ“ÕUWÑÑU\Þ[˜È
+
+HOˆÂˆ™]\›ˆ™XYÛÙ^[[YT›Ý]J
+NÂˆJNÂ‚ˆËÈØÈ:næ:+©:-ëùå,y/&º+çyæ¡9å'ù¥b:+¨z-.z-ëùå,H8 %8 %›ÞH˜[œÙ›Ü›H9£"z+íù¬`º)à¹kçú/æÈ™YÚ\ÝžJ:-ëùå,yç'ù`/
+KˆËÈ9å*:aãÈÚ\9/&9ab9å*9k ù¦/¹é.º+¨ºf!HÈ9ïdyalùoh¹  JÜ]Ûˆ9aëz+àya®ùîäË9aj9l`9­.ù )ùâ­¹  zaãyë¥ù/&¹cäy¥hÊxà ‚ˆËÈÑU:+îù§ :/äz)à¹kçù`/È9cæ9c%¹¥íŠ9«ãù/&º+çyå'ùdoydj9§'ú`&¹n.9. 9«(Jynoù¤«yîæy¢`9§"yê¥ùcèøà ‚ˆ\ÓXZ[‹š[™JPRÑT—ÒT×ÒS•“ÒÑKÓUQWÔÑTÔÒSÓ—Ô“ÕUWÑÑU\Þ[˜È
+Ù]™[Ù\ÜÚ[Û’Yˆ[šÛ›ÝÛŠHOˆÂˆYˆ
+\[ÙˆÙ\ÜÚ[Û’YOOH	ÜÝš[™ÉÈÙ\ÜÚ[Û’Y›[™ÝOOH
+H™]\›ˆ[Âˆ™]\›ˆ™XYÛ]YTÙ\ÜÚ[Û”›Ý]JÙ\ÜÚ[Û’Y
+NÂˆJNÂˆÛÛ]YTÙ\ÜÚ[Û”›Ý]PÚ[™ÙJ
+Ù\ÜÚ[Û’Y›Ý]JHOˆÂˆ›Üˆ
+ÛÛœÝÚ[ˆÙˆœ›ÝÜÙ\•Ú[™ÝË™Ù][Ú[™ÝÜÊ
+JHÂˆYˆ
+Ú[‹š\Ñ\Ý›ÞYY
+
+JHÛÛ[YNÂˆžHÂˆÚ[‹ÙXÛÛ[ËœÙ[™
+PRÑT—ÔTÒÓUQWÔÑTÔÒSÓ—Ô“ÕUWÐÒS‘ÑQÈÙ\ÜÚ[Û’Y›Ý]HJNÂˆHØ]ÚÂˆÊˆ›Ë[Ü
+‹ÂˆBˆBˆËÈ]šXÙK[[šÎœ^[ØY:hm¹l`ˆÙ\ÜÚ[Û’Y8¡¤ˆÙ\ÜÚ[ÛŽYˆÜXË9¢dùo :+éz/ç9ê"ù/&º+çyæ¡ˆËÈ9£©ùb-¹êëù£k¹«i9k§¹¥í¹b!ù£hº+¨ºf!HÈ9ïdyalù¦/¹é.¹oh¹  J9«ãù/&º+çyå'ùdoydj9§'ú`&¹n.9.áy. 9«(K9§ y/cºh¤Jxà ‚ˆ\Ú[™ÝÐœ›ØYØ\Ý
+PRÑT—ÔTÒÓUQWÔÑTÔÒSÓ—Ô“ÕUWÐÒS‘ÑQÈÙ\ÜÚ[Û’Y›Ý]HJNøïÏ-¢G§²ÚîÆ­yÒ6WGF–æw2Òv—BWFFUW'6—7FVEv–æF÷u¦ööÒ†çVÆÂ“°¢&WGW&â°¢ö³¢G'VR26öç7BÀ¢¦ööÔf7F÷#¢6WGF–æw2çv–æF÷u¦ööÒÀ¢Ó°¢Ò“° ¢òògVÆÇ67&VVâ7FFRVW'’(	B&VæFW&W"6ÆÇ2F†—2öâÖ÷VçBFò&V6÷fW"g&öÒF†P¢òò&6Rv†W&RVçFW"ÖgVÆÂ×67&VVæf—&W2&Vf÷&RF†R&VæFW&W"7V'67&–&W2†Rærà¢òòv†Vâv–æF÷r×7FFR&W7F÷&W2gVÆÇ67&VVâv–æF÷röâÆVæ6‚’à¢—4Ö–âæ†æFÆR‚vvWBÖgVÆÇ67&VVâ×7FFRrÂ†WfVçB“¢&ööÆVâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â&VEv–æF÷tgVÆÇ67&VVå7FFR„'&÷w6W%v–æF÷ræg&öÕvV$6öçFVçG2†WfVçBç6VæFW"’“°¢Ò“° ¢—4Ö–âæ†æFÆR‚wFövvÆRÖgVÆÇ67&VVârÂ†WfVçB“¢&ööÆVâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7Bv–âÒ'&÷w6W%v–æF÷ræg&öÕvV$6öçFVçG2†WfVçBç6VæFW"’óòvWEv–æF÷r‚“°¢–b‚v–â’&WGW&âfÇ6S°¢6öç7BæW‡BÒ‡v–âæ—4gVÆÅ67&VVâ‚’ÇÂv–âæ—56–×ÆTgVÆÅ67&VVâ‚’“°¢–b‡v–âæ—56–×ÆTgVÆÅ67&VVâ‚’’v–âç6WE6–×ÆTgVÆÅ67&VVâ†fÇ6R“°¢v–âç6WDgVÆÅ67&VVâ†æW‡B“°¢&WGW&âæW‡C°¢Ò“° ¢òòf–æBÖ–â×vR„bÔd•Ó“¢&VæFW&W"÷fW&Æ’G&—fW26‡&öÖ—VÒw2æF—fRvR6V&6‚à¢òò7F'C¢&WGW&ç2F†R&WVW7D–B6‡&öÖ—VÒ76–vç3²&VæFW&W"6÷'&VÆFW2v—F‚F†P¢òò&W7VÇBWfVçB6VçBg&öÒ7&VFUv–æF÷rw2f÷VæBÖ–â×vVÆ—7FVæW"à¢—4Ö–âæ†æFÆR€¢vf–æBÖ–â×vS§7F'BrÀ¢€¢WfVçBÀ¢&×3¢°¢FW‡C¢7G&–æs°¢f÷'v&Có¢&ööÆVã°¢f–æDæW‡Có¢&ööÆVã°¢ÖF6„66Só¢&ööÆVã°¢ÒÀ¢“¢çVÖ&W"ÂçVÆÂÓâ°¢6öç7Bv2ÒWfVçBç6VæFW#°¢–b‚v2ÇÂv2æ—4FW7G&÷–VB‚’ÇÂ&×3òçFW‡B’&WGW&âçVÆÃ°¢&WGW&âv2æf–æD–åvR‡&×2çFW‡BÂ°¢f÷'v&C¢&×2æf÷'v&BóòG'VRÀ¢f–æDæW‡C¢&×2æf–æDæW‡BóòfÇ6RÀ¢ÖF6„66S¢&×2æÖF6„66RóòfÇ6RÀ¢Ò“°¢ÒÀ¢“°¢—4Ö–âæöâ€¢vf–æBÖ–â×vS§7F÷rÀ¢€¢WfVçBÀ¢7F–öã¢v6ÆV%6VÆV7F–öârÂv¶VW6VÆV7F–öârÂv7F—fFU6VÆV7F–öârÒv6ÆV%6VÆV7F–öârÀ¢’Óâ°¢6öç7Bv2ÒWfVçBç6VæFW#°¢–b‚v2ÇÂv2æ—4FW7G&÷–VB‚’’&WGW&ã°¢v2ç7F÷f–æD–åvR†7F–öâ“°¢ÒÀ¢“° ¢òòFWf–6R”B††&Gv&RÖ&6VBÂ7W'f—fW2&V–ç7FÆÂ¢6öç7BÖ6†–æT–BÒÖ6†–æT–E7–æ2‚“°¢—4Ö–âæ†æFÆR‚vvWBÖFWf–6RÖ–BrÂ‚’ÓâÖ6†–æT–B“° ¢òò42{Ù{¹Î‹>Šù^[ÈX[2(	B&VæFW&W"6WGF–æw2(i"W‡W&–ÖVçFÂ$42{Ù{¹Î‹>Šù^iz^[ùr"i8ÞKÙÎjÚNXÎ8 ¢òòiKžXi’&ö6W72æVçbå„EEô45ôDT%TuôäUBÂŠê’'V–ÆD6ÆVFTVçbYÊŽKˆ¾jÊ7vâ62i{nk:ŽXZP¢òòåD…$õ”5ôÄôsÖFV'VrŽZèÎi[NŠû~k.Y
+²†VFW'2’²äôDUôDT%TsÖ‡GGÆ‡GG2ÆæWBÇFÇ2²4D²FV'Vs§G'V^8 ¢òòK¸^Zûž[ÈX[>Yîik[»®y¨B6W76–öâyIþiXŽ8 ¢òð¢òòx«nhiÚ^k©ŽhÈžKÉŽXXŽ{ªr“ ¢òòâyJŽh‹~{;¾{¹þxêþZ(>XùŽ˜xò„EEô45ôDT%TuôäUCÓ¢ˆyJŽk9RÂX[ÎZë¢òò"â&VæFW&W"6WGF–æw2[ÈX[2†Æö6Å7F÷&vRhÈK˜^XÉbÂÖ÷VçBi{b•2YÎjÚ^‹ø~iÚR¢òòFWbjŠ[ÈþKˆÞXhÞY
+þXªŽiÉþzÎ[ÈŽynyKŠxKˆ¾ik’##“ŠÎ™˜N‹ùk:Ž˜x¢ž8 ¢òð¢òò6¶vVBjŠ[ÈþKˆ¾KˆÞhÈK˜^XÉnK‹¾‹ù¾zˆ¾XÃ¢˜xÞY
+þY¹âöfbŽ™‹.jÚ.yJŽh‹~[ùŽX[>ZûÎˆ{Niz^[ù~xˆnx+‚’À¢òò&VæFW&W"‹ù²6WGF–æw2i{nXhÒ7–æ2Y¹îiÚ^8 ¢6öç7B64FV'VtæWDÆörÒ7&VFU66†VGVÆW$ÆövvW"‚v62ÖFV'VrÖæWBr“° ¢òò62ZÙ‹ù¾zˆ¾Xh^˜:‚FV'Vry¨B&rKŠÞ‹ÚÎih~K»b…4D²FV'Vtf–ÆR˜žš’ž8&62K¨Î‹ù¾X‹nˆz®[{f÷Và¢òòXižZè2Žh‰KºÎk*k9^hê^zê’ÂKˆ¾™Ú.y¨BF–ÆW"˜	ŠÎŠû¾X{®Yî[Ù.KˆXÉnk~XZ^{¹þKˆvVçBkX¢òò†vVçBÓÆFFSâææF§6öâÂ6÷W&6SÖ62ÖFV'Vrž8.ih~K»nYÞ[Šbç&rŠŽiˆîZè>iŠþKŠÞ‹ÚÎ8KˆÞiŠþiÈ{¸Žiz^[ù~8 ¢òòFWc¢2öFW6·F÷öÆöw2ö62ÖFV'Vrç&ræÆös²6¶vVC¢ÇW6W$FFâöÆöw2ö62ÖFV'Vrç&ræÆö~8 ¢òòK»¾KÙ^jŠ[ÈþKˆ²ÂXú®Šh„EEô45ôDT%TuôäUCÓ[Šê’4D²‹[FV'Vtf–ÆR‹zòÂ{¹^‹ør4T7FFW'"h©X‹n8 ¢6öç7B64FV'VtÆöuF‚ÒF‚æ¦ö–â€¢æ—56¶vV@¢òF‚ç&W6öÇfR…õöF—&æÖRÂrââòââöÆöw2r¢¢F‚æ¦ö–â†ævWEF‚‚wW6W$FFr’ÂvÆöw2r’À¢v62ÖFV'Vrç&ræÆörrÀ¢“°¢&ö6W72æVçbå„EEô45ôDT%Tuôd”ÄRÒ64FV'VtÆöuFƒ° ¢òòY
+þXªŽiÉòG&–Ó¢‹yòÆövvW"çG2YÎKˆzÙnyZR(	BKˆÞyY’ãZH~K»ÒÂzÞZKNKùÞ[î8&62ZÙ‹ù¾zˆ°¢òòŠhzØžyJŽh‹~‹[r6W76–öâh˜ÞKÉ¢f÷Vâ‹ùžKŠ®ih~K»bÂY
+þXªŽiÉþiKžXªŽZèžXZŽ8&FWbjŠ[Èò62ÖFV'Vp¢òòKˆy»NYÊŽXi’ÂKˆÒG&–ÒZëži‰>Y>hèžXzy›âÔ"K¹>[©>z›®™{N8 ¢òòš®h˜¾kˆ^hèžXènXû.x˜ŽiÊÎyYžKˆ¾y¨BãŽKˆ®Kˆx˜ŽiÊÂ&÷FF–öâKª~xš’ÂxëYÊŽKˆÞXhÞX‰¾[»¢ž8 ¢G'’°¢g2çVæÆ–æµ7–æ2†G¶64FV'VtÆöuF‡Òã“°¢Ò6F6‚°¢ò¢æ÷BW†—7B¢ð¢Ð¢ÆWB64FV'Vu6—¦T&Vf÷&RÒ°¢G'’°¢64FV'Vu6—¦T&Vf÷&RÒg2ç7FE7–æ2†64FV'VtÆöuF‚’ç6—¦S°¢Ò6F6‚°¢ò¢æ÷B–WB¢ð¢Ð¢¶VW&V6VçE7–æ2†64FV'VtÆöuF‚“°¢–b†64FV'Vu6—¦T&Vf÷&RâR¢#B¢#B’°¢64FV'VtæWDÆöræ–æfò†G&–ÖÖVB62ÖFV'Vrç&ræÆöröâ7F'GW‡v2G¶64FV'Vu6—¦T&Vf÷&WÒ'—FW2–“°¢Ð¢òòW"×6W76–öâ&r‡6W76–öç2óÆ–Câö62ÖFV'Vrç&ræÆör’YÎj~YÊŽY
+þXªŽiÉþzÞZKNKùÞ[â(	N(	BZè>KˆÞ{¸òVÖ—BÀ¢òò[›>i{nXú®™Ú6ÆVçWöÆE6W76–öç23ZJži[Nyºî[Ù^XŠÂiÉþ™{NKˆKŠ®[ÈyØäôDUôDT%Try¨NkK¾‹x26W76–öâˆ;Þh¨®XÙ^KŠ ¢òò&rXižxˆnz8y¹Ž8.Xh^Zëž[{.Š*¾Kˆ¾™Ú.y¨BF–ÆW"k~XZRÆFFSâææF§6öâÂ&rXú®iŠþKŠÞ‹ÚÂÂzÞhèžiz~ZKNKˆÞKŠ.iÈžiXŽKúhþ8 ¢¶VW&V6VçE6W76–öä64FV'Vu7–æ2‚“° ¢òò62ÖFV'Vrç&ræÆör(i"{¹þKˆvVçBkX†vVçBÓÆFFSâææF§6öâÂ6÷W&6SÖ62ÖFV'Vr“ ¢òò62ZÙ‹ù¾zˆ¾˜	®‹ør4D²FV'Vtf–ÆRy»NhêRf÷VâXi’&rÂKˆÞ{¸òÆövvW#²‹ùž˜xÎ‹ÚîŠú.Šû¾Z)î˜xòÀ¢òò˜	ŠÎ‹2w&—FT64FV'VtÆ–æR‚’Šz>iéŠÎšibUD2Ô•4òi{n™{Nh‹>Yî[Ù.KˆXÉnXižXZ^[Ù>ZJ’vVçBkXÀ¢òò‹yòÖ¶W"ò&÷‡’KŠNk©YŽ[›n8X[yJŽhÈžZJ’&÷FFR²KùÞyYžzÙnyZ^8 ¢òð¢òòÒ‹ÚîŠú"'3¢62ÖFV'VrKˆÞiŠþš¹Žš)x:Þx+’ÂKˆÞ™ÈŠhg2çvF6‚y¨NZéîi{nh
+rŽhé.[¨þhÈžŠz>iéX{®y¨BG2À¢òòKˆÞXùr'2‹ÚîŠú.[»n‹ùþ[ÛY8ÒÂ[»n‹ùþXú®[ÛY8Ò.ZI®K˜^XúþŠx"¢òòÒ62hÈiÈ’fBiÉþ™{Nh‰KºÂ&÷FFRKˆÞhè’&rih~K»b…v–æF÷w2&VæÖRZK‹JRÂÆ–çW‚G'Væ6FP¢òòyYžzˆyhþz›®kIâÂ˜;ÞKˆÞZèžXZ‚’Âh˜Kº^XøÞY	‹[)HŠû¾X{®Xh^Zëžk~XZRvVçBkXÂ&rK¸^Y
+þXªŽiÉòG&–Ð¢òòÒj8kX¾X‹ih~K»b6—¦RX	.˜‡G'Væ6FRòY
+þXª‚&VæÖR’Â˜xÞ{Úâ&VBöfg6WBK¸â[ÈZx°¢òòÒ‹zŽŠû¾KùÞyYž[î˜:ŽKˆÞZèÎi[NŠÂÂ‹yþKˆ¾Kˆjë^h»Î‹[~iÚ^XhÞXˆrÂKˆÞXˆ~YØò×VÇF’ÖÆ–æRKúhð¢òòÒF–ÖW"çVç&Vb‚’™‹.jÚ.‹ù¾zˆ¾X[>™zÞi{nŠ*¾XÚKØð¢òòW"Öf–ÆRF–Âx«nh¢f–ÆUF‚(i"²öfg6WBÂÆVgF÷fW"Þ8.YÎi{bF–ÂXZŽ[fÆÆ&6²&p¢òòŽiz6W76–öä–By¨B62Â{Ù^Šx’²YB6W76–öç2óÆ–Câö62ÖFV'Vrç&ræÆös²6W76–öä–BK¸î‹zþ[è@¢òòhùXùnYîKÊ{¹’w&—FT64FV'VtÆ–æRÂŠê’62{Ù{¹ÂFV'Vr[Ù.X‹Zûž[©B6W76–öây¨BÆFFSâææF§6öî8 ¢6öç7B64Æöu&ö÷DF—"ÒF‚æF—&æÖR†64FV'VtÆöuF‚“°¢6öç7B65F–Å7FFRÒæWrÖÇ7G&–ærÂ²öfg6WC¢çVÖ&W#²ÆVgF÷fW#¢7G&–ærÓâ‚“° ¢gVæ7F–öâF–ÄöæT64f–ÆR†f–ÆUFƒ¢7G&–ærÂ6W76–öä–C¢7G&–ær“¢fö–B°¢ÆWB7FC¢g2å7FG3°¢G'’°¢7FBÒg2ç7FE7–æ2†f–ÆUF‚“°¢Ò6F6‚°¢&WGW&ã°¢Ð¢6öç7B7BÒ65F–Å7FFRævWB†f–ÆUF‚“°¢–b‚7B’°¢òòšinjÊXùxë¢K¸î[Ù>X˜ÞiÊ¾[î[ÈZx²Â‹{>‹ø~[{.iÈžXh^Zë’Ž˜þXXÒ˜xÞY
+þYîh¨®izr6W76–öây¨B&r˜xÞZHÐ¢òòxÎ‹ù²æF§6öâž8.Kº>K»~iŠþkÈþhèžih~K»nŠ*¾XùxëX˜Ò(šB‹ÚîŠú.™{N™©By¨NXzŠÎX‰ÞZx²62iz^[ùrÂXúþhê^Xù~8 ¢65F–Å7FFRç6WB†f–ÆUF‚Â²öfg6WC¢7FBç6—¦RÂÆVgF÷fW#¢rrÒ“°¢&WGW&ã°¢Ð¢–b‡7FBç6—¦RÂ7Bæöfg6WB’°¢7Bæöfg6WBÒ°¢7BæÆVgF÷fW"Òrs°¢Ð¢–b‡7FBç6—¦RÓÓÒ7Bæöfg6WB’&WGW&ã°¢ÆWBfC¢çVÖ&W#°¢G'’°¢fBÒg2æ÷Vå7–æ2†f–ÆUF‚Âw"r“°¢Ò6F6‚°¢&WGW&ã°¢Ð¢G'’°¢6öç7BÆVâÒ7FBç6—¦RÒ7Bæöfg6WC°¢6öç7B'VbÒ'VffW"æÆÆö2†ÆVâ“°¢g2ç&VE7–æ2†fBÂ'VbÂÂÆVâÂ7Bæöfg6WB“°¢7Bæöfg6WBÒ7FBç6—¦S°¢7BæÆVgF÷fW"³Ò'VbçFõ7G&–ær‚wWFc‚r“°¢6öç7BÆ–æW2Ò7BæÆVgF÷fW"ç7Æ—B‚uÆâr“°¢7BæÆVgF÷fW"ÒÆ–æW2ç÷‚’óòrs°¢f÷"†6öç7BÆ–æRöbÆ–æW2’°¢–b†Æ–æRæÆVæwF‚â’w&—FT64FV'VtÆ–æR†Æ–æRÂ6W76–öä–B“°¢Ð¢Òf–æÆÇ’°¢G'’°¢g2æ6Æ÷6U7–æ2†fB“°¢Ò6F6‚°¢ò¢–væ÷&R¢ð¢Ð¢Ð¢Ð ¢gVæ7F–öâF–Ä64FV'Vtöæ6R‚“¢fö–B°¢F–ÄöæT64f–ÆR†64FV'VtÆöuF‚Ârr“²òòXZŽ[fÆÆ&6²Žiz6W76–öä–By¨B62¢6öç7B6W76–öç4&6RÒF‚æ¦ö–â†64Æöu&ö÷DF—"Âw6W76–öç2r“°¢ÆWBF—'3¢g2äF—&VçEµÓ°¢G'’°¢F—'2Òg2ç&VFF—%7–æ2‡6W76–öç4&6RÂ²v—F„f–ÆUG—W3¢G'VRÒ“°¢Ò6F6‚°¢&WGW&ã°¢Ð¢f÷"†6öç7BBöbF—'2’°¢–b‚Bæ—4F—&V7F÷'’‚’’6öçF–çVS°¢F–ÄöæT64f–ÆR‡F‚æ¦ö–â‡6W76–öç4&6RÂBææÖRÂv62ÖFV'Vrç&ræÆörr’ÂBææÖR“°¢Ð¢Ð¢6WD–çFW'fÂ‡F–Ä64FV'Vtöæ6RÂ#’çVç&Vb‚“° ¢òòFWbjŠ[ÈþKˆÞXhÞY
+þXªŽiÉþzÎ[Èƒ##bÓrÓÆ—¦’Zé®j‚“¤äôDUôDT%TsÖ‡GGÆ‡GG2ÆæWBÇFÇ0¢òòKÉ®š®yØ62ZÙ‹ù¾zˆ¾{º~h›þ‹ù²vVçBy¨B&6‚ZÙYÞKºN(	N(	Nh˜iÈžYÞKºN‹é>X{®Š*¾‹>Šù^iz^[ù~X‹~[òÀ¢òò‹ùŽKÉ®kiù2.ijÞŠˆ‹é>X{®[›.Xx.y¨NXÙ^kX²‡6Æ6²Ö†öö²×6W'fW"iz^[ù~ˆKiXþyJŽKè¾Zéîi)âž8 ¢òò™ÈŠh{Ù{¹ÎŠø®ijÞi{n‹[6WGF–æw2(i"W‡W&–ÖVçFÂ[ÈX[2Îh‰n‹[rX˜ÞŠëâ„EEô45ôDT%TuôäUCÓ8  ¢òò&VÆV6RyJŽh‹~[ÈFV'Vriz^[ù~i{bÂh¨¢Ö–âöÖ¶W"ÆövvW"K™þK¸â–æfòhªÎX‹FV'VrÂŠê¢òòÖ¶W"Ö6÷&R˜xÂ6W76–öâçG2òÖ¶W"çG2ò6öFW‚6Æ–VçBy¨BÆövvW"æFV'Vr‚âââ’Kˆ‹[~‰Þy¹‚(	@¢òòXÙ^[È62ZÙ‹ù¾zˆ¾{Ù{¹Îiz^[ù~k*hHþK˜’ÂyJŽh‹~hé.iú^™zîš)Ž™ÈŠhXZŽZY~Kˆ®Kˆ¾ih~8 ¢òòFWbjŠ[Èþ›¹ŽŠêBG&6RÂKˆÞ™ÈŠhK™þKˆÞ[©NŠ*¾‹ùž˜xÎiK’ŽKÉ®XøÞY	™˜Þ{ªrž8 ¢òòX[>Y¹îXë¾i{nh.ZHÞXéþ{ª~XŠ²‡&VÆV6R›¹ŽŠêB–æfòž8 ¢ÆWBÆWfVÄ&Vf÷&TFV'VtæWC¢ÆötÆWfVÂÂçVÆÂÒçVÆÃ°¢—4Ö–âæ†æFÆR‚v63§6WBÖFV'VrÖæWBrÂ…öWfVçBÂVæ&ÆVC¢&ööÆVâ“¢²ö³¢G'VRÒÓâ°¢–b†Væ&ÆVB’°¢&ö6W72æVçbå„EEô45ôDT%TuôäUBÒss°¢òò&VÆV6S¢hªÎ{ª~8&FWc¢[{.{¸þiŠòG&6RÂ‹{>‹ø~8 ¢–b†æ—56¶vVB’°¢6öç7B7W"ÒvWDÆötÆWfVÂ‚“°¢òòXú®YÊŽjùBFV'Vr[Ëy¨N{ª~XŠ¾Kˆ®hªÂÂ˜þXXÞh¨®yJŽh‹~˜	®‹ørÄôuôÄUdTÃ×G&6Ry¨Ni»Nš¹ŽŠøžk.™˜Þ{ªp¢–b†7W"ÓÓÒv–æfòrÇÂ7W"ÓÓÒwv&ârÇÂ7W"ÓÓÒvW'&÷"rÇÂ7W"ÓÓÒvfFÂr’°¢ÆWfVÄ&Vf÷&TFV'VtæWBÒ7W#°¢6WDÆötÆWfVÂ‚vFV'Vrr“°¢64FV'VtæWDÆöræ–æfò†'V×VBÖ–âöÖ¶W"ÆövvW"G¶7W'Ò(i"FV'Vv“°¢Ð¢Ð¢ÒVÇ6R°¢FVÆWFR&ö6W72æVçbå„EEô45ôDT%TuôäUC°¢–b†æ—56¶vVBbbÆWfVÄ&Vf÷&TFV'VtæWB’°¢6WDÆötÆWfVÂ†ÆWfVÄ&Vf÷&TFV'VtæWB“°¢64FV'VtæWDÆöræ–æfò†&W7F÷&VBÖ–âöÖ¶W"ÆövvW"(i"G¶ÆWfVÄ&Vf÷&TFV'VtæWGÖ“°¢ÆWfVÄ&Vf÷&TFV'VtæWBÒçVÆÃ°¢Ð¢Ð¢64FV'VtæWDÆöræ–æfò†6WBG¶Væ&ÆVBòvöâr¢vöfbwÒf–&VæFW&W&“°¢&WGW&â²ö³¢G'VRÓ°¢Ò“° ¢òò&VÆV6Ræ÷FW2‡W"×fW'6–öâÂfWF6†VBg&öÒ4Dâ’âÆFf÷&Ò—2&W6öÇfV@¢òò–ç6–FRF†R6W'f–6R6ò&VæFW&W"æWfW"æVVG2Fò72—Bà¢—4Ö–âæ†æFÆR‚w&VÆV6RÖæ÷FW3¦fWF6‚rÂ7–æ2…öWfVçBÂfW'6–öã¢7G&–ær’Óâ°¢&WGW&âfWF6…&VÆV6Tæ÷FW2‡fW'6–öâ“°¢Ò“° ¢òò&VÆV6Ræ÷FW2–æFW‚(	B6÷'FVBÆ—7BöbWfW'’fW'6–öâv—F‚æ÷F–6RöâF†P¢òò4DââW6VB'’F†R&VæFW&W"Fò6ö×WFRF†RVç&VB&ævRöâ7&÷72×fW'6–öà¢òòWw&FRæBVÆÂWfW'’–çFW&ÖVF–FRæ÷F–6Rà¢—4Ö–âæ†æFÆR‚w&VÆV6RÖæ÷FW3¦fWF6‚Ö–æFW‚rÂ7–æ2‚’Óâ°¢&WGW&âfWF6…&VÆV6Tæ÷FW4–æFW‚‚“°¢Ò“° ¢òò6fU7F÷&vR•2†æFÆW'0¢6öç7B—5fÆ–D¶W’Ò†¶W“¢7G&–ær“¢&ööÆVâÓâõå¶×¤Õ£Ó•òÕÒ²BòçFW7B†¶W’“°¢6öç7B—5fÆ–E&VæFW&W$¶W’Ò†¶W“¢7G&–ær“¢&ööÆVâÓà¢—5fÆ–D¶W’†¶W’’bb—5&VæFW&W$66W76–&ÆU6fU7F÷&vT¶W’†¶W’“°¢6öç7B&W6öÇfU6fU7F÷&vTf–ÆWF‚Ò†¶W“¢7G&–ær“¢7G&–ærÂçVÆÂÓâ°¢6öç7B66÷VD¶W’Ò&W6öÇfT÷væW%66÷VE6V7&WE7F÷&vT¶W’†¶W’“°¢&WGW&â66÷VD¶W¢òF‚æ¦ö–â†ævWEF‚‚wW6W$FFr’Âw6fR×7F÷&vRrÂG·66÷VD¶W—ÒæVæ6¢¢çVÆÃ°¢Ó° ¢òòX[yJŽy¨B•ö¶W’XùŽi»NYâÂˆºR6öFW‚×6W'fW"KºRVçbÖ¶W’Y
+þXª‚ŽizôWF‚ÆvFWv’¶W’Xk¾XZP¢òòZÙ‹ù¾zˆ²VçbžX‰ž˜xÞ[»¢(	N(	B6WGF–æw2iK’þXŠK¨b¶W’‹ù¾zˆ¾hIþyú^KˆÞX‹Â[ø^š¾˜xÞ[»®h˜ÞyIþiXŽ8&öWF‚Ö&V&W ¢òò7vây¨B6öFW‚yK&÷‡’hÈžŠû~k"Æ—fRŠû²vFWv’¶W’…÷&VDvFWv”¶W’’ÎiK’¶W’iz™È˜xÞ[»®8 ¢òòKŠ^jÂvFVC¢™Ùâ•ö¶W’ò™ÙâVçbÖ¶W’7vâKˆ[è²æòÖ÷ÂZû’6ÆVFR‹zþ[èN™»n[ÛY8Ò„6ÆVFRjøþKŠ ¢òò6W76–öâxëŠû²¶W’ÂZJžxKn‹yþ™¨òž8.iK’¶W’(i"VçbÖ¶W’6öFW‚ik‹ù¾zˆ¾yJŽik¶W“²XŠ¶W’(i"XùŽiÊ®hèŽiØ>8 ¢6öç7B6†÷VÆE&W7F'D6öFW„f÷$”¶W”6†ævRÒ†¶W“¢7G&–ær“¢&ööÆVâÓà¢¶W’ÓÓÒv•ö¶W’rbbvWD6öFW…&÷‡”WF„–æ¦V7F–öå7FFR‚’ÓÓÒvVçbÖ¶W’s° ¢6öç7B&W&T”¶W”6†ævTÖ–&U&W7F'D6öFW‚Ò7–æ2€¢¶W“¢7G&–ærÀ¢“¢&öÖ—6SÇ²ö³¢G'VRÒÂ²ö³¢fÇ6S²W'&÷#¢7G&–ærÓâÓâ°¢–b‚6†÷VÆE&W7F'D6öFW„f÷$”¶W”6†ævR†¶W’’’&WGW&â²ö³¢G'VRÓ°¢G'’°¢v—B&W&T6öFW„f÷$WF„ÖöFT6†ævR‚“°¢&WGW&â²ö³¢G'VRÓ°¢Ò6F6‚†W'"’°¢6öç7BW'&÷"ÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢7&VFTÆövvW"‚v6öFW‚Ö’Ö¶W’×&W7F'Br’çv&â‚w&W&R&Vf÷&R•ö¶W’6†ævRf–ÆVBrÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢&WGW&â²ö³¢fÇ6RÂW'&÷"Ó°¢Ð¢Ó° ¢6öç7Bf–æÆ—¦T”¶W”6†ævTÖ–&U&W7F'D6öFW‚Ò7–æ2€¢¶W“¢7G&–ærÀ¢“¢&öÖ—6SÇ²ö³¢G'VRÒÂ²ö³¢fÇ6S²W'&÷#¢7G&–ærÓâÓâ°¢–b‚6†÷VÆE&W7F'D6öFW„f÷$”¶W”6†ævR†¶W’’’&WGW&â²ö³¢G'VRÓ°¢G'’°¢v—Bf–æÆ—¦T6öFW„gFW$WF„ÖöFT6†ævR‚“°¢&WGW&â²ö³¢G'VRÓ°¢Ò6F6‚†W'"’°¢6öç7BW'&÷"ÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢7&VFTÆövvW"‚v6öFW‚Ö’Ö¶W’×&W7F'Br’çv&â‚w&W7F'BgFW"•ö¶W’6†ævRf–ÆVBrÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢&WGW&â²ö³¢fÇ6RÂW'&÷"Ó°¢Ð¢Ó° ¢6öç7B6æ6VÄ”¶W”6†ævTÖ–&U&W7F'D6öFW‚Ò†¶W“¢7G&–ær“¢fö–BÓâ°¢–b‚6†÷VÆE&W7F'D6öFW„f÷$”¶W”6†ævR†¶W’’’&WGW&ã°¢6æ6VÄ6öFW„WF„ÖöFT6†ævR‚“°¢Ó° ¢6öç7Bæ÷F–g•&÷f–FW$¶W”6†ævVBÒ‡&÷f–FW$–C¢7G&–ær“¢fö–BÓâ°¢vWDv†÷7E6WGW6†ævT'W2‚’æVÖ—DÆÂ‡°¢6÷W&6S¢v†÷7Eö6öæf–rrÀ¢&Vc¢&÷f–FW#¢G·&÷f–FW$–GÖÀ¢Ò“°¢–b‡&÷f–FW$–BÓÓÒv÷Væ’Ö–ÖvW2r’°¢æ÷F–g”÷Vä”ÖVF–7&VFVçF–Ä6†ævVB‚“°¢Ð¢òòY	h˜iÈžz©~Xú>[›þi*Ò$õd”DU%ô4„ätTC§W6U&÷f–FW'2KéÞ‹YnjÚNkhŽhþX‹~ik‹ùîhê^h[ú¾xZrŽZI®z©~Xú>YÎjÚRž8 ¢f÷"†6öç7Bv–âöb'&÷w6W%v–æF÷rævWDÆÅv–æF÷w2‚’’°¢–b‚v–âæ—4FW7G&÷–VB‚’’°¢G'’°¢v–âçvV$6öçFVçG2ç6VæB„Ô´U%õU4‚å$õd”DU%ô4„ätTBÂ·Ò“°¢Ò6F6‚°¢ò¢æòÖ÷¢ð¢Ð¢Ð¢Ð¢Ó° ¢—4Ö–âæ†æFÆR€¢w6fR×7F÷&vR×7F÷&RrÀ¢7–æ2†WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂ¶W“¢7G&–ærÂfÇVS¢7G&–ær“¢&öÖ—6SÆ&ööÆVãâÓâ°¢G'’°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‚—5fÆ–E&VæFW&W$¶W’†¶W’’’&WGW&âfÇ6S°¢6öç7Bf–ÆWF‚Ò&W6öÇfU6fU7F÷&vTf–ÆWF‚†¶W’“°¢–b‚f–ÆWF‚’&WGW&âfÇ6S°¢–b‚6fU7F÷&vRæ—4Væ7'—F–öäf–Æ&ÆR‚’’&WGW&âfÇ6S°¢6öç7BVæ7'—FVBÒ6fU7F÷&vRæVæ7'—E7G&–ær‡fÇVR“°¢6öç7B&W&U&W7VÇBÒv—B&W&T”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢–b‚&W&U&W7VÇBæö²’&WGW&âfÇ6S°¢6öç7BF—"ÒF‚æF—&æÖR†f–ÆWF‚“°¢6öç7B†E&Wf–÷W2Òg2æW†—7G57–æ2†f–ÆWF‚“°¢6öç7B&Wf–÷W46öçFVçBÒ†E&Wf–÷W2òg2ç&VDf–ÆU7–æ2†f–ÆWF‚ÂwWFbÓ‚r’¢çVÆÃ°¢ÆWB×WFFVBÒfÇ6S°¢ÆWBf–æÆ—¦VBÒfÇ6S°¢g2æÖ¶F—%7–æ2†F—"Â²&V7W'6—fS¢G'VRÒ“°¢G'’°¢g2çw&—FTf–ÆU7–æ2†f–ÆWF‚ÂVæ7'—FVBçFõ7G&–ær‚v&6ScBr’ÂwWFbÓ‚r“°¢×WFFVBÒG'VS°¢6öç7B&W7F'E&W7VÇBÒv—Bf–æÆ—¦T”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢f–æÆ—¦VBÒ&W7F'E&W7VÇBæö³°¢–b‡&W7F'E&W7VÇBæö²’°¢òòh˜¾Z²„B¶W’KùÞZÙŽh‰X©ó®iÚ^k©j~Šë{û²ÖçVÂ†VæGö–çBY¹î‰Þ{ÉnŠùiÉþ[‹Ž˜xòÀ¢òòKˆâÖöFVÂÖ66W72ˆz®XªŽKˆ¾Xùy¨BVæGö–çBŠz>ˆ
+bÎŠx7&VFVçF–Ç57F÷&Rk:Ž˜x¢ž8 ¢–b†¶W’ÓÓÒv•ö¶W’r’°¢æ÷FTÖçVÅ†D¶W•6fVB‚“°¢æ÷F–g•&÷f–FW$¶W”6†ævVB‚w†Br“°¢Ð¢&WGW&âG'VS°¢Ð¢–b††E&Wf–÷W2bb&Wf–÷W46öçFVçBÓÒçVÆÂ¢g2çw&—FTf–ÆU7–æ2†f–ÆWF‚Â&Wf–÷W46öçFVçBÂwWFbÓ‚r“°¢VÇ6R–b†g2æW†—7G57–æ2†f–ÆWF‚’’g2çVæÆ–æµ7–æ2†f–ÆWF‚“°¢&WGW&âfÇ6S°¢Òf–æÆÇ’°¢–b‚f–æÆ—¦VB’°¢–b‚×WFFVB’6æ6VÄ”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢Ð¢Ð¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚u·6fR×7F÷&vR×7F÷&UÒrÂW'"“°¢6æ6VÄ”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢&WGW&âfÇ6S°¢Ð¢ÒÀ¢“° ¢—4Ö–âæ†æFÆR€¢w6fR×7F÷&vR×&VBrÀ¢7–æ2†WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂ¶W“¢7G&–ær“¢&öÖ—6SÇ7G&–ærÂçVÆÃâÓâ°¢6öç7B7G&–7D7W7FöÕ&÷f–FW%&VBÒ—47W7FöÕ&÷f–FW%'VçF–ÖT¶W•7F÷&vT¶W’†¶W’“°¢G'’°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‚—5fÆ–E&VæFW&W$¶W’†¶W’’’&WGW&âçVÆÃ°¢6öç7Bf–ÆWF‚Ò&W6öÇfU6fU7F÷&vTf–ÆWF‚†¶W’“°¢–b‚f–ÆWF‚’&WGW&âçVÆÃ°¢–b‚6fU7F÷&vRæ—4Væ7'—F–öäf–Æ&ÆR‚’’°¢–b‡7G&–7D7W7FöÕ&÷f–FW%&VB’°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂv7W7FöÒ&÷f–FW"7&VFVçF–Â—2Væf–Æ&ÆRr“°¢Ð¢&WGW&âçVÆÃ°¢Ð¢–b‚g2æW†—7G57–æ2†f–ÆWF‚’’&WGW&âçVÆÃ°¢6öç7B6öçFVçBÒg2ç&VDf–ÆU7–æ2†f–ÆWF‚ÂwWFbÓ‚r“°¢6öç7B'VffW"Ò'VffW"æg&öÒ†6öçFVçBÂv&6ScBr“°¢&WGW&â6fU7F÷&vRæFV7'—E7G&–ær†'VffW"“°¢Ò6F6‚†W'"’°¢òò™ÙîXúþKúW†–Æ–'’õvV%f–Wr&VæFW&W"ŠznXùy¨Nh¹.{¹ÞiŠþš(NiÉþZèžXZŽ{¹>iéÂÎ™˜ÞK‹¢FV'V~ûÉ°¢òòwV&N8ÆÆ÷vÆ—7N8‹zþ[èNY(Îiˆîih~‹ùNY¹î‹ëžyXÎKùÞhÈKˆÞXùŽ8.X[nZè>[È.[‹ŽK¸ÞXúþŠxÎKØnXú®Šë[ÙP¢òòZèžXZŽy¨N{¾Yè²ö6öFRÎ{¹ÞKˆÞ‰ÞXéþZx²ÖW76v^8‹zþ[èN86VæFW"h‰nZønih~8 ¢–b†—4—4W'&÷"†W'"’bbW'"æ6öFRÓÓÒuU$Ô•54”ôåôDTä”TBr’°¢6fU7F÷&vU&VDÆöræFV'Vr‚w&VBFVæ–VBf÷"VçG'W7FVB&VæFW&W"r“°¢ÒVÇ6R°¢6fU7F÷&vU&VDÆöræW'&÷"‚w&VBf–ÆVBrÂ°¢W'&÷#¢—4—4W'&÷"†W'"’òW'"æ6öFR¢W'"–ç7Fæ6VöbW'&÷"òW'"ææÖR¢wVæ¶æ÷vârÀ¢Ò“°¢–b‡7G&–7D7W7FöÕ&÷f–FW%&VB’°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂv7W7FöÒ&÷f–FW"7&VFVçF–Â—2Vç&VF&ÆRr“°¢Ð¢Ð¢&WGW&âçVÆÃ°¢Ð¢ÒÀ¢“° ¢—4Ö–âæ†æFÆR€¢w6fR×7F÷&vR×&VÖ÷fRrÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢¶W“¢7G&–ærÀ¢“¢&öÖ—6SÇ²7V66W73¢&ööÆVã²W'&÷#ó¢7G&–ærÓâÓâ°¢G'’°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‚—5fÆ–E&VæFW&W$¶W’†¶W’’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢v–çfÆ–B¶W’rÓ°¢Ð¢6öç7Bf–ÆWF‚Ò&W6öÇfU6fU7F÷&vTf–ÆWF‚†¶W’“°¢–b‚f–ÆWF‚’&WGW&â²7V66W73¢G'VRÓ°¢6öç7B&W&U&W7VÇBÒv—B&W&T”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢–b‚&W&U&W7VÇBæö²’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢v6öFW…÷&W7F'Eöf–ÆVBrÓ°¢Ð¢6öç7B†E&Wf–÷W2Òg2æW†—7G57–æ2†f–ÆWF‚“°¢6öç7B&Wf–÷W46öçFVçBÒ†E&Wf–÷W2òg2ç&VDf–ÆU7–æ2†f–ÆWF‚ÂwWFbÓ‚r’¢çVÆÃ°¢G'’°¢–b†g2æW†—7G57–æ2†f–ÆWF‚’’°¢g2çVæÆ–æµ7–æ2†f–ÆWF‚“°¢Ð¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢òòTäôTåBŠŽzK®ih~K»n[{.KˆÞZÙŽYÊŽûÈÎXŠ™šNŠúÞK˜žKùÞhÈ[˜.zØž8 ¢–b‚€¢W'"–ç7Fæ6VöbW'&÷"b`¢v6öFRr–âW'"b`¢†W'"2æöFT¥2äW'&æôW†6WF–öâ’æ6öFRÓÓÒtTäôTåBp¢’’°¢6öç6öÆRæW'&÷"‚u·6fR×7F÷&vR×&VÖ÷fUÒrÂW'"“°¢6æ6VÄ”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢w&VÖ÷fUöf–ÆVBrÀ¢Ó°¢Ð¢Ð¢6öç7B&W7F'E&W7VÇBÒv—Bf–æÆ—¦T”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢–b‚&W7F'E&W7VÇBæö²’°¢–b††E&Wf–÷W2bb&Wf–÷W46öçFVçBÓÒçVÆÂ’°¢g2æÖ¶F—%7–æ2‡F‚æF—&æÖR†f–ÆWF‚’Â²&V7W'6—fS¢G'VRÒ“°¢g2çw&—FTf–ÆU7–æ2†f–ÆWF‚Â&Wf–÷W46öçFVçBÂwWFbÓ‚r“°¢Ð¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢v6öFW…÷&W7F'Eöf–ÆVBrÓ°¢Ð¢òòh˜¾Z²„B¶W’Š*¾XŠ™šBŽijÞ[È“®kˆ^iÚ^k©j~ŠëÆVæGö–çBY¹î‰Þ{ÉnŠùiÉþ[‹Ž˜xþ8 ¢–b†¶W’ÓÓÒv•ö¶W’r’°¢æ÷FTÖçVÅ†D¶W•&VÖ÷fVB‚“°¢æ÷F–g•&÷f–FW$¶W”6†ævVB‚w†Br“°¢Ð¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢6öç6öÆRæW'&÷"‚u·6fR×7F÷&vR×&VÖ÷fUÒrÂW'"“°¢6æ6VÄ”¶W”6†ævTÖ–&U&W7F'D6öFW‚†¶W’“°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢w&VÖ÷fUöf–ÆVBrÀ¢Ó°¢Ð¢ÒÀ¢“° ¢òòXh^{Úâ’Ö¶W’Ké¾[©NYXnK‰>yJ‚•2ŽiúRþXi’þXŠÆ†2Xú®Y¹îZÙŽYÊŽh
+rÎkŽKˆÞY¹îŠû¾iˆîihrž8 ¢òòK‰®XªKÙ2Žy›ÞYÞXÙRþ{¾Yè²þ™[þ[ªnj
+š¨Â²{¹þKˆ™IžŠúþXØþŠêâžYÊ‚6V7&WG2ö'V–ÇF–ä”¶W”'&–FvRçG2À¢òò‹ëžyXÎŠÎK‹®iÈžXÙ^kX³¾‹ùž˜xÎXú®X¢6VæFW"ZèŽXÚ²²KéÞ‹YnŠ8^˜XÞ8 ¢6öç7B'V–ÇF–ä”¶W”ÆörÒ7&VFTÆövvW"‚w6V7&WG3¦'V–ÇF–âÖ’Ö¶W’r“°¢6öç7B'V–ÇF–ä”¶W”FW3¢'V–ÇF–ä”¶W”'&–FvTFW2Ò°¢7F÷&S¢vWE&÷f–FW%6V7&WE7F÷&R‚’À¢öä¶W”6†ævVC¢†–B’Óâæ÷F–g•&÷f–FW$¶W”6†ævVB†–B’À¢ÆötW'&÷#¢†ÖW76vRÂW'"’Óâ'V–ÇF–ä”¶W”ÆöræW'&÷"†ÖW76vRÂW'"’À¢Ó° ¢—4Ö–âæ†æFÆR€¢v'V–ÇF–âÖ’Ö¶W’Ö†2rÀ¢7–æ2†WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂ&÷f–FW$–C¢Væ¶æ÷vâ“¢&öÖ—6SÆ&ööÆVãâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â'V–ÇF–ä”¶W”†2†'V–ÇF–ä”¶W”FW2Â&÷f–FW$–B“°¢ÒÀ¢“° ¢—4Ö–âæ†æFÆR€¢v'V–ÇF–âÖ’Ö¶W’×7F÷&RrÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&÷f–FW$–C¢Væ¶æ÷vâÀ¢fÇVS¢Væ¶æ÷vâÀ¢“¢&öÖ—6SÇfö–CâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢'V–ÇF–ä”¶W•7F÷&R†'V–ÇF–ä”¶W”FW2Â&÷f–FW$–BÂfÇVR“°¢v—B&WF–å&÷f–FW%&W6VçFF–öägFW$WF„6†ævR€¢'V–ÇF–ä”¶W•&W6VçFF–öä–B‡&÷f–FW$–B27G&–ær’À¢“°¢ÒÀ¢“° ¢—4Ö–âæ†æFÆR€¢v'V–ÇF–âÖ’Ö¶W’×&VÖ÷fRrÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&÷f–FW$–C¢Væ¶æ÷vâÀ¢÷væW%66÷Só¢²FF÷væW$–C¢7G&–ærÂçVÆÃ²÷væW$vVæW&F–öã¢çVÖ&W"ÒÀ¢“¢&öÖ—6SÇfö–CâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7B7F—fRÒvWD7F—fT6W76–öâ‚“°¢–b€¢—46W76–öä&÷VæF'•VæF–ær‚’ÇÀ¢†÷væW%66÷Rb`¢†÷væW%66÷RæFF÷væW$–BÓÒ7F—fRæFF÷væW$–BÇÀ¢÷væW%66÷Ræ÷væW$vVæW&F–öâÓÒ7F—fRævVæW&F–öâ’¢¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂu&÷f–FW"÷væW"6†ævVBr“°¢'V–ÇF–ä”¶W•&VÖ÷fR†'V–ÇF–ä”¶W”FW2Â&÷f–FW$–B“°¢v—B&WF–å&÷f–FW%&W6VçFF–öägFW$WF„6†ævR€¢'V–ÇF–ä”¶W•&W6VçFF–öä–B‡&÷f–FW$–B27G&–ær’À¢“°¢ÒÀ¢“° ¢òò)H)HWF‚•2†æFÆW'2†FVÆVvFVBFòWF„ÖævW"’)H)H  ¢—4Ö–âæ†æFÆR‚vWFƒ¦–æ—F–Æ—¦RrÂ7–æ2‚’Óâ°¢G'’°¢ÆWBVæF–æt6ö×ÆWF–öã¢&öÖ—6SÆWF„ÖævW"äWF…7FFSâÂçVÆÂÒçVÆÃ°¢6öç7B7FFRÒv—BWF„ÖævW ¢æ–æ—F–Æ—¦R‡°¢öä6öÆE7F'EVæF–æs¢†6ö×ÆWF–öâ’Óâ°¢VæF–æt6ö×ÆWF–öâÒ6ö×ÆWF–öã°¢ÒÀ¢Ò¢æf–æÆÇ’‚‚’ÓâWF„7&VFVçF–Å&V6÷fW'’ç&WVW7B‚’“°¢v—BWF„ÖævW"æVç7W&U7F&ÆT÷væW%÷7D6öÖÖ—EF6·2‚vWF‚Ö–æ—F–Æ—¦Rr“°¢–b‚æ—56¶vVBÇÂ—46–æG•fW'6–öäÆVæ6…VæF–ær‚’’°¢&V6÷&DFW6·F÷FWdWF…7F'GW&W7VÇB‡7FFRÂVæF–æt6ö×ÆWF–öâÂ‚’Óà¢WF„ÖævW"ævWDWF…7FFR‚’À¢“°¢Ð¢òòKÛþyJŽ{¹þŠêYÎhHþ™{Žy¨NKˆjÊh
+~ZÙŽ˜xþ‹øz{³®Xú®ŠêNXk~Y
+þXªŽh.ZHÞX{®iÚ^y¨Ny›¾[Ù^h8.Xh^˜:ŽiÈ’wV&BÀ¢òòZI®KŠ®z©~Xú>YNˆz¢–æ—F–Æ—¦RXú®KÉ®ŠøNKËKˆjÊŽŠxæÇ—F–756WGF–æw56W'f–6Rž8 ¢òòYø¾x+žiŠò&W7BÖVff÷'C®XhÞXÈ^Kˆ["6F6‚ÎK»¾KÙ^[È.[‹Ž˜;ÞKˆÞ[é~Šêž‹ùžjÊŠêNŠøŠ*¾XŠNZK‹JP¢òòŽ˜*>KÉ®ŠêžyJŽh‹~Š*¾[Ù.Kˆh‰iÊ®y›¾[ÙRž8 ¢G'’°¢æ÷FTWF„6öÆE7F'E7FFR‡7FFRÂVæF–æt6ö×ÆWF–öâ“°¢Ò6F6‚†æÇ—F–74W'"’°¢6öç6öÆRçv&â‚u¶æÇ—F–75Ò6öÆB×7F'B6öç6VçBÖ–w&F–öâf–ÆVBrÂæÇ—F–74W'"“°¢Ð¢&WGW&â7FFS°¢Ò6F6‚†W'"’°¢–b‚æ—56¶vVB’°¢Ö&´FW6·F÷FWe7F'GWf–ÆVB€¢tUD…ô”ä•Eôd”ÄTBrÀ¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢°¢†6S¢vWFƒ¦–æ—F–Æ—¦RrÀ¢ÒÀ¢“°¢Ð¢F‡&÷rW'#°¢Ð¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦vWBÖÆöv–â×7FFRrÂ7–æ2‚’ÓâWF„ÖævW"ævWDÆöv–å7FFR‚’“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦F—7F6‚ÖÆöv–âÖ7F–öârÂ7–æ2…öWfVçBÂ7F–öã¢Væ¶æ÷vâ’Óâ°¢&WGW&âWF„ÖævW"æF—7F6„Æöv–ä7F–öâ†7F–öâ“°¢Ò“° ¢òòy›¾[ÙR6F6†h™ŽzêhÉh‰Žš^YËYØŽKˆÞY
+²VW'’ž8.Xú®‹ùNY¹îhÈžièN[»®XË®Yùþh»ÎX{®y¨NXZÎ[ÈU$ÂÀ¢òòizXšþKÙÎyJŽ8KˆÞY
+¾XzÞŠø·&VæFW&W"y¨BÆöv–ä6F6†÷fW&Æ’yJŽZè>Š8^‹ÛÒvV'f–W~8 ¢—4Ö–âæ†æFÆR‚vWFƒ¦vWBÖ6F6†Ö6†ÆÆVævR×W&ÂrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&âWF„ÖævW"ævWDÆöv–ä6F6†6†ÆÆVævUW&Â‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦Æöv÷WBrÂ7–æ2‚’Óâ°¢v—BWF„ÖævW"æÆöv÷WB‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçG3¦Æ—7BrÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&âWF„ÖævW"æÆ—7E6fVD66÷VçG2‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçG3§7–æ2rÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—BWF„ÖævW"ç7–æ56fVD66÷VçG2‚“°¢Ò6F6‚†W'&÷"’°¢F‡&÷tWF„66÷VçD—4W'&÷"†W'&÷"“°¢Ð¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçG3§7v—F6‚rÂ7–æ2†WfVçBÂ66÷VçD¶W“¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢v—BWF„ÖævW"ç7v—F6…6fVD66÷VçB†66÷VçD¶W’“°¢Ò6F6‚†W'&÷"’°¢F‡&÷tWF„66÷VçD—4W'&÷"†W'&÷"“°¢Ð¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçG3¦&Vv–âÖFBrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—BWF„ÖævW"æ&Vv–äFD66÷VçDÆöv–â‚“°¢Ò6F6‚†W'&÷"’°¢F‡&÷tWF„66÷VçD—4W'&÷"†W'&÷"“°¢Ð¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçG3¦6æ6VÂÖFBrÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢WF„ÖævW"æ6æ6VÄFD66÷VçDÆöv–â‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦VçFW"ÖÆö6ÂrÂ7–æ2‚’Óâ°¢–b†vWD7F—fT6W76–öâ‚’æÖöFRÓÓÒvÆö6Âr’°¢&WGW&âWF„ÖævW"ævWDWF…7FFR‚“°¢Ð¢v—BWF„ÖævW"çv—Df÷%6W76–öä–çfÆ–FF–öâ‚“°¢&WGW&âWF„ÖævW"æVçFW$Æö6ÄÖöFR‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦W†—BÖÆö6ÂrÂ7–æ2‚’Óâ°¢–b†vWD7F—fT6W76–öâ‚’æÖöFRÓÒvÆö6Âr’°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂtÆö6ÂÖöFR—2æ÷B7F—fRâr“°¢Ð¢&WGW&âWF„ÖævW"æW†—DÆö6ÄÖöFR‚“°¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ§&Vg&W6‚rÂ7–æ2‚’Óâ°¢&WGW&âWF„ÖævW"ç&Vg&W6‚‚“°¢Ò“° ¢òò)H)H66÷VçBFVÆWF–öâ•2)H)H ¢òò&V6V—BæBWF‚Fö¶Vç27F’–âÖ–ââ7V66W76gVÂ6öæf—&Òf—'7B&WW6W0¢òòF†RgVÆÂÆöv÷WB66÷VçBÖ&÷VæF'’FV&F÷vâÂF†Vâ6ÆV'2öæÇ’F†—2Æö6À¢òò6W76–öâ‡F†R6W'fW"†2Ç&VG’&Wfö¶VB—G2&Vg&W6‚fÖ–Ç’’à¢6öç7B66÷VçDFVÆWF–öäÆörÒ7&VFTÆövvW"‚v66÷VçDFVÆWF–öâr“°¢6öç7B66÷VçDFVÆWF–öä†æFÆW'2Ò7&VFT66÷VçDFVÆWF–öä—4†æFÆW'2‡°¢vWDf–Æ&–Æ—G“¢‚’ÓâWF„ÖævW"ævWD66÷VçDFVÆWF–öäf–Æ&–Æ—G’‚’À¢&WVW7D6†ÆÆVævS¢‚’ÓâWF„ÖævW"ç&WVW7D66÷VçDFVÆWF–öä6†ÆÆVævR‚’À¢6öæf—&Ó¢†–çWB’ÓâWF„ÖævW"æ6öæf—&Ô66÷VçDFVÆWF–öâ†–çWB’À¢vWE7FGW3¢‚’ÓâWF„ÖævW"ævWD66÷VçDFVÆWF–öå7FGW2‚’À¢6ÆV%&V6V—C¢‚’ÓâWF„ÖævW"æ6ÆV$66÷VçDFVÆWF–öå&V6V—B‚’À¢6öç7VÖU&W7F÷&VDæ÷F–6S¢‚’ÓâWF„ÖævW"æ6öç7VÖT66÷VçDFVÆWF–öå&W7F÷&VDæ÷F–6R‚’À¢—46öæf—&ÖVDÆö6Å6W76–öä7W'&VçC¢‚’ÓâWF„ÖævW"æ—46öæf—&ÖVD66÷VçDFVÆWF–öå6W76–öä7W'&VçB‚’À¢6ÆV$Æö6Å6W76–öã¢‚’ÓâWF„ÖævW"æ6ÆV$Æö6Å6W76–öägFW$66÷VçDFVÆWF–öâ‚’À¢Æöuv&ã¢†ÖW76vRÂW'&÷"’Óâ66÷VçDFVÆWF–öäÆörçv&â†ÖW76vRÂW'&÷"’À¢Ò“° ¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã¦vWBÖf–Æ&–Æ—G’rÂ‚’Óà¢66÷VçDFVÆWF–öä†æFÆW'2ævWDf–Æ&–Æ—G’‚’À¢“°¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã§&WVW7BÖ6†ÆÆVævRrÂ‚’Óà¢66÷VçDFVÆWF–öä†æFÆW'2ç&WVW7D6†ÆÆVævR‚’À¢“°¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã¦6öæf—&ÒrÂ…öWfVçBÂ–çWC¢Væ¶æ÷vâ’Óà¢66÷VçDFVÆWF–öä†æFÆW'2æ6öæf—&Ò†–çWB’À¢“°¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã¦vWB×7FGW2rÂ‚’Óâ66÷VçDFVÆWF–öä†æFÆW'2ævWE7FGW2‚’“°¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã¦6ÆV"×&V6V—BrÂ‚’Óà¢66÷VçDFVÆWF–öä†æFÆW'2æ6ÆV%&V6V—B‚’À¢“°¢—4Ö–âæ†æFÆR‚vWFƒ¦66÷VçBÖFVÆWF–öã¦6öç7VÖR×&W7F÷&VBÖæ÷F–6RrÂ‚’Óà¢66÷VçDFVÆWF–öä†æFÆW'2æ6öç7VÖU&W7F÷&VDæ÷F–6R‚’À¢“° ¢òò)H)H&öf–ÆR{Én‹é•2ŽŠëî{Úâ(i"yJŽh‹~XÚx˜~{Én‹é¾K‰®XªKÙ>YÊ‚&öf–ÆTVF—BçG2À¢òò‹XNiižy»NXi’WF‚×6W'fW"ÎZKNX8þ{¸ò÷72×6W'fW"š(NzÛîYÞy»NKÊ’)H)H  ¢6öç7B&öf–ÆTVF—DÆörÒ7&VFTÆövvW"‚w&öf–ÆTVF—Br“°¢6öç7B&öf–ÆTVF—DFW3¢&öf–ÆTVF—Bå&öf–ÆTVF—DFW2Ò°¢vWD7W'&VçEW6W$–C¢‚’ÓâWF„ÖævW"ævWD7W'&VçEW6W$–B‚’À¢vWE6W'fW%&öf–ÆS¢‚’ÓâWF„ÖævW"ævWE6W'fW%&öf–ÆR‚’À¢6†÷tfF$÷VäF–Æös¢7–æ2‚’Óâ°¢6öç7B&W7VÇBÒv—BF–Æörç6†÷t÷VäF–Æör‡°¢&÷W'F–W3¢²v÷Väf–ÆRuÒÀ¢f–ÇFW'3¢·²æÖS¢t–ÖvW2rÂW‡FVç6–öç3¢&öf–ÆTVF—BädD%ôd”ÄUôU…DTå4”ôå2ÕÒÀ¢Ò“°¢&WGW&â&W7VÇBæ6æ6VÆVBÇÂ&W7VÇBæf–ÆUF‡5³ÒòçVÆÂ¢&W7VÇBæf–ÆUF‡5³Ó°¢ÒÀ¢&VDf–ÆS¢†f–ÆUF‚’Óâg2ç&öÖ—6W2ç&VDf–ÆR†f–ÆUF‚’À¢WÆöDfF#¢7–æ2‡²'VffW"ÂÖ–ÖUG—RÒ’Óâ°¢6öç7B&W7VÇBÒv—BWÆöEV&Æ–476WB€¢°¢fWF6„–×Ã¢†–çWBÂ–æ—B’ÓâæWBæfWF6‚†–çWBÂ–æ—B’À¢vWD&6UW&Ã¢‚’ÓâvWD6Æ–VçDVæGö–çB‚v÷74”&6UW&Âr’À¢vWEFö¶Vã¢‚’ÓâWF„ÖævW"ævWD66W75Fö¶Vâ‚’À¢ÒÀ¢²66VæS¢vfF"rÂ6öçFVçEG—S¢Ö–ÖUG—RÂ&öG“¢'VffW"ÒÀ¢“°¢–b‚&W7VÇBæö²bb&W7VÇBç7FGW2ÓÓÒCbb&W7VÇBæ6öFRÓÓÒt44õTåEõTäd”Ä$ÄRr’°¢fö–BWF„ÖævW"æ–çfÆ–FFU6W76–öâ‚v66÷VçB×Væf–Æ&ÆRr“°¢Ð¢&WGW&â&W7VÇC°¢ÒÀ¢F6…&öf–ÆS¢‡F6‚’ÓâWF„ÖævW"çWFFU6W'fW%&öf–ÆR‡F6‚’À¢Æöuv&ã¢†ÖW76vRÂW'"’Óâ&öf–ÆTVF—DÆörçv&â†ÖW76vRÂW'"’À¢Ó° ¢6öç7B&WV—&T6Æ÷VE&öf–ÆRÒ‚“¢fö–BÓâ°¢–b‚vWD6&–Æ—F–W2‚’æ6åW6T6–æG”66÷VçE6W'f–6W2’°¢F‡&÷t—4W'&÷"‚uU$Ô•54”ôåôDTä”TBrÂu&öf–ÆRVF—F–ær&WV—&W26–æG’66÷VçBâr“°¢Ð¢Ó° ¢—4Ö–âæ†æFÆR‚w&öf–ÆS¦vWB×7FFRrÂ7–æ2‚’Óâ°¢&WV—&T6Æ÷VE&öf–ÆR‚“°¢&WGW&â&öf–ÆTVF—BævWE&öf–ÆTVF—E7FFR‡&öf–ÆTVF—DFW2“°¢Ò“° ¢—4Ö–âæ†æFÆR‚w&öf–ÆS¦6†ö÷6RÖfF"rÂ7–æ2‚’Óâ°¢&WV—&T6Æ÷VE&öf–ÆR‚“°¢&WGW&â&öf–ÆTVF—Bæ6†ö÷6TfF$f–ÆR‡&öf–ÆTVF—DFW2“°¢Ò“° ¢—4Ö–âæ†æFÆR‚w&öf–ÆS§WFFRrÂ7–æ2…öWfVçBÂ&×3¢Væ¶æ÷vâ’Óâ°¢&WV—&T6Æ÷VE&öf–ÆR‚“°¢&WGW&â&öf–ÆTVF—BçWFFU&öf–ÆR‡&öf–ÆTVF—DFW2Â&×2“°¢Ò“° ¢òòvöövÆRôWF‚™¸nh‰[{.K¨â##bÓrÓ2™¨òÆ—¦•övöövÆR˜[Ûž(	N(	DvöövÆRˆ;ÞX©¾i[NKÙ0¢òò‹øXZ^Xh^{ÚîhHþŠøbf–ÆòÖvöövÆRŽŠëî{ÚîXZ^Xú>YÊ‚hHþŠøb(i"f–ÆòvöövÆRž8  ¢òò¦—&ôWF‚„FÆ76–â4Äò²Æö÷&6²&VF—&V7B ¢òò6Æ6²ZéŽik’Ô5ôWF‚•2[{.K¨â##bÓrÓR˜[Û’Žˆ;ÞX©¾‹øXZ^Xh^{ÚîhHþŠøb6–æG’×6Æ6²À¢òòhèŽiØ>‹[öWF‚Ö'&ö¶W#¾ˆ‹JnXû~yK6Æ6´66÷VçG4Ö–w&F–öâizhIþi
+ÎXZRž8  ¢òòv—D‡V"òv—DÆ"B•2[{.K¨â##bÓrÓB˜[Û’„v—D‡V"ˆ;ÞX©¾‹øXZ^Xh^{ÚîhHþŠø`¢òò6–æG’Öv—F‡V"Äv—DÆ"ˆ;ÞX©¾‹øXZ^Xh^{ÚîhHþŠøb6–æG’Öv—FÆ"ž8  ¢òòÖ¶W"6÷&R•2k:ŽXhÎ[ø^š¾zØ’7Æ6‚h¨¢6ÆVFRö6öFW‚&–æ'’˜;Ò&÷f—6–öâZ[ÞK˜¾YîXhÞX¢(	N(	@¢òòvWDÖ¶W"‚’YÊŽièN˜
+iÉþ[Šû²&–æ'’F‚ÂizžK¨â7Æ6‚‹>yJŽKÉ®h©¾™I“²zÊÎKˆjÊ7Æ6‚h‰X©þYî{ÚâG'VRÀ¢òòYî{ºÒ&WG'’‹[6†V6²ÖVçf—&öæÖVçBKˆÞ˜xÞZHÞk:ŽXhÂŽ˜xÞZHÒ—4Ö–âæ†æFÆRKÉ®Šhny¹nYÎYÒ†æFÆW"ž8 ¢ÆWBÖ¶W$—75&Vv—7FW&VBÒfÇ6S°¢òò’iŠþ(	ÎiÊÎjÊY
+þXªŽXúþ˜ž(	Þy¨Nˆ;ÞX©¾ûÉ®XxnZH~ZK‹J^KˆÞ™‹¾ZîK‹¾yXÎ™Ú.ûÈÎKªN{¹’&V6÷fW'’YÊŽ{Ù{¹Îh.ZHÞYà¢òò˜xÞik‹[ÖævVB&W&^ûÈÎ[›nYÊŽh‰X©þYîXªŽhk:ŽXhÎX‹[Ù>X˜ÒÖ¶W.8 ¢6öç7B•'VçF–ÖU&V6÷fW'’Ò7&VFU•'VçF–ÖU&V6÷fW'’‡°¢—4öæÆ–æS¢‚’ÓâæWBæ—4öæÆ–æR‚’À¢&W&S¢7–æ2‚’Óâ°¢6öç7B&W7VÇBÒv—B&–æ'•&W&R‚w’rÂ°¢'&öF67Df–ÇW&S¢fÇ6RÀ¢'&öF67E&öw&W73¢fÇ6RÀ¢6–væÃ¢&÷'E6–væÂçF–ÖV÷WB…•ôtTåEô”å5DÄÅõ5D%EUôDTDÄ”äUôÕ2’À¢Ò“°¢&WGW&â&W7VÇC°¢ÒÀ¢&Vv—7FW#¢‚’Óâ&Vv—7FW%”vVçD–df–Æ&ÆR‚’À¢öå&Vv—7FW&VC¢‚’Óâ°¢6öç6öÆRæ–æfò‚u¶&ö÷G7G&ÖVÆV7G&öåÒ’'VçF–ÖR&V6÷fW&VBæBvVçB&Vv—7FW&VBr“°¢ÒÀ¢Æöuv&ã¢†ÖW76vRÂW'&÷"’Óâ6öç6öÆRçv&â†¶&ö÷G7G&ÖVÆV7G&öåÒG¶ÖW76vWÖÂW'&÷"óòrr’À¢Ò“°¢&WG'••'VçF–ÖTgFW$æWGv÷&µ&V6÷fW'’Ò‚’Óâ°¢fö–B•'VçF–ÖU&V6÷fW'’ç&WG'”æ÷r‚wv–æF÷rÖfö7W2r“°¢Ó°¢F—7÷6U•'VçF–ÖU&V6÷fW'’Ò‚’Óâ•'VçF–ÖU&V6÷fW'’æF—7÷6R‚“°¢6öç7B&Vv—7FW$Ö¶W$—74gFW%7Æ6‚Ò7–æ2‚“¢&öÖ—6SÇfö–CâÓâ°¢–b†Ö¶W$—75&Vv—7FW&VB’&WGW&ã°¢òòjŠYè¾Ké¾[©NYXnyºî[ÙR‡&÷f–FW'2æ§6öâžhÈž8Äõ52yÉþk©ò'VæFÆVBXYÎ[©^8ÞXª‹ÛÞKˆjÊZÙŽXh^ZÙƒ®[ø^š¾YÊŽzÊÎKˆjÊ¢òòvWDÖ¶W$6÷&R‚’ŽKˆ¾™Ú.ièN˜
+Ö¶W.8YÎjÚ^K¸âvWD7F—fT6FÆör‚’kKîyIòf–Æ&ÆTÖöFVÇ2žK˜¾X˜ÞZèÎh‰À¢òòY
+nX‰žšinKŠ®‹ù¾zˆ¾KÉ®yJŽXh^{ÚîXYÎ[©^yºî[Ù^kKîyIþjŠYè¾kˆ^XÙ^8&Vç7W&T7F—fT6FÆötÆöFVB[˜.zØžK‰NkŽKˆÞh©°¢òòŽZK‹J^Y¹î‰Ò'VæFÆVB’Îh¸žXùn‹[7Æ6‚iÉþ8Š*¾‹ù¾[ªniÚy¹nKØþ8 ¢v—BVç7W&T7F—fT6FÆötÆöFVB‚“°¢òòçF‡&÷–2Ö6ö×BiÊÎYËKº>ynYÊ‚7Æ6‚iÉþh.Y
+þXª‚(	N(	B˜[ÛžX[ÎZëžjŠ[Èþ[ÈX[>Yâ&÷‡’h.YÊŽ™;î‹zþ˜xÀ¢òò‡W"ÖÖöFVÂòW"×6W76–öâKé¾[©NYXn‹zþyK˜;ÞkK¾YÊ‚&÷‡’y¨B&÷WF–æuG&ç6f÷&Ò˜xÂÂ{¹^‹ø~XÛ>ZKiX‚ž8 ¢òòY
+þXªŽZK‹J^KÉ¢f–ÂÖ÷VâY¹î‰ÞyÉþKˆ®k‹‚²h™2U%$õ"iz^[ùrÂKˆÞ™‹¾Zâ8 ¢òð¢òò6ÆVFT6öFTvVçBç'VçF–ÖT6öæf–ræVæGö–çBiŠòvWGFW"ŽŠx'VçF–ÖRÖ6öæf–w2çG2’À¢òòjøþjÊ7F'E6W76–öâ˜;Þ˜xÞŠû²vWD6ÆVFTVæGö–çB‚’Â&÷‡’[{º®Yîik[»¢6W76–öâˆz®XªŽyJŽKˆ¢Æö÷&6¾8 ¢òð¢òòŠê.™ˆ^y»N‹ùâ†6†FwBòò†’òX˜Þ{ÈžKºRÆö6Ä†æFÆW"[Ú.hhù.YÊŽiÊÂ&÷‡’y¨B&÷WF–æuG&ç6f÷&Ò˜xÀ¢òòŽŠxçF‡&÷–2Ö6ö×B×&÷‡’Ö†÷7BòçF‡&÷–2×&W7öç6W2Ö'&–FvRÖ†÷7B’Î{ªþXh^ZÙŽhy.Š8^˜XÒÀ¢òòizxºÎz¸²6W'fW.8izY
+þXª‚òX[>XÎyIþYÞYŽiÉþ8 ¢v—BVç7W&TçF‡&÷–46ö×E&÷‡•&VG’‚“°¢òò6öFW‚&÷‡’KŠNzxÒ7vâ[Ú.h†öWF‚Ö&V&W"òVçbÖ¶W’ž˜;Þ{¸þZè>X{®Xú2ÎšinKŠ¢6öFW‚6W76–öâ7vâi{`¢òòyK&W&T6öFW„W‡G&7vä6öæf–rhy.Y
+þXª‚Ž[˜.zØ’“¾jÚNZHNKˆÞXhÞhÈžXZŽ[[ÈX[2VvW"×7F'N8 ¢G'’°¢6WEWFFTWFõ&VÆVæ6„'W7•&ö&R†7–æ2‚’Óâ°¢òò&VÖ÷FR÷W&F÷"Ö’&Rf–Wv–ærÆ—fR6W76–öâ÷"f–ÆRG&VRv—F†÷WBâvVçBGW&âà¢òò¶VWF†÷6RF‡2Æ—fRÂ'WBFòæ÷BÆWBF†RÆ–v‡GvV–v‡B6W76–öç6Æ—7B7V'67&—F–öà¢òò†VÆB'’WfW'’VÆ–v–&ÆRFWf–6R&Æö6²WFFW2f÷&WfW"à¢&WGW&â†5WFFU&VÆVæ6„'W7”7F—f—G’‡°¢&VE7–æ6‡&öæ÷W4'W7“¢‚’Óà¢vWEWFFU&VÆVæ6„6öçG&öÆÆW'2‚’æÆVæwF‚âÇÀ¢†4–äfÆ–v‡E&VÖ÷FT–çfö¶W2‚’ÇÀ¢ç•6W76–öä–åGW&â†vWDÖ¶W$6÷&R‚’’À¢&VE66†VGVÆT'W7“¢‚’Óâ&VEWFFU&VÆVæ6…66†VGVÆT'W7’†vWE66†VGVÆU7F÷&vT–d–æ—F–Æ—¦VB‚’’À¢Ò“°¢Ò“°¢òòh˜¾XªŽi»Nik˜xÞY
+òŽKê~jòWFFT&ææW"žy¨N™‹¾ijÞXŠNZé®8.KˆîKˆ®™Ú.˜*>KŠ¢¢®izK«®XÎZè‚¢®hê.™(ŽX‹¾hHþXˆn[È ¢òòizK«®XÎZèŽŠh‹ùî8ÎiÈž‹ùÎzˆ¾ŠëîZH~YÊŽyÈ¾KÉ®ŠùÞ8Þ˜;ÞŠêž‹zòÎh˜¾XªŽ˜xÞY
+þiŠþyJŽh‹~K‹¾XªŽXù‹[~y¨BÎXú®Šú^X[>[ø0¢òò8Î‹ùžKˆKˆ¾KÉ®h™>ijÞY:®K©¾jÚ>YÊŽ‹yy¨NkK¾8Þ8.Y¹¾KŠ®kK¾XªŽiÚ^k©y¨Nˆ®YŽKˆâf–ÂÖ6Æ÷6VBXú>[èNŠx¢òò&VÆVæ6„'W7”7F—f—G’çG2Æ†æFÆW"Kˆâ6VæFW"ijÞŠˆŠx&VÆVæ6„'W7”7F—f—G”—2çG3°¢òò‹ùž˜xÎXú®hùKé¾iÚ^k©(	N(	BiÊÎ‹ù¾zˆ¾YJþKˆˆ;ÞYÎi{nyÈ¾X‹Ö¶W.86–æG’Ö'&–âKˆâ66†VGVÆW"KˆžKê~y¨NKØÞ{Úî8 ¢òð¢òòKˆÞ‹ù²FWf–6RÖÆ–æ²ÆÆ÷vÆ—7C§WFFW"{²6†ææVÂhÈ’ÆÆ÷vÆ—7Bšn˜:Žk:Ž˜x®[î8ÎkŽKˆÞiKîŠÎ8ÒÀ¢òòK‰N‹ùÎzˆ¾hê~X‹nzºþKˆÞKÉ®Kº>i»þyJŽh‹~x+žŠ*¾hê~zºþy¨Ni»Nik˜xÞY
+þ8 ¢&Vv—7FW%&VÆVæ6„'W7”7F—f—G”—2‡&VE&VÆVæ6„7F—f—G•6÷W&6W2“°¢òòvWDÖ¶W$6÷&R‚’šinjÊ‹>yJŽŠznXùÖ¶W"ièN˜
+ûÈÎYÎi{nXù‹[~ˆz®Zé®K˜’Ô5X‰ÞZx¾Xª‹ÛÞ8 ¢òòv—BzîKùÞzÊÎKˆKŠ®KÉ®ŠùÞy¨BÖ7&÷f–FW'2i[{¸N[{.Z¾XZ^[{.KùÞZÙŽy¨Nˆz®Zé®K˜’Ô5ûÈ…"Xk~Y
+þXªŽz¹îhKúîZHÞûÈž8 ¢vWDÖ¶W$6÷&R‚“°¢v—Bv—Df÷$–æ—F–Ä7W7FöÔÖ7&Vg&W6‚‚“°¢òò•2†æFÆW'2Æ—fRf÷"F†Rv†öÆR&ö6W72Âv†–ÆRF†R6öæ7&WFRÖ¶W"—0¢òò&WÆ6VBBWfW'’FFÖ÷væW"&÷VæF'’âF†Rf6FR&W6öÇfW2—BÆ¦–Ç’à¢6öç7B—4Ö¶W"Ò7&VFTG–æÖ–4Ö¶W"‚‚’Óâ°¢–b†—46W76–öä&÷VæF'•VæF–ær‚’’°¢F‡&÷t—4W'&÷"€¢u$T4ôäD•D”ôåôd”ÄTBrÀ¢t6W76–öâ—27v—F6†–æs²&WG'’gFW"F†R÷væW"&÷VæF'’6WGFÆW2ârÀ¢“°¢Ð¢&WGW&âvWDÖ¶W$6÷&R‚“°¢Ò“°¢&Vv—7FW$Ö¶W$6÷&T—2†—4Ö¶W"Â°¢'V–ÇF–ä”¶W”FW2À¢öäç•6W76–öåGW&ä¶VWÆ—fT6†ævS¢†—5'Vææ–ær’Óâ°¢6WDÖ–åv–æF÷t&6¶w&÷VæEF‡&÷GFÆ–ætf÷$7F—fUGW&â†—5'Vææ–ær“°¢æ÷F–g•WFFTWFõ&VÆVæ6„'W7•7FFT6†ævVB‚“°¢ÒÀ¢&Vg&W6…†DvFWv”ÖöFVÇ2À¢v—Df÷$66÷VçE&÷f–FW$ÖöFVÇ5&VG“¢v—Df÷$7W'&VçD66÷VçE&÷f–FW$ÖöFVÇ5&VG’À¢öå&÷f–FW$ÖöFVÄWFõ&Vg&W6„6öæf–wW&VC¢Ö&´Ö¶W%&÷f–FW%&Vg&W6„6öæf–wW&VBÀ¢Ò“°¢&Vv—7FW$Ö¶W%F—FÆT—2‡²—56W76–öåGW&åVæF–æt6ö×ÆWF–öâÒ“°¢&Vv—7FW%v÷&¶–æu7FGW4—2‚“°¢&Vv—7FW$W†–Æ–'”ÖöFVÅ6WGF–æw4—2‚“°¢&Vv—7FW$Ö¶W$†VÇ—2†—4Ö¶W"“°¢&Vv—7FW$†VÇfVVF&6´—2‚“°¢&Vv—7FW$Ö¶W%Æåw&—FT—2‚“°¢&Vv—7FW$Ö¶W%&Wv–æD—2‚“°¢&Vv—7FW$Ö¶W$f÷&´—2‚“°¢&Vv—7FW$Ö¶W$WF„—2†—4Ö¶W"“°¢&Vv—7FW$Ö¶W%7FGW4—2†—4Ö¶W"“°¢&Vv—7FW$Ö¶W%W6vT—2†—4Ö¶W"“°¢&Vv—7FW$Ö¶W$&–æ'•fW'6–öä—2‚“°¢&Vv—7FW$7&÷74vVçD6öçfW'D—2‚“°¢òòv÷&¶F—"f–ÆR'&÷w6W"‡g66öFR×7G–ÆRÆ§’f–ÆRG&VR²6öçFVçBf–WvW"f÷ ¢òò6W76–öâw2v÷&¶–ærF—&V7F÷'’’âW&RÆö6Âg2”òÂæòÖ¶W"FWVæFVæ7’À¢òò'WBÆ—fW2–âF†—2&Æö6²Fò¶VW7Æ6‚ÖvF–ær6–×ÆRà¢&Vv—7FW$f–ÆT'&÷w6W$—2‚“°¢òòFWf–6RÖÆ–æ²‹ùÎzˆ¾ih~K»nkXþŠxƒ¦f–ÆRÖ'&÷w6W#§&VÖ÷FRÖ÷†æFÆW"²g2×vF6‚F÷–0¢òòŠê.™ˆ^™*žZÙŽŠ*¾hê~zºþŠy.ˆ›#¶–çfö¶R×&Vv—7G'’hÙ^ˆë~YîKé¾hê~X‹nzºþ™ª~˜>‹>yJ‚ž8 ¢&Vv—7FW$f–ÆT'&÷w6W$FWf–6T÷‚“°¢òò&VÖ÷FR54‚†÷7BÖævVÖVçB…†6R’(	N(	B‹ùîhê^zêyb²âòç76‚ö6öæf–r”òÀ¢òòi¨.iÊ®khžXø¢vVçBÖöâ×&VÖ÷FRò6W76–öâYÎjÚRÎYî{ºÒ†6R"hšž[^8 ¢&Vv—7FW%&VÖ÷FU76„—2‚“°¢òò†6RB(	BY
+þXªŽYîXûWFô6öææV7C¢h¨¢&Vg2˜xÂWFô6öææV7C×G'VRy¨B†÷7@¢òòhùX˜Þ‹ùîZ[ÒÂyJŽh‹~‹ù¾ik[»®ZûžŠùÞx+ž‹ùÎzˆ¾šžyºîi{nKˆÞyJŽzØž8&f—&RÖæBÖf÷&vWBÂZK‹J^K¸P¢òòÆörçv&âÂKˆÞ™‹¾Zâ&ö÷G7G&Yî{ºÞjÚ^šªN8.k:ŽhHþ[ø^š¾YÊ‚&Vv—7FW%&VÖ÷FU76„—0¢òòK˜¾YâÂYºK‹¢7F'DWFô6öææV7BXh^˜:Ž‹[Vç7W&T‡–G&FVBÂˆÂööÂiŠò•0¢òòk:ŽXhÎi{nX‰ÞZx¾XÉny¨N8 ¢fö–B7F'DWFô6öææV7D†÷7G4&6¶w&÷VæB‚’æ6F6‚‚†W'"’Óâ°¢òòXYÎ[©^™‹.jÚ"Væ†æFÆVB&öÖ—6R(	B7F'DWFô6öææV7BXh^˜:Ž[{"ÆÅ6WGFÆVBÂ‹ùž˜xÀ¢òòXú®Xúþˆ;ÞiŠòVç7W&T‡–G&FVBˆz®[{x+ŽK¨bŽz8y¹ŽiX^™©Î{ªr’Âv&âXÛ>Xúþ8 ¢7&VFTÆövvW"‚w&VÖ÷FR×76ƒ¦WFòÖ6öææV7Br’çv&â‚w7F'DWFô6öææV7D†÷7G4&6¶w&÷VæBF‡&WrrÂ°¢W'&÷#¢7G&–ær†W'"’À¢Ò“°¢Ò“°¢òò†öö²‹ùîhêRŽZIn˜:‚†öö²6W'fW"hê^XZR“¢•2k:ŽXhÂ²hÈž˜XÞ{Úîh¸ž‹[~Y
+þyJŽy¨N‹ùîhê^8 ¢òòX{®Xè.‹ùîhê^X‰~ŠŽK‹®z›¢(	N(	Bk*˜XÞ‹ø~y¨NyJŽh‹~jÚNZHN™šNKˆjÊz›®ih~K»nŠû¾XùnZIn™»nŠÎK‹®8 ¢&Vv—7FW$†öö´6öçG&öÄ—2‚“°¢òòšžyºî{ª~ih~iÊÎi	Î{J"‡v÷&¶F—"Ö'&÷w6R6V&6‚æVÂ’(	B7vâˆz®[Šb&—w&WÀ¢òòäD¥4ôâkX[ÈþY¹îhêŽX‹&VæFW&W.8.ZèÎXZŽxºÎz¸¾K¨âf–ÆRÖ'&÷w6W"K‹¾™;î‹zòÎiKî‹ùž˜xÀ¢òòK¸^K‹®YÎKˆY
+þXªŽiÉþk:ŽXhÎ8 ¢&Vv—7FW%6V&6„—2‚“°¢òòFW6·F÷6Æ6‚6öÖÖæB&Vv—7G'’(	N(	Bk:ŽXhÂö†VÇö6ÆV"zØžXh^{Úîš’À¢òò•2i«N™Ë.ŠxÖ¶W"Ö—2öFW6·F÷Ö6öÖÖæG2çG2Ž[èR7FWRk{¾Xªž8 ¢òòXÙ^Kè²²[˜.zØžKùÞhªB†Ö¶W$—75&Vv—7FW&VBfÆr’KùÞŠø'V–ÇF–ç2Xú®xÎKˆjÊ8 ¢òò&VÖ÷FT–çfö¶S®‹ùÎzˆ¾KÉ®ŠùÒ†7G‚æFWf–6T–Bžy¨BövöÂöÆV&âö6ÖBK‰®XªKÙ>{¸þ™ª~˜>‹zþyK¢òòX‹Š*¾hê~zºò(	N(	B‹[Kˆâ&VæFW&W"FWf–6TÆ–æ²æ–çfö¶RYÎKˆiÚ†æFÆT–çfö¶RK‹¾‹zþ[è@¢òòŽhê~X‹n[ÈX[>j
+š¨Â²™IžŠúþiŠ[NKˆˆ{Bž8 ¢&Vv—7FW$'V–ÇF–äFW6·F÷6öÖÖæG2†vWDFW6·F÷6öÖÖæE&Vv—7G'’‚’Â°¢vWDvöÄ6öçG&öÆÆW"À¢vWDÆV&ä6öçG&öÆÆW"À¢—4ÆV&äVæ&ÆVC¢—46–æG”ÆV&å6¶–ÆÄVæ&ÆVBÀ¢&VÖ÷FT–çfö¶S¢†FWf–6T–BÂ6†ææVÂÂ&w2’Óà¢FWf–6TÆ–æ´†æFÆT–çfö¶R†FWf–6TÆ–æ´—4FW2‚’ÂFWf–6T–BÂ6†ææVÂÂ&w2’À¢Ò“°¢òòFW6·F÷Ö6ÖC§'Vâ(	N(	Bö6ÖBy¨NŠ*¾hê~zºþ‹ùÎzˆ¾hš~ŠÂ†æFÆW"ŽK¸^™ª~˜2F—7F6‚khŽ‹K’À¢òòiÊÎiË¢ö6ÖBK¸ÞYÊ‚'V–ÇF–ç2Xh^ˆNhš~ŠÂÎKˆÞ‹[•2[è‹ùBž8 ¢&Vv—7FW%&VÖ÷FT6ÖD—2‚“°¢òòÆV&ã¢¢†æFÆW"hùX˜ÞKˆjÊh
+~k:ŽXhÂ†VvW"ÎYÂvöÂ“¶†æFÆW"Xh^˜:ŽŠû¾Xùb6öçG&öÆÆW ¢òòXÙ^Kè²Æ–çfö¶Ri{b6öçG&öÆÆW"[{.yK7F'DÆV&ä†÷7BY
+þXªŽ8 ¢&Vv—7FW$ÆV&ä—2‚“°¢òòÖ¶W#§66†VGVÆS¢¢†æFÆW"hùX˜ÞKˆjÊh
+~k:ŽXhÃ¶†æFÆW"Xh^˜:‚v—E&VG’zØžyÉþZéà¢òò66†VGVÆW"ZéîKè²ŽyKYî{ºÒGFV×E7F'E66†VGVÆW"˜	®‹ørGF6…66†VGVÆW$WfVçDÆ—7FVæW'0¢òò(i"6WE66†VGVÆW%&VG’Yh.XZRž8.‹ùžiÚKúîZHÒ6öÆB×7F'B&6S®K˜¾X˜Ò†æFÆW"YÊ€¢òòGFV×E7F'E66†VGVÆW"Xh^h˜ÞhÈ"Ç&VæFW&W"Ö÷VçBW6U66†VGVÆW2‰ÞYÊŽ˜*22zy.z©~Xú0¢òòXh^KÉ®h»þX‹$æò†æFÆW"&Vv—7FW&VB"™IžŠúþK‰Niz&WG'’(i"T’XÚjÛ¾8 ¢òòvWDÖ¶W"h;h
+~k:ŽXZS®K¸^8Ä’yIþh‰X˜Þ{Úîj8iú^ˆI®iÊÎ8Ö†æFÆW"yJ‚‡WF–Æ—G’ÖöFVÂXÙ^jÊyIþh‰’À¢òò–çfö¶Ri{nh˜ÞŠz>[É^yJƒ¶Ö¶W"iÊ®[{º®i{b†æFÆW"Xh^˜:ŽhªR”åDU$äÂˆÎ™Ùîk:ŽXhÎiÉþ[Jžk¨>8 ¢&Vv—7FW%66†VGVÆT†æFÆW'2‚‚’Óâ°¢G'’°¢&WGW&âvWDÖ¶W$6÷&R‚“°¢Ò6F6‚°¢&WGW&âçVÆÃ°¢Ð¢Ò“°¢òòÖ¶W#¦vöÃ¢¢†æFÆW"YÎj~hùX˜ÞKˆjÊh
+~k:ŽXhÂ†VvW"“¶†æFÆW"Xh^˜:‚vWDvöÄ6öçG&öÆÆW"‚¢òòXùnXÙ^Kè²Æ–çfö¶Ri{b6öçG&öÆÆW"[{.yKGFV×E7F'E66†VGVÆW"(i"7F'DvöÄ6öçG&öÆÆW"Y
+þXªŽ8 ¢&Vv—7FW$vöÄ†æFÆW'2‚“°¢òò6ÆV"Ö6öçFW‡Bkˆ^yºîjròGW&âiKn[â–FÆRXYÎ[©^{ºÞ‹y‡6WGFW"k:ŽXZRÆçVÆÂ×6fRž8 ¢6WDvöÄ6ÆV$ö'6W'fW"‚‡6–B’Óâ°¢fö–BvWDvöÄ6öçG&öÆÆW"‚“òæ6ÆV$vöÂ‡6–B“°¢Ò“°¢6WDvöÄ–FÆTö'6W'fW"‚‡6–B’Óâ°¢fö–BvWDvöÄ6öçG&öÆÆW"‚“òæÖ–&T6öçF–çVT7F—fTvöÂ‡6–B“°¢Ò“°¢6WDvöÄFVfW'&VE&W7VÖT6æ6VÄö'6W'fW"‚‡6–B’Óâ°¢vWDvöÄ6öçG&öÆÆW"‚“òæ6æ6VÄFVfW'&VDÖçVÅ&W7VÖR‡6–BÂ²&W7F÷&UW6vU&W7VÖS¢G'VRÒ“°¢Ò“°¢òòyJŽh‹r7F÷[Ù>X˜ÒGW&â(i"i¨.XÂ7F—fRyºîj~8.‹ùNY¹â&öÖ—6RŠê’$õ%Eõ4U54”ôâYÊ‚&÷'BX˜Òv—BÀ¢òòzîKùÞyºîj~XX‚W6VB²FWF6‚y¹Y
+ÂÆ&÷'B{¸ŽjÚ.K¨¾K»nKˆÞXhÞŠznXù{ºÞ‹yXŠNZé®8 ¢6WDvöÅ7F÷ö'6W'fW"‚‡6–B’ÓâvWDvöÄ6öçG&öÆÆW"‚“òçW6TvöÂ‡6–BÂwW6VC¢7F÷VB'’W6W"r’“°¢òò„÷F–öâ"žyJŽh‹~zÙNZèÂ6µW6W%VW7F–öâ(i"XÛ>i{nh¨®h˜˜žzÙNjŽiKžXižK‹®yºîjrŽK¸^šin‹Úî8K‰NiÊÎjÊzîK‹ ¢òò.yºîj~kèNkˆ^™zîš)‚.i{niKžXi“¶6öçG&öÆÆW"Xh^yJ‚VW7F–öç2y¨NzîZé®h
+~j~Šë²ZI®˜xÒwV&Bh¨®X[2ž8 ¢6WDvöÄ6´ç7vW$ö'6W'fW"‚‡6–BÂç7vW'2ÂVW7F–öç2’Óâ°¢òò&W7BÖVff÷'C®yºîj~iKžXižZK‹J^KˆÞ[©NXi.k:h‰Væ†æFÆVB&V¦V7F–öâŽKªNK©.Šz>ié™;î‹zþiŠòf—&RÖæBÖf÷&vWBž8 ¢fö–BvWDvöÄ6öçG&öÆÆW"‚¢òæÇ”6Æ&–f–6F–öäç7vW"‡6–BÂç7vW'2ÂVW7F–öç2¢æ6F6‚‚‚’Óâ·Ò“°¢Ò“°¢Ö¶W$—75&Vv—7FW&VBÒG'VS°¢v÷&·G&VU'VçF–ÖT6Æ÷6U&VG’ÒG'VS°¢òòFWf–6RÖÆ–æ²hÙ^ˆë~ˆz®j8iKîYÊŽ‹ùž˜xÂŽˆÎ™Ùâ&ö÷G7G&{«þh
+~jëR“¦Ö¶W#¦7&VFR×6W76–öâòÖ¶W#§6Væ@¢òòyKKˆ®™Ú.y¨B&Vv—7FW$Ö¶W$6÷&T—2k:ŽXhÂÎ[â7Æ6‚Yîy¨N[»n‹ùþk:ŽXhÃ¾ˆº^YÊŽ{«þh
+~jëR†–æ—DFWf–6TÆ–æµ6W'f–6P¢òòK˜¾Yâž[76W'BÎKÉ®Šúþhª^‹ùžKŠNKŠ¢6VçF–æVÎ8ÎiÊ®hÙ^ˆë~8Þ8.jÚNX‹¾h˜iÈ’6VçF–æVÂŽY
+¾{«þh
+~jë^[{.k:ŽXhÎy¨@¢òòÆö6ÂÖF#§6W76–öç3¦Æ—7Bž˜;Þ[{.[KØÒÎˆz®j8{¹>iéÎh˜ÞXxnzî8&–ç7FÆÄ–çfö¶T6GW&RYÊ‚–æFW‚çG2iÈizžiÉð¢òòF6‚K¨b—4Ö–âæ†æFÆRÎiX^izŠë®[»n‹ùþKˆîY
+bÎ‹ùžK©²†æFÆW"˜;Þ[{.Š*¾hÙ^ˆë~8 ¢76W'D6GW&T†VÇF‡’‚“°¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚u¶&ö÷G7G&ÖVÆV7G&öåÒf–ÆVBFò&Vv—7FW"Ö¶W#¢¢•2rÂW'"“°¢òòKˆÞ™‹¾ZîY
+þXª‚(	N(	Bˆ™;î‹zþK¸ÞXúþyJƒ²Kˆ¾jÊ7Æ6‚&WG'’XhÞ[	ÞŠù^8 ¢Ð ¢7F'E&VG•v÷&·G&VTÖ–çFVææ6R‚“°¢òòXŠ™šBv÷&·G&VRi{nYºh»þKˆÞX‹XZŽ[6fRæF—&V7F÷'’™HˆÎ‰Þy¹Žy¨Njè¾yYž‹zþ[èBÂY
+þXªŽiÉþŠ^kˆ^8 ¢fö–B&V6öæ6–ÆUVæF–æu6fTF—&V7F÷'”6ÆVçW2‚’æ6F6‚‚†W'"’Óâ°¢6öç6öÆRæW'&÷"€¢u¶&ö÷G7G&ÖVÆV7G&öåÒ6fRæF—&V7F÷'’6ÆVçW&V6öæ6–ÆRf–ÆVB†æöâÖfFÂ“¢rÀ¢W'"À¢“°¢Ò“°¢òòYÎz©~Xú>y¨B6†F÷r6fWö–çBZûž‹Jc¦÷væ–ær6W76–öâ[{.XŠ™šNy¨NZÚNXKþKùÞZÙŽx+ž™;à¢òò‡&Vg2ö6–æG’÷6fWö–çG2óÇ6–CâžY
+þXªŽiÉþŠ^XŠ8&f—&RÖæBÖf÷&vWBÎKˆÞ™‹¾ZîY
+þXªŽ8 ¢fö–B&V6öæ6–ÆU6fWö–çE&Vg4f÷$FVÆWFVE6W76–öç2‚’æ6F6‚‚†W'"’Óâ°¢6öç6öÆRæW'&÷"‚u¶&ö÷G7G&ÖVÆV7G&öåÒ6fWö–çB&V6öæ6–ÆRf–ÆVB†æöâÖfFÂ“¢rÂW'"“°¢Ò“° ¢òò66†VGVÆW"òvöÂòÆV&â{¹þKˆyKÆö6ÄF"öå&VG’YÊ‚&÷f–FW"&VF–æW726WGFÆRYîY
+þXªŽ8 ¢òòD"Kˆâ7Æ6‚izŠë®‹XXŽZèÎh‰ûÈÎKˆ®ik’6öæf–wW&VBKúXû~˜;ÞKÉ®Šz>[ÈYÎKˆiÚYîXû™;îûÉ°¢òò‹ùž˜xÎKˆÞXhÞy»NY
+þûÈÎ˜þXXÒ66†VGVÆW"YÊŽ‹JnXû~jŠYè¾XùxëZèÎh‰X˜Þhª.XXŽ˜ž‹zþyK8 ¢Ó° ¢òòVçf—&öæÖVçB6†V6²•2†æFÆW"(	Bš®[¨þj8iúR6ÆVFR(i"6öFW‚(i"’KˆžKŠ¢fVæF÷"&–æ'ž8 ¢òòhùX˜ÒVV´æVVG4F÷væÆöBXk>Zé¢‡‚÷’’j~zÛîûÉ®KŠNKŠ®Xø®Kº^Kˆ®™ÈŠhKˆ¾‹ÛÞi{n{¹’7FW÷F÷FÅ7FW>ûÈÀ¢òòY
+nX‰žKˆÞ[Šnj~zÛîûÈ‡7Æ6‚i‹îzK®XÙ^Kˆ.YJN˜i"6–æG’KŠÒâââ"ih~jŽûÈž8 ¢òò’iŠþXúþ˜žZéîš¨ÂvVçC®kˆ^XÙ^iz‹XNKªròKˆ¾‹ÛÞZK‹J^˜;ÞKˆÞzé~xêþZ(>j8iú^ZK‹JRŽZK‹J^KˆÞ[›þi*Ð¢òòf–ÆVB–ÆöB’ÎiÊÎjÊKˆÞk:ŽXhÂž8 ¢—4Ö–âæ†æFÆR‚v6†V6²ÖVçf—&öæÖVçBrÂ7–æ2‚’Óâ°¢òò7Æ6‚šinKŠ¢–çfö¶RÒ&VæFW&W"ZÙŽkK¾y¨N[Ë®KúXûrŽKˆâ&VæFW&W#¦ÆörXøÎKùÞ™š’ž8 ¢&VæFW&W$&ö÷DwV&CòæÖ&´Æ—fR‚“°¢6öç7BÆFf÷&ÒÒ&ö6W72çÆFf÷&Ò2vF'v–ârÂwv–ã3"rÂvÆ–çW‚s°¢òò6¶vVBÆ–çW‚Ö’–ç7FÆÂ&÷F‚4Ä—2GW&–æröæR7F'GW6†V6²â6†&R¢òò6–ævÆRFVFÆ–æR6ò6WVVçF–ÂfÆÆ&6²–ç7FÆÇ26ææ÷BV6‚6öç7VÖRF†P¢òògVÆÂF–ÖV÷WBà¢6öç7BÆ–çW„–ç7FÆÅ6–væÂÐ¢ÆFf÷&ÒÓÓÒvÆ–çW‚rbbæ—56¶vV@¢ò&÷'E6–væÂçF–ÖV÷WB„Ä”åU…ôtTåEô”å5DÄÅõ5D%EUôDTDÄ”äUôÕ2¢¢VæFVf–æVC° ¢òò)H)H†6R¢VV²YBfVæF÷"iŠþY
+n™ÈŠhKˆ¾‹ÛÞûÈŽXk>Zé¢‡‚÷’’j~zÛîûÈž)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢6öç7BæVVG•7FW3¢vVçD&–æ'”¶–æEµÒÒµÓ°¢f÷"†6öç7B¶–æBöb²v6ÆVFRÖ6öFRrÂv6öFW‚rÂw’uÒ26öç7B’°¢G'’°¢–b†v—B&–æ'•VV´æVVG4F÷væÆöB†¶–æB’’æVVG•7FW2çW6‚†¶–æB“°¢Ò6F6‚°¢ò¢KùÞZèƒ¢VV²ZK‹J^hÈ’fÇ6RZHNynûÈÎ‹ù¾XZR&W&RXh^˜:Ž™IžŠúþkXzˆ²¢ð¢Ð¢Ð¢6öç7B—4×VÇF”F÷væÆöBÒæVVG•7FW2æÆVæwF‚ãÒ#°¢6öç7BF÷FÅ7FW2ÒÖF‚æÖ–â†æVVG•7FW2æÆVæwF‚Â2’2"Â3°¢6öç7B7FW÷G4f÷"Ò†¶–æC¢vVçD&–æ'”¶–æB“¢²7FWó¢Â"Â3²F÷FÅ7FW3ó¢"Â2ÒÓà¢—4×VÇF”F÷væÆöBbbæVVG•7FW2æ–æ6ÇVFW2†¶–æB¢ò²7FW¢†æVVG•7FW2æ–æFW„öb†¶–æB’²’2Â"Â2ÂF÷FÅ7FW2Ð¢¢·Ó°¢òòKˆ®Kˆjë^yÉþy¨NXùyIþ‹ø~Kˆ¾‹ÛÞ8K‰N[Ù>X˜Þjë^K™þŠhKˆ¾‹ÛÞi{bÎXXŽ[›þi*Ò&W6WB–ÆöBŠê’7Æ6€¢òò‹ù¾[ªniÚyêÎ™{N[Ù.™»bŽKˆÞ‹[G&ç6—F–öâXªŽyK²’Î™¨þYî[Ù>X˜Þjë^K¸âR[ÈZx¾jÚ>[‹Ž{JþXª8 ¢6öç7B&W6WD&Vf÷&U6VvÖVçBÒ†¶–æC¢vVçD&–æ'”¶–æBÂç•&Wf–÷W4F÷væÆöFVC¢&ööÆVâ“¢fö–BÓâ°¢6öç7B7FW÷G2Ò7FW÷G4f÷"†¶–æB“°¢–b†ç•&Wf–÷W4F÷væÆöFVBbb7FW÷G2ç7FWbb7FW÷G2çF÷FÅ7FW2’°¢&–æ'”'&öF67E&W6WDf÷%7FW†¶–æBÂ7FW÷G2ç7FWÂ7FW÷G2çF÷FÅ7FW2“°¢Ð¢Ó° ¢òò)H)H†6R¢6ÆVFRjëR)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢ÆWB6ÆVFU&W3¢&W&U&W7VÇC°¢G'’°¢6ÆVFU&W2Òv—B&–æ'•&W&R‚v6ÆVFRÖ6öFRrÂ°¢ââç7FW÷G4f÷"‚v6ÆVFRÖ6öFRr’À¢6–væÃ¢Æ–çW„–ç7FÆÅ6–væÂÀ¢Ò“°¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢6öç7BÖW76vRÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢&WGW&â°¢6ÆVFT6öFS¢²7FGW3¢vf–ÆVBr26öç7BÂW'&÷#¢ÖW76vRÒÀ¢6öFWƒ¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢“¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢ÆÅ76VC¢fÇ6RÀ¢ÆFf÷&ÒÀ¢Ó°¢Ð ¢–b‚6ÆVFU&W2ç&VG’ÇÂ6ÆVFU&W2çF‚’°¢&WGW&â°¢6ÆVFT6öFS¢°¢7FGW3¢vf–ÆVBr26öç7BÀ¢W'&÷#¢6ÆVFU&W2æW'&÷"óòt6ÆVFR6öFR&–æ'’æ÷Bf–Æ&ÆRrÀ¢ÒÀ¢6öFWƒ¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢“¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢ÆÅ76VC¢fÇ6RÀ¢ÆFf÷&ÒÀ¢Ó°¢Ð ¢òò6WD6ÆVFT6öFUF‚[{.˜[Û’(	N(	BvVçBÖ&–æ&–W2ç&W&R‚’h‰X©þi{n[{.Xi’Æ7E&VG•F‚66†S°¢òòK»¾KÙ^™ÈŠh6ÆVFR&–æ'’‹zþ[èNy¨NYËikžKˆ[è¾‹[vWE&VG”&–æ'•F‚‚v6ÆVFRÖ6öFRrž8  ¢òò)H)H†6R#¢6öFW‚jëR)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢&W6WD&Vf÷&U6VvÖVçB‚v6öFW‚rÂ6ÆVFU&W2æF÷væÆöFVBÓÓÒG'VR“° ¢ÆWB6öFW…&W3¢&W&U&W7VÇC°¢G'’°¢6öFW…&W2Òv—B&–æ'•&W&R‚v6öFW‚rÂ°¢ââç7FW÷G4f÷"‚v6öFW‚r’À¢6–væÃ¢Æ–çW„–ç7FÆÅ6–væÂÀ¢Ò“°¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢6öç7BÖW76vRÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢&WGW&â°¢6ÆVFT6öFS¢²7FGW3¢w76VBr26öç7BÂFƒ¢6ÆVFU&W2çF‚ÒÀ¢6öFWƒ¢²7FGW3¢vf–ÆVBr26öç7BÂW'&÷#¢ÖW76vRÒÀ¢“¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢ÆÅ76VC¢fÇ6RÀ¢ÆFf÷&ÒÀ¢Ó°¢Ð ¢–b‚6öFW…&W2ç&VG’ÇÂ6öFW…&W2çF‚’°¢&WGW&â°¢6ÆVFT6öFS¢²7FGW3¢w76VBr26öç7BÂFƒ¢6ÆVFU&W2çF‚ÒÀ¢6öFWƒ¢²7FGW3¢vf–ÆVBr26öç7BÂW'&÷#¢6öFW…&W2æW'&÷"óòt6öFW‚&–æ'’æ÷Bf–Æ&ÆRrÒÀ¢“¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢ÆÅ76VC¢fÇ6RÀ¢ÆFf÷&ÒÀ¢Ó°¢Ð ¢òò)H)H†6R"ãS¢'VæFÆVB&—w&WŽ[ø^™ÈÆ6öFW‚7vâVçbKˆâf–ÆRÖ'&÷w6W"i	Î{J.y¨@¢òòzÎKéÞ‹Ybž)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢òòhê.kX¾[{.h;h
+~XÉb†–×÷'BKˆÞXhÞŠznXùÆ—77VR3“Sb’ÎY
+þXªŽiÉòf–ÂÖf7B‰ÞYÊ‚7Æ6€¢òò‹ùž˜xÃ®{Ë®ZKi{nKˆâ6ÆVFRö6öFW‚&–æ'’{Ë®ZKYÎKˆKÙ>š¨Â‡7Æ6‚f–ÆVB²Xúþ˜xÞŠùRÀ¢òòFWbŠ^‹yçÒ–ç7FÆÃ§&—w&WYî˜xÞŠù^XÛ>‹ør’ÎˆÎKˆÞiŠò–×÷'BiÉþzÎ[Jž8K™þKˆÞiŠð¢òòÖ¶W#¢¢•2™Ùž›¹ŽKˆÞk:ŽXhÎy¨N™˜Þ{ª~Y
+þXªŽ8&ÖVÖö—¦RYîjÚNZHNhê.kX¾‹ù™»nh‰iÊÎ8 ¢G'’°¢Vç7W&T'VæFÆVE&—w&W&VG’‚“°¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢6öç7BÖW76vRÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢òò7Æ6‚ZK‹J^hT’KˆÞk‹.iù2W'&÷"ZÙ~jëRÎ‹ùžŠÎiz^[ù~iŠþ{Ë¢&ri{nYJþKˆy¨NŠø®ijÞX{®Xú0¢òòŽŠ^Š8^hÈ~[É^YÊ‚ÖW76vR˜xÂ“¾KˆîKˆ¾ik’’ZK‹J^y¨B6öç6öÆRçv&âYÎKˆiz.iÈžh:þKè¾8 ¢6öç6öÆRæW'&÷"‚u¶&ö÷G7G&ÖVÆV7G&öåÒ'VæFÆVB&—w&W6†V6²f–ÆVC¢rÂÖW76vR“°¢&WGW&â°¢6ÆVFT6öFS¢²7FGW3¢w76VBr26öç7BÂFƒ¢6ÆVFU&W2çF‚ÒÀ¢6öFWƒ¢²7FGW3¢w76VBr26öç7BÂFƒ¢6öFW…&W2çF‚ÒÀ¢“¢²7FGW3¢w6¶—VBr26öç7BÒÀ¢&—w&W¢²7FGW3¢vf–ÆVBr26öç7BÂW'&÷#¢ÖW76vRÒÀ¢ÆÅ76VC¢fÇ6RÀ¢ÆFf÷&ÒÀ¢Ó°¢Ð ¢òò)H)H†6R3¢’jë^ûÈŽXúþ˜’ÎZK‹J^KˆÞ™‹¾ZîY
+þXªŽûÈž)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢òò'&öF67Df–ÇW&S¢fÇ6R(	N(	B’Kˆ¾‹ÛÞZK‹J^KˆÞˆ;Þh¨¢7Æ6‚h™>‹ù¾ZK‹J^h¾™Ùž›¹ŽzhyJ€¢òòiÊÎjÊ’k:ŽXhÎûÈÄ6ÆVFR6öFRò6öFW‚Kˆâ6–æG’iÊÎ‹ª¾K¸ÞxZ~[‹ŽXúþyJŽ8 ¢òòXú®K¸â’™‹një^[ÈZx¾Šêi{nûÈÎKˆÞˆ;ÞŠêžX˜Þ™Ú.y¨N[ø^™È&–æ'’Kˆ¾‹ÛÞY>hè’’ˆz®[{y¨Nš(Nzé~8 ¢6öç7B”–ç7FÆÅ6–væÂÒæ—56¶vV@¢ò&÷'E6–væÂçF–ÖV÷WB…•ôtTåEô”å5DÄÅõ5D%EUôDTDÄ”äUôÕ2¢¢VæFVf–æVC°¢&W6WD&Vf÷&U6VvÖVçB‚w’rÂ6ÆVFU&W2æF÷væÆöFVBÓÓÒG'VRÇÂ6öFW…&W2æF÷væÆöFVBÓÓÒG'VR“° ¢ÆWB”–æfó¢²7FGW3¢w76VBrÂvf–ÆVBs²Fƒó¢7G&–æs²W'&÷#ó¢7G&–ærÓ°¢G'’°¢6öç7B•&W2Òv—B&–æ'•&W&R‚w’rÂ°¢ââç7FW÷G4f÷"‚w’r’À¢'&öF67Df–ÇW&S¢fÇ6RÀ¢6–væÃ¢”–ç7FÆÅ6–væÂÀ¢Ò“°¢”–æfòÐ¢•&W2ç&VG’bb•&W2çF€¢ò²7FGW3¢w76VBr26öç7BÂFƒ¢•&W2çF‚Ð¢¢²7FGW3¢vf–ÆVBr26öç7BÂW'&÷#¢•&W2æW'&÷"óòw’&–æ'’æ÷Bf–Æ&ÆRrÓ°¢Ò6F6‚†W'#¢Væ¶æ÷vâ’°¢”–æfòÒ°¢7FGW3¢vf–ÆVBr26öç7BÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ó°¢Ð¢–b‡”–æfòç7FGW2ÓÓÒvf–ÆVBr’°¢•'VçF–ÖU&V6÷fW'’æÖ&µVæf–Æ&ÆR‡”–æfòæW'&÷"“°¢6öç6öÆRçv&â€¢¶&ö÷G7G&ÖVÆV7G&öåÒ’&–æ'’&W&Rf–ÆVB†æöâÖfFÂÂ&V6÷fW'’66†VGVÆVB“¢G·”–æfòæW'&÷'ÖÀ¢“°¢Ð ¢òò[ø^Š8R&–æ'’˜;Ò&VG’ÎxëYÊŽh˜Þˆ;ÞZèžXZŽièN˜
+Ö¶W"XÙ^Kè¾[›nhÈ"Ö¶W#¢¢òy»ŽX[2•>8 ¢v—B&Vv—7FW$Ö¶W$—74gFW%7Æ6‚‚“° ¢&WGW&â°¢6ÆVFT6öFS¢²7FGW3¢w76VBr26öç7BÂFƒ¢6ÆVFU&W2çF‚ÒÀ¢6öFWƒ¢²7FGW3¢w76VBr26öç7BÂFƒ¢6öFW…&W2çF‚ÒÀ¢“¢”–æfòÀ¢&—w&W¢²7FGW3¢w76VBr26öç7BÒÀ¢ÆÅ76VC¢G'VRÀ¢ÆFf÷&ÒÀ¢Ó°¢Ò“° ¢òò6öFW‚XX2•2†WF‚ö&–æ'’÷W6vR’[{.XØ~{ª~X‹Ö¶W#¢¢YÞYÞz›®™{BÂŠúnŠx¢òòÖ¶W"Ö—2öWF‚çG2ò7FGW2çG2òW6vRçG2Âk:ŽXhÎK¨â&Vv—7FW$Ö¶W$—74gFW%7Æ6‚Xh^8  ¢6öç7BÆÆ÷vVE7—7FVÕ6WGF–æw5W&Ç2ÒæWr6WB…°¢w‚ÖÆRç7—7FV×&VfW&Væ6W3¦6öÒæÆRç&VfW&Væ6Rç6V7W&—G“õ&—f7•ô66W76–&–Æ—G’rÀ¢w‚ÖÆRç7—7FV×&VfW&Væ6W3¦6öÒæÆRç&VfW&Væ6Rç6V7W&—G“õ&—f7•õ67&VVä6GW&RrÀ¢w‚ÖÆRç7—7FV×&VfW&Væ6W3¦6öÒæÆRç&VfW&Væ6Rç6V7W&—G“õ&—f7•ôÆÄf–ÆW2rÀ¢Ò“° ¢òò÷VâW‡FW&æÂU$Â–â7—7FVÒFVfVÇB'&÷w6W"ÂÇW26ÖÆÂÆÆ÷vÆ—7Bö`¢òòÖ4õ2&—f7’æW2F†B6WGF–æw2W6W2f÷"W&Ö—76–öâöæ&ö&F–ærà¢—4Ö–âæ†æFÆR€¢w6†VÆÃ¦÷VâÖW‡FW&æÂrÀ¢7–æ2†WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂW&Ã¢7G&–ær“¢&öÖ—6SÇ²7V66W73¢&ööÆVâÓâÓâ°¢G'’°¢6öç7B'6VBÒæWrU$Â‡W&Â“°¢6öç7B—5vV%W&ÂÒ'6VBç&÷Fö6öÂÓÓÒv‡GG¢rÇÂ'6VBç&÷Fö6öÂÓÓÒv‡GG3¢s°¢òòÖ–ÂÆ–æ·2&R&W7G&–7FVBFòF†Rf—†VB&–ÆÆ–ær–æ&÷‚â&VæFW&W"6öçFVçBÖ¢òò&÷f–FRF†RÆö6Æ—¦VB7V&¦V7Bö&öG’Â'WB—B×W7Bæ÷B6†ö÷6R&V6—–VçB÷ ¢òòW6RÖ–ÇFò2vVæW&Â×W'÷6RW‡FW&æÂ66†VÖRà¢6öç7B—4&–ÆÆ–ætÖ–ÇFòÒ—4ÆÆ÷vVD&–ÆÆ–ætÖ–ÇFõ&WVW7B€¢W&ÂÀ¢—5G'W7FVD&VæFW&W$WfVçB†WfVçB’À¢“°¢6öç7B—4ÆÆ÷vVE7—7FVÕ6WGF–æw5W&ÂÐ¢&ö6W72çÆFf÷&ÒÓÓÒvF'v–ârbbÆÆ÷vVE7—7FVÕ6WGF–æw5W&Ç2æ†2‡W&Â“°¢–b‚—5vV%W&Âbb—4&–ÆÆ–ætÖ–ÇFòbb—4ÆÆ÷vVE7—7FVÕ6WGF–æw5W&Â’°¢&WGW&â²7V66W73¢fÇ6RÓ°¢Ð¢v—B6†VÆÂæ÷VäW‡FW&æÂ‡W&Â“°¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚°¢&WGW&â²7V66W73¢fÇ6RÓ°¢Ð¢ÒÀ¢“° ¢òò6†DuBFW6·F÷[Ù>X˜Þk:ŽXhÂ6öFWƒ¦XØþŠêîûÈ†Ö4õ2'VæFÆR–B6öÒæ÷Væ’æ6öFWŽûÉ°¢òòv–æF÷w2ZèžŠ8^XÈ^K™þyK{;¾{¹þXØþŠêîk:ŽXhÎŠŽhê^zêûÈž8.xºÎz¸¾izXø"•2KùÞhÈiÈ[þiØ>™™ûÈÎKˆÞˆ;ÞX	þjÚ@¢òòh™>[È&VæFW&W"hùKé¾y¨NK»¾hHþˆz®Zé®K˜’66†VÖRòFVWÆ–æ¾8 ¢—4Ö–âæ†æFÆR‚w6†VÆÃ¦÷VâÖ6†FwBÖrÂ7–æ2†WfVçB“¢&öÖ—6SÇ²7V66W73¢&ööÆVâÓâÓà¢†æFÆT÷Vä6†DuD†WfVçBÂ°¢76W'EG'W7FVE6VæFW#¢†6æF–FFR’Óâ°¢òòF†R66†VBvÆö&Â÷fW&Æ’—2G'W7FVB6–æG’&VæFW&W"'WBFVÆ–&W&FVÇ¢òòæ÷BÖ6öçFVçC¢—BæVVG2F†—2f—†VBÂæòÖ&wVÖVçB6&–Æ—G’Fò¶VW ¢òòWF‚&V6÷fW'’f—6–&ÆRv—F†÷WB7F—fF–ærF†RÖ–âv–æF÷rà¢6öç7B÷fW&Æ•v–æF÷rÒ'&÷w6W%v–æF÷ræg&öÕvV$6öçFVçG2†6æF–FFRç6VæFW"“°¢–b€¢—4vÆö&Åfö–6T–çWD÷fW&Æ•6VæFW"†6æF–FFRç6VæFW"’b`¢6æF–FFRç6VæFW$g&ÖRÓÓÒ6æF–FFRç6VæFW"æÖ–äg&ÖRb`¢—5G'W7FVD6–æG•&VæFW&W%v–æF÷r†÷fW&Æ•v–æF÷r¢¢&WGW&ã°¢76W'EG'W7FVD&VæFW&W$WfVçB†6æF–FFR“°¢ÒÀ¢÷VäW‡FW&æÃ¢‡W&Â’Óâ6†VÆÂæ÷VäW‡FW&æÂ‡W&Â’À¢Ò’À¢“° ¢òò6†÷ræF—fRF—&V7F÷'’–6¶W"F–Æöp¢—4Ö–âæ†æFÆR€¢w6†÷rÖ÷VâÖF—&V7F÷'’ÖF–ÆörrÀ¢7–æ2‚“¢&öÖ—6SÇ²6æ6VÆVC¢&ööÆVã²Fƒó¢7G&–ærÓâÓâ°¢6öç7BF&vWEv–âÒvWEv–æF÷r‚’óò'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚“°¢–b‚F&vWEv–â’&WGW&â²6æ6VÆVC¢G'VRÓ°¢6öç7B&W7VÇBÒv—BF–Æörç6†÷t÷VäF–Æör‡F&vWEv–âÂ°¢&÷W'F–W3¢²v÷VäF—&V7F÷'’rÂv7&VFTF—&V7F÷'’uÒÀ¢Ò“°¢–b‡&W7VÇBæ6æ6VÆVBÇÂ&W7VÇBæf–ÆUF‡2æÆVæwF‚ÓÓÒ’°¢&WGW&â²6æ6VÆVC¢G'VRÓ°¢Ð¢&WGW&â²6æ6VÆVC¢fÇ6RÂFƒ¢&W7VÇBæf–ÆUF‡5³ÒÓ°¢ÒÀ¢“° ¢òò)H)Hv÷&·76R66ææ–ærf÷"ÖVçF–öâæVÂ†6öÖÖæB×ÆWGFRc"òcR’)H)H ¢òð¢òò66ç2F†Rv—fVâv÷&¶–ætF—"f÷"6æF–FFRÖÖVçF–öâ—FV×3 ¢òòÒæ6ÆVFRövVçG2ò¢æÖF(i"vVçB—FV×2†æÖRÒf–ÆVæÖRv—F†÷WBæÖB¢òòÒ&VwVÆ"f–ÆW2bF—&V7F÷&–W2‡&W7V7G26öÖÖöâ–væ÷&VBF—'2¢òð¢òò&WGW&ç2WFò6—FV×2F÷FÂ†vVçG2²f–ÆW2²F—'26öÖ&–æVB’âv†Và¢òòG'Væ6FVBÂF†R6ÆÆW"6†÷VÆB†–çBF†RW6W"Fòæ'&÷rF†RVW'’à¢òð¢òòF†—2'Vç2öâF†RÖ–â&ö6W72&V6W6RæöFRg2—2F†RöæÇ’&V6öæ&ÆRv¢òòFòvÆ²F†RG&VS²&VæFW&W"6ææ÷BFò—BF‡&÷Vv‚6öçFW‡D'&–FvR6fVÇ’à¢òð¢òòW&f÷&Öæ6S¢$e2v—F‚†&B6†FVfVÇB#’æB–væ÷&RÆ—7Bâöâ¢òòÖVF—VÒ&WòF†—26ö×ÆWFW2–âÃS×2‡7V2F&vWB’à¢—4Ö–âæ†æFÆR€¢wv÷&·76S§66âÖB×&W6÷W&6W2rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²v÷&¶–ætF—#¢7G&–æs²6ó¢çVÖ&W"ÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢&ööÆVã°¢W'&÷#ó¢7G&–æs°¢—FV×3ó¢'&“À¢Â²G—S¢vf–ÆRs²æÖS¢7G&–æs²&VÅFƒ¢7G&–ærÐ¢Â²G—S¢vF—"s²æÖS¢7G&–æs²&VÅFƒ¢7G&–ærÐ¢Â²G—S¢vvVçBs²æÖS¢7G&–æs²&VÅFƒ¢7G&–ærÐ¢ã°¢G'Væ6FVCó¢&ööÆVã°¢ÓâÓâ°¢G'’°¢òò6Æ×6ÆÆW"×7WÆ–VB6FòF†R7V2w2#6V–Æ–ær(	BWfVâ¢òòvVÆÂÖÖVæ–ær6ÆÆW"6†÷VÆFâwB&R&ÆRFòf÷&6RW2–çFò66à¢òòF†B–ç2F†RWfVçBÆö÷öâ‡VvRÖöæ÷&Wò‡&Wf–WrÖ–æ÷"3r’à¢6öç7B6ÒÖF‚æÖ–â‡&×2æ6óò#Â#“°¢6öç7B&ö÷BÒ&×2çv÷&¶–ætF—#°¢–b‚&ö÷BÇÂF‚æ—4'6öÇWFR‡&ö÷B’ÇÂg2æW†—7G57–æ2‡&ö÷B’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢wv÷&¶–ætF—"æ÷Bf÷VæBrÓ°¢Ð ¢òòÖ–æ–ÖÂ–væ÷&RÆ—7B(	BFöâwBGFV×BgVÆÂæv—F–væ÷&R'6–ær†÷WBö`¢òòÕe66÷RW"7V2’âF†W6R&RF†RF—'2F†Bv÷VÆB&Æ÷rW66âà¢6öç7B”täõ$UôD•%2ÒæWr6WB…°¢ræv—BrÀ¢væöFUöÖöGVÆW2rÀ¢uõ÷–66†UõòrÀ¢ræ66†RrÀ¢rçg66öFRrÀ¢ræ–FVrÀ¢ræVçbrÀ¢v6÷fW&vRrÀ¢rç6—f’rÀ¢ræ7W'6÷"rÀ¢v'V–ÆBrÀ¢vF—7BrÀ¢v÷WBrÀ¢rææW‡BrÀ¢rçGW&&òrÀ¢rçf—FRrÀ¢Ò“° ¢6öç7B—FV×3¢'&“À¢Â²G—S¢vf–ÆRs²æÖS¢7G&–æs²&VÅFƒ¢7G&–æs²FW67&—F–öãó¢7G&–ærÐ¢Â²G—S¢vF—"s²æÖS¢7G&–æs²&VÅFƒ¢7G&–æs²FW67&—F–öãó¢7G&–ærÐ¢Â²G—S¢vvVçBs²æÖS¢7G&–æs²&VÅFƒ¢7G&–æs²FW67&—F–öãó¢7G&–ærÐ¢âÒµÓ°¢ÆWBG'Væ6FVBÒfÇ6S° ¢òò’66âæ6ÆVFRövVçG2ò¢æÖB(	B6–ÆVçFÇ’6¶—–bÖ—76–æp¢G'’°¢6öç7BvVçG4F—"ÒF‚æ¦ö–â‡&ö÷BÂræ6ÆVFRrÂvvVçG2r“°¢–b†g2æW†—7G57–æ2†vVçG4F—"’bbg2ç7FE7–æ2†vVçG4F—"’æ—4F—&V7F÷'’‚’’°¢6öç7BVçG&–W2Òg2ç&VFF—%7–æ2†vVçG4F—"Â²v—F„f–ÆUG—W3¢G'VRÒ“°¢f÷"†6öç7BVçBöbVçG&–W2’°¢–b†VçBæ—4f–ÆR‚’bbVçBææÖRæVæG5v—F‚‚ræÖBr’’°¢6öç7BæÖRÒVçBææÖRç&WÆ6R‚õÂæÖBBòÂrr“°¢òòW‡G&7BFW67&—F–öâg&öÒ”ÔÂg&öçFÖGFW"f–w&’ÖÖGFW"(	@¢òò†æFÆW2×VÇF’ÖÆ–æRòV÷FVBòW66VB”ÔÂ6÷'&V7FÇ’‡F†P¢òòV&Æ–W"†æB×&öÆÆVB&VvW‚öæÇ’ÖF6†VB6–ævÆRÖÆ–æR7G&–æw0¢òòæBG&÷VBç’FW67&—F–öã¢ÅÆâ×VÇF’Æ–æV6öçFVçB’à¢ÆWBFW67&—F–öã¢7G&–ærÂVæFVf–æVC°¢G'’°¢6öç7B&rÒg2ç&VDf–ÆU7–æ2‡F‚æ¦ö–â†vVçG4F—"ÂVçBææÖR’ÂwWFbÓ‚r“°¢6öç7B'6VBÒÖGFW"‡&r“°¢6öç7BFW62Ò'6VBæFFòæFW67&—F–öã°¢–b‡G—VöbFW62ÓÓÒw7G&–ærrbbFW62çG&–Ò‚’’°¢FW67&—F–öâÒFW62çG&–Ò‚’ç6Æ–6RƒÂ#“°¢Ð¢Ò6F6‚°¢ò¢æöâÖfFÂ¢ð¢Ð¢—FV×2çW6‚‡°¢G—S¢vvVçBrÀ¢æÖRÀ¢&VÅFƒ¢F‚ç÷6—‚æ¦ö–â‚ræ6ÆVFRrÂvvVçG2rÂVçBææÖR’À¢FW67&—F–öâÀ¢Ò“°¢–b†—FV×2æÆVæwF‚ãÒ6’°¢G'Væ6FVBÒG'VS°¢&WGW&â²7V66W73¢G'VRÂ—FV×2ÂG'Væ6FVBÓ°¢Ð¢Ð¢Ð¢Ð¢Ò6F6‚†W'"’°¢òòæöâÖfFÂ(	BvVçG2&R&öçW26÷W&6P¢6öç6öÆRçv&â‚u·v÷&·76R×66åÒvVçG266âf–ÆVC¢rÂW'"“°¢Ð ¢òò"’$e2vÆ²öbv÷&¶–ætF—"(	BF—'2F†Vâf–ÆW2Â'&VGF‚Öf—'7B6òF†P¢òò6ÆÆW"6VW2F÷ÖÆWfVÂ—FV×2f—'7BæBG'Væ6F–öâ†–bç’’7WG2öf`¢òòF†RFVWW7Bæö—6RÂæ÷BF†RÖ÷7BW6VgVÂ&W7VÇG2à¢6öç7BVWVS¢7G&–æuµÒÒ·&ö÷EÓ°¢v†–ÆR‡VWVRæÆVæwF‚âbb—FV×2æÆVæwF‚Â6’°¢6öç7B7W"ÒVWVRç6†–gB‚“°¢–b‚7W"’'&V³°¢ÆWBVçG&–W3¢g2äF—&VçEµÓ°¢G'’°¢VçG&–W2Òg2ç&VFF—%7–æ2†7W"Â²v—F„f–ÆUG—W3¢G'VRÒ“°¢Ò6F6‚°¢6öçF–çVS°¢Ð¢òò6÷'BÇ†&WF–6ÆÇ’f÷"FWFW&Ö–æ—7F–2G'Væ6F–öà¢VçG&–W2ç6÷'B‚†Â"’ÓâææÖRæÆö6ÆT6ö×&R†"ææÖR’“°¢f÷"†6öç7BVçBöbVçG&–W2’°¢–b†—FV×2æÆVæwF‚ãÒ6’°¢G'Væ6FVBÒG'VS°¢'&V³°¢Ð¢–b†VçBææÖRç7F'G5v—F‚‚râr’bbVçBææÖRÓÒræ6ÆVFRr’°¢òò6¶—Ö÷7BF÷Ff–ÆW2öF÷FF—'2W†6WBæ6ÆVFR†vVçG2†æFÆVB&÷fR¢6öçF–çVS°¢Ð¢–b†VçBæ—4F—&V7F÷'’‚’’°¢–b„”täõ$UôD•%2æ†2†VçBææÖR’’6öçF–çVS°¢6öç7B'2ÒF‚æ¦ö–â†7W"ÂVçBææÖR“°¢6öç7B&VÂÒF‚ç&VÆF—fR‡&ö÷BÂ'2’ç7Æ—B‡F‚ç6W’æ¦ö–â‚ròr“°¢òòæ6ÆVFRövVçG6—2†æFÆVB'’7FW2G—S¢vvVçBv(	@¢òò6¶—F†R7V'G&VR†W&R6òvRFöâwBF÷V&ÆR×&W÷'BF†R6ÖP¢òò¢æÖBf–ÆW22G—S¢vf–ÆRvVçG&–W2‡&Wf–Wr–×÷'FçB32’à¢–b‡&VÂÓÓÒræ6ÆVFRövVçG2r’6öçF–çVS°¢—FV×2çW6‚‡²G—S¢vF—"rÂæÖS¢VçBææÖRÂ&VÅFƒ¢&VÂÒ“°¢VWVRçW6‚†'2“°¢ÒVÇ6R–b†VçBæ—4f–ÆR‚’’°¢6öç7B'2ÒF‚æ¦ö–â†7W"ÂVçBææÖR“°¢6öç7B&VÂÒF‚ç&VÆF—fR‡&ö÷BÂ'2’ç7Æ—B‡F‚ç6W’æ¦ö–â‚ròr“°¢—FV×2çW6‚‡²G—S¢vf–ÆRrÂæÖS¢VçBææÖRÂ&VÅFƒ¢&VÂÒ“°¢Ð¢Ð¢Ð¢–b†—FV×2æÆVæwF‚ãÒ6bbVWVRæÆVæwF‚â’G'Væ6FVBÒG'VS° ¢&WGW&â²7V66W73¢G'VRÂ—FV×2ÂG'Væ6FVBÓ°¢Ò6F6‚†W'"’°¢6öç7BÖW76vRÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢6öç6öÆRæW'&÷"‚u·v÷&·76S§66âÖB×&W6÷W&6W5Òf–ÆVC¢rÂW'"“°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢ÖW76vRÓ°¢Ð¢ÒÀ¢“° ¢òò66ç2·v÷&¶–ætF—'Òòæ6ÆVFRö6öÖÖæG2ò¢æÖFæBæ6ÆVFR÷6¶–ÆÇ2ò¢æÖFf÷ ¢òòW6W"ÖFVf–æVB6Æ6‚6öÖÖæG2ò6¶–ÆÇ2†6öÖÖæB×ÆWGFRc’à¢òò&WGW&ç2µÒ–bF—'2FöâwBW†—7Bâæò&V7W'6–öâà¢—4Ö–âæ†æFÆR€¢wv÷&·76S§66â×6Æ6‚Ö6öÖÖæG2rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²v÷&¶–ætF—#¢7G&–ærÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢&ööÆVã°¢W'&÷#ó¢7G&–æs°¢6öÖÖæG3ó¢'&“Ç²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6Só¢wW6W"rÂw6¶–ÆÂrÓã°¢ÓâÓâ°¢G'’°¢6öç7B&ö÷BÒ&×2çv÷&¶–ætF—#°¢–b‚&ö÷BÇÂF‚æ—4'6öÇWFR‡&ö÷B’ÇÂg2æW†—7G57–æ2‡&ö÷B’’°¢&WGW&â²7V66W73¢G'VRÂ6öÖÖæG3¢µÒÓ°¢Ð ¢ò¢ ¢¢'6R”ÔÂg&öçFÖGFW"FW67&—F–öæg&öÒæÖBf–ÆRw2&r6öçFVçBà¢¢W6W2§2×–ÖÂf÷"&÷W"”ÔÂ'6–ær†ÖF6†W262Ö6öFRw2&ö6‚’à¢¢fÆÇ2&6²FòF†Rf—'7BæöâÖV×G’ÂæöâÖ†VF–ær&öG’Æ–æRà¢¢ð¢6öç7B'6TFW67&—F–öâÒ‡&s¢7G&–ær“¢7G&–ærÂVæFVf–æVBÓâ°¢6öç7BfÔÖF6‚Ò&ræÖF6‚‚õâÒÒÕÇ2¥Æâ…µÇ5Å5Ò£ò’ÒÒÕÇ2¥Æãòò“°¢–b†fÔÖF6‚’°¢G'’°¢6öç7B'6VBÒ–ÖÂæÆöB†fÔÖF6…³ÒÇÂrr’2&V6÷&CÇ7G&–ærÂVæ¶æ÷vãâÂçVÆÃ°¢–b‡'6VBbbG—Vöb'6VBÓÓÒvö&¦V7BrbbG—Vöb'6VBæFW67&—F–öâÓÓÒw7G&–ærr’°¢6öç7BFW62Ò'6VBæFW67&—F–öâçG&–Ò‚“°¢–b†FW62’&WGW&âFW62ç6Æ–6RƒÂ#“°¢Ð¢Ò6F6‚°¢ò¢”ÔÂ'6RW'&÷"(	BfÆÂF‡&÷Vv‚Fò&öG’W‡G&7F–öâ¢ð¢Ð¢Ð¢òòfÆÆ&6³¢f—'7BæöâÖV×G’ÂæöâÖ†VF–ær&öG’Æ–æP¢6öç7B&öG•7F'BÒfÔÖF6‚ò&ræ–æFW„öb†fÔÖF6…³Ò’²fÔÖF6…³ÒæÆVæwF‚¢°¢6öç7Bf—'7DÆ–æRÒ&p¢ç6Æ–6R†&öG•7F'B¢ç7Æ—B‚õÇ#õÆâò¢æÖ‚†Â’ÓâÂçG&–Ò‚’¢æf–æB‚†Â’ÓâÂæÆVæwF‚âbbÂç7F'G5v—F‚‚r2r’bbÂÓÒrÒÒÒr“°¢&WGW&âf—'7DÆ–æSòç6Æ–6RƒÂ#“°¢Ó° ¢ò¢ ¢¢66âæ6ÆVFRö6öÖÖæG2ö(	BfÆBæÖBf–ÆW3¢6öÖÖæG2÷¶æÖWÒæÖF ¢¢ð¢6öç7B66ä6öÖÖæG2Ò€¢F—%Fƒ¢7G&–ærÀ¢“¢'&“Ç²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6S¢wW6W"rÂw6¶–ÆÂrÓâÓâ°¢–b‚g2æW†—7G57–æ2†F—%F‚’ÇÂg2ç7FE7–æ2†F—%F‚’æ—4F—&V7F÷'’‚’’&WGW&âµÓ°¢6öç7BVçG&–W2Òg2ç&VFF—%7–æ2†F—%F‚Â²v—F„f–ÆUG—W3¢G'VRÒ“°¢6öç7B&W7VÇG3¢'&“Ç²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6S¢wW6W"rÂw6¶–ÆÂrÓâÐ¢µÓ°¢f÷"†6öç7BVçBöbVçG&–W2’°¢–b‚VçBæ—4f–ÆR‚’ÇÂVçBææÖRæVæG5v—F‚‚ræÖBr’’6öçF–çVS°¢6öç7BæÖRÒVçBææÖRç&WÆ6R‚õÂæÖBBòÂrr“°¢ÆWBFW67&—F–öã¢7G&–ærÂVæFVf–æVC°¢G'’°¢6öç7B&rÒg2ç&VDf–ÆU7–æ2‡F‚æ¦ö–â†F—%F‚ÂVçBææÖR’ÂwWFbÓ‚r“°¢FW67&—F–öâÒ'6TFW67&—F–öâ‡&r“°¢Ò6F6‚°¢ò¢æöâÖfFÂ¢ð¢Ð¢&W7VÇG2çW6‚‡²æÖRÂFW67&—F–öâÂ6÷W&6S¢wW6W"rÒ“°¢Ð¢&WGW&â&W7VÇG3°¢Ó° ¢ò¢ ¢¢66âæ6ÆVFR÷6¶–ÆÇ2ö(	B7V&F—&V7F÷'’W"6¶–ÆÃ¢6¶–ÆÇ2÷¶æÖWÒõ4´”ÄÂæÖF ¢¢†÷"6¶–ÆÂæÖFÂ66RÖ–ç6Vç6—F—fR’à¢¢ð¢6öç7B66å6¶–ÆÇ2Ò€¢F—%Fƒ¢7G&–ærÀ¢“¢'&“Ç²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6S¢wW6W"rÂw6¶–ÆÂrÓâÓâ°¢–b‚g2æW†—7G57–æ2†F—%F‚’ÇÂg2ç7FE7–æ2†F—%F‚’æ—4F—&V7F÷'’‚’’&WGW&âµÓ°¢6öç7BVçG&–W2Òg2ç&VFF—%7–æ2†F—%F‚Â²v—F„f–ÆUG—W3¢G'VRÒ“°¢6öç7B&W7VÇG3¢'&“Ç²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6S¢wW6W"rÂw6¶–ÆÂrÓâÐ¢µÓ°¢f÷"†6öç7BVçBöbVçG&–W2’°¢–b‚VçBæ—4F—&V7F÷'’‚’ÇÂVçBææÖRç7F'G5v—F‚‚râr’’6öçF–çVS°¢òòÆöö²f÷"4´”ÄÂæÖB÷"6¶–ÆÂæÖB–ç6–FRF†R7V&F—&V7F÷'¢6öç7B7V$F—"ÒF‚æ¦ö–â†F—%F‚ÂVçBææÖR“°¢6öç7B6¶–ÆÄf–ÆRÒ²u4´”ÄÂæÖBrÂw6¶–ÆÂæÖBuÒæf–æB‚†b’Óà¢g2æW†—7G57–æ2‡F‚æ¦ö–â‡7V$F—"Âb’’À¢“°¢–b‚6¶–ÆÄf–ÆR’6öçF–çVS°¢ÆWBFW67&—F–öã¢7G&–ærÂVæFVf–æVC°¢G'’°¢6öç7B&rÒg2ç&VDf–ÆU7–æ2‡F‚æ¦ö–â‡7V$F—"Â6¶–ÆÄf–ÆR’ÂwWFbÓ‚r“°¢FW67&—F–öâÒ'6TFW67&—F–öâ‡&r“°¢Ò6F6‚°¢ò¢æöâÖfFÂ¢ð¢Ð¢&W7VÇG2çW6‚‡²æÖS¢VçBææÖRÂFW67&—F–öâÂ6÷W&6S¢w6¶–ÆÂrÒ“°¢Ð¢&WGW&â&W7VÇG3°¢Ó° ¢òò66âvÆö&Â‡âòæ6ÆVFRò’f—'7BÂF†Vâ&ö¦V7B†÷fW'&–FW2öâæÖP¢òò6öÆÆ—6–öâ’(	BÖF6†W26ÆVFR6öFRw2÷vâF—66÷fW'’&V6VFVæ6Ræ@¢òò6÷fW'2Ö&¶WBÖ–ç7FÆÆVB6¶–ÆÇ2v†–6‚Çv—2ÆæB–ââòæ6ÆVFR÷6¶–ÆÇ2òà¢6öç7B†öÖRÒ÷2æ†öÖVF—"‚“°¢6öç7BÖW&vVBÒæWrÖÀ¢7G&–ærÀ¢²æÖS¢7G&–æs²FW67&—F–öãó¢7G&–æs²6÷W&6S¢wW6W"rÂw6¶–ÆÂrÐ¢â‚“°¢f÷"†6öç7B6ÖBöb°¢ââç66ä6öÖÖæG2‡F‚æ¦ö–â††öÖRÂræ6ÆVFRrÂv6öÖÖæG2r’’À¢ââç66å6¶–ÆÇ2‡F‚æ¦ö–â††öÖRÂræ6ÆVFRrÂw6¶–ÆÇ2r’’À¢ââç66ä6öÖÖæG2‡F‚æ¦ö–â‡&ö÷BÂræ6ÆVFRrÂv6öÖÖæG2r’’À¢ââç66å6¶–ÆÇ2‡F‚æ¦ö–â‡&ö÷BÂræ6ÆVFRrÂw6¶–ÆÇ2r’’À¢Ò’°¢ÖW&vVBç6WB†6ÖBææÖRÂ6ÖB“°¢Ð¢6öç7B6öÖÖæG2Ò'&’æg&öÒ†ÖW&vVBçfÇVW2‚’’ç6÷'B‚†Â"’ÓâææÖRæÆö6ÆT6ö×&R†"ææÖR’“°¢&WGW&â²7V66W73¢G'VRÂ6öÖÖæG2Ó°¢Ò6F6‚†W'"’°¢6öç7BÖW76vRÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢ÖW76vRÓ°¢Ð¢ÒÀ¢“° ¢&Vv—7FW%6¶–ÆÆ‡V$—2‡°¢vWDÖ¶W#¢vWDÖ¶W$6÷&RÀ¢vWDÖævVE6¶–ÆÅ&ö÷G3¢‚’ÓâvWDv†÷7DÖævW"‚’æÖævVE&ö÷DF—'2‚’À¢vWD'V–ÇD–å6¶–ÆÇ3¢‚’Óâ'V–ÇD–å6¶–ÆÄFW67&—F÷'2€¢ævWEF‚‚wW6W$FFr’À¢ævWEF‚‚vFFr’À¢’À¢vWDÆÆ÷vVE&ö¦V7E&ö÷G3¢Æ—7DÆÆ÷vVE6¶–ÆÆ‡V%&ö¦V7E&ö÷G2À¢Ò“°¢F—7÷6U6¶–ÆÆ‡V$WFõ7–æ4WF„Æ—7FVæW"ÒWF„ÖævW"æöäWF…7FFT6†ævR‚‡7FFR’Óâ°¢–b‚7FFRæ—4WF†VçF–6FVB’&WGW&ã°¢fö–B6¶–ÆÆ‡V$WFõ7–æ56W'f–6Rç'Väöæ6TgFW$Æöv–â‚“°¢Ò“°¢F—7÷6U&÷f–FW$66W74WF„Æ—7FVæW"ÒWF„ÖævW"æöäWF…7FFT6†ævR‚‚’Óâ°¢&Vg&W6…&÷f–FW$66W74gFW$WF„6†ævR‚“°¢&V&–æD6†DVÖ&VFF–æu6WGF–æw5vF6†W"‚“°¢òò6†BVÖ&VFF–ær†2â66÷VçBÖFW&—fVBFVfVÇB–âFF—F–öâFò&÷f–FW"f–Æ&–Æ—G’à¢òò&V6öæ6–ÆRöâWfW'’6öÖÖ—GFVBWF‚&ö¦V7F–öâ6ò6ÖRÖ÷væW"ÖVÖ&W'6†—6†ævW26ææ÷@¢òòÆVfRF†R&Wf–÷W2FVfVÇB'Vææ–ærVçF–ÂâVç&VÆFVB&÷f–FW"&Vg&W6‚ö67W'2à¢fö–B66†VGVÆT6†DVÖ&VFF–æu'VçF–ÖU&V6öæ6–ÆR‚“°¢Ò“°¢&V&–æD6†DVÖ&VFF–æu6WGF–æw5vF6†W"‚“°¢òò›¹ŽŠêNhù.K»nYÎjÚ^KˆÞˆ;ÞKéÞ‹YnyJŽh‹~XXŽh™>[Èhù.K»nš^8.Y
+þXªŽi{niÊÎYË÷væW"[{.{¸þz‹>Zé®X‰žz¸¾X‹°¢òòZHÞyJŽ[ˆ.YË®[ú¾xZ~ûÉ¾K©zºþy›¾[ÙRþXˆ~Xû~y¨N˜	®yú^Xúþˆ;ÞizžK¨â÷væW"&÷VæF'’˜x®iKîûÈÎYºjÚ@¢òò[»n‹ùþX‹[Ù>X˜Þ‹>yJŽjŽ{¹>iÙþYîXhÞhÈž[{.hùKªNy¨Nik÷væW"Š^‹yKˆjÊ8 ¢ÇVv–äÖ&¶WEW&–öF–57–æ5F–ÖW"óóÒ6WD–çFW'fÂ€¢‚’Óâ7–æ5ÇVv–äÖ&¶WDf÷$7F—fT÷væW"…ÅTt”åôÔ$´UEõU$”ôD”5õ5”ä5ôÕ2’À¢ÅTt”åôÔ$´UEõU$”ôD”5õ5”ä5ôÕ2À¢“°¢ÇVv–äÖ&¶WEW&–öF–57–æ5F–ÖW"çVç&Vb‚“°¢òò)H)HF–Æös¢yºî[Ù^˜žhºžYšŽûÈ‡cãbikZ)îûÈÎKˆîizr6†÷rÖ÷VâÖF—&V7F÷'’ÖF–Æör[›nZÙŽûÈ’)H)H ¢—4Ö–âæ†æFÆR€¢vF–Æös§6†÷rÖ÷VâÖF—&V7F÷'’rÀ¢7–æ2€¢WfVçBÀ¢°¢FVfVÇEF‚À¢w&—F&ÆTw&çE66÷RÀ¢Ó¢²FVfVÇEFƒó¢7G&–æs²w&—F&ÆTw&çE66÷Só¢7G&–ærÒÒ·ÒÀ¢’Óâ°¢–b‡w&—F&ÆTw&çE66÷RÓÒVæFVf–æVB’°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‚w&—F&ÆTw&çE66÷RÇÂw&—F&ÆTw&çE66÷RæÆVæwF‚â#‚’°¢F‡&÷ræWrW'&÷"‚v–çfÆ–Bw&—F&ÆRF—&V7F÷'’w&çB66÷Rr“°¢Ð¢Ð¢6öç7BF&vWEv–âÒvWEv–æF÷r‚’óò'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚“°¢–b‚F&vWEv–â’&WGW&â²7V66W73¢G'VRÂFƒ¢çVÆÂÓ°¢6öç7B&W7VÇBÒv—BF–Æörç6†÷t÷VäF–Æör‡F&vWEv–âÂ°¢òò7&VFTF—&V7F÷'“¦Ö4õ2i‹îzK¢.ik[»®ih~K»nZK’.hÈž™*â…v–æF÷w2ˆz®[Šb“°¢òòY
+nX‰žyJŽh‹~YÊ‚–6¶W"˜xÎk*k9^[Ù>YË®[»®KˆKŠ®yºîj~yºî[ÙRÎXú®ˆ;ÞXXŽXë²f–æFW"[»®8 ¢&÷W'F–W3¢²v÷VäF—&V7F÷'’rÂv7&VFTF—&V7F÷'’uÒÀ¢âââ†FVfVÇEF‚ò²FVfVÇEF‚Ò¢·Ò’À¢Ò“°¢–b‡&W7VÇBæ6æ6VÆVBÇÂ&W7VÇBæf–ÆUF‡2æÆVæwF‚ÓÓÒ’°¢&WGW&â²7V66W73¢G'VRÂFƒ¢çVÆÂÓ°¢Ð¢6öç7B6VÆV7FVEF‚Ò&W7VÇBæf–ÆUF‡5³Ó°¢–b‡w&—F&ÆTw&çE66÷RÓÒVæFVf–æVB’°¢v—B—77VUw&—F&ÆTF—&V7F÷'•–6¶W$w&çB‡°¢66÷T–C¢w&—F&ÆTw&çE66÷RÀ¢6VæFW$–C¢WfVçBç6VæFW"æ–BÀ¢F—&V7F÷'“¢6VÆV7FVEF‚À¢Ò“°¢Ð¢&WGW&â²7V66W73¢G'VRÂFƒ¢6VÆV7FVEF‚Ó°¢ÒÀ¢“° ¢òò)H)HF–Æös¢ih~K»n˜žhºžYš‚ŽX˜Þ{Úîj8iú^ˆI®iÊÎ˜žXùnzØž˜	®yJŽYË®išó¾Kˆîyºî[Ù^˜žhºžYšŽYÎ[Ú"’)H)H ¢—4Ö–âæ†æFÆR€¢vF–Æös§6†÷rÖ÷VâÖf–ÆRrÀ¢7–æ2€¢öWfVçBÀ¢²FVfVÇEF‚Âf–ÇFW'2Ó¢²FVfVÇEFƒó¢7G&–æs²f–ÇFW'3ó¢VÆV7G&öâäf–ÆTf–ÇFW%µÒÒÒ·ÒÀ¢’Óâ°¢6öç7BF&vWEv–âÒvWEv–æF÷r‚’óò'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚“°¢–b‚F&vWEv–â’&WGW&â²7V66W73¢G'VRÂFƒ¢çVÆÂÓ°¢6öç7B&W7VÇBÒv—BF–Æörç6†÷t÷VäF–Æör‡F&vWEv–âÂ°¢&÷W'F–W3¢²v÷Väf–ÆRuÒÀ¢âââ†FVfVÇEF‚ò²FVfVÇEF‚Ò¢·Ò’À¢âââ†f–ÇFW'2ò²f–ÇFW'2Ò¢·Ò’À¢Ò“°¢–b‡&W7VÇBæ6æ6VÆVBÇÂ&W7VÇBæf–ÆUF‡2æÆVæwF‚ÓÓÒ’°¢&WGW&â²7V66W73¢G'VRÂFƒ¢çVÆÂÓ°¢Ð¢&WGW&â²7V66W73¢G'VRÂFƒ¢&W7VÇBæf–ÆUF‡5³ÒÓ°¢ÒÀ¢“° ¢òò)H)HF–Æös¢‹XNk©XZ^Xú>y¨N{;¾{¹þ˜žhºžYš‚)H)H ¢—4Ö–âæ†æFÆR€¢vF–Æös§6†÷rÖ÷Vâ×&W6÷W&6RrÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢–ÆöC¢Væ¶æ÷vâÒ·ÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢G'VS°¢Fƒ¢7G&–ærÂçVÆÃ°¢¶–æC¢vf–ÆRrÂvF—&V7F÷'’rÂçVÆÃ°¢ÓâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7B&×2Ò&WV—&Tö&¦V7B‡–ÆöB“°¢6öç7BFVfVÇEF…fÇVRÒ&×2æFVfVÇEFƒ°¢–b€¢FVfVÇEF…fÇVRÓÒVæFVf–æVBb`¢‡G—VöbFVfVÇEF…fÇVRÓÒw7G&–ærrÇÀ¢FVfVÇEF…fÇVRæÆVæwF‚âC“bÇÀ¢F‚æ—4'6öÇWFR†FVfVÇEF…fÇVR’¢’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂvFVfVÇEF‚×W7B&Râ'6öÇWFRF‚r“°¢Ð¢6öç7B÷væW"Ò'&÷w6W%v–æF÷ræg&öÕvV$6öçFVçG2†WfVçBç6VæFW"“°¢–b‚÷væW"’&WGW&â²7V66W73¢G'VRÂFƒ¢çVÆÂÂ¶–æC¢çVÆÂÓ°¢G'’°¢6öç7B–6¶VBÒv—B–6´æF—fTE&W6÷W&6R€¢°¢ÆFf÷&Ó¢&ö6W72çÆFf÷&ÒÀ¢6†÷t÷VäF–Æös¢†÷F–öç2’ÓâF–Æörç6†÷t÷VäF–Æör†÷væW"Â÷F–öç2’À¢—4F—&V7F÷'“¢‡6VÆV7FVEF‚’Óâg2ç7FE7–æ2‡6VÆV7FVEF‚’æ—4F—&V7F÷'’‚’À¢ÒÀ¢FVfVÇEF…fÇVRÀ¢“°¢&WGW&â²7V66W73¢G'VRÂââç–6¶VBÓ°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂwVæ&ÆRFò÷Vâ&W6÷W&6R–6¶W"r“°¢Ð¢ÒÀ¢“° ¢òò†’Ö¶W“§FW7BÖ6öææV7F–öâ[{.™¨þh˜¾Z¾[Ù^XZ^™;î‹zþz{¾™šBÃ##bÓrÓs¥„B{ÙX[2¶W’Kˆ[è¾yK¢òòÖöFVÂÖ66W72ˆz®XªŽKˆ¾XùÎ‹ùî˜	®h
+~yKYÎjÚ^x«nhiË®‹Iþ‹J>8" ¢òò)H)HvVæW&–2’&WVW7B&÷‡“¢[{.z{¾™šBƒ##bÓr”&6UW&Âkˆ^ybž)H)H ¢òòi»î{¸þy¨B“§&WVW7F‡&VæFW&W"(i"Ö–â(i"K‹²6W'fW"ž˜	®yJŽKº>yn™¨þiÈYîKˆKŠ ¢òò‹>yJŽˆR†ÖU6W'f–6RtUBö’öÖRÎKª~Y8&öÆR[{.˜[Û’žKˆ‹[~h¸n™šN8'&VæFW&W"K¸îjÚ@¢òòZûžK‰®Xª6W'fW"™»nŠû~k#¶Ö–âXh^˜:Ž‹>yJŽ‹[6W'fW$”6Æ–VçBç6W'fW$”fWF6Ž8  ¢òò)H)H’¶W’&Vg&W6‚g&öÒ6W'fW#¢[{.z{¾™šB)H)H ¢òò„B{ÙX[2¶W’òÖ—fò¶W’YØ~K‹®iÊÎYËöæÇ’‡6fU7F÷&vR’Îk*iÈžiÈÞXªYšŽXšþiÊÂÀ¢òòYºjÚNKˆÞXhÞhùKé²£§&Vg&W6‚Ög&öÒ×6W'fW&h¸žXùn˜	®˜>8.iÊÎYË¶W’ZKiXŽi{nyKyJŽh‹~YÊŽŠëî{Úî˜xÎ˜xÞZ¾8  ¢òò)H)Hf–ÆRGF6†ÖVçB•2„bÔd’Ór’)H)H ¢—4Ö–âæ†æFÆR€¢w&VBÖf–ÆRÖf÷"ÖGF6†ÖVçBrÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢°¢f–ÆUFƒ¢7G&–æs°¢Væ6öF–æs¢v&6ScBrÂwWFc‚s°¢Ö…6—¦Só¢çVÖ&W#°¢ÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢&ööÆVã°¢W'&÷#ó¢7G&–æs°¢FFó¢7G&–æs°¢6—¦S¢çVÖ&W#°¢G'Væ6FVCó¢&ööÆVã°¢ÓâÓâ°¢G'’°¢6öç7B²f–ÆUF‚ÂVæ6öF–ærÒÒ&×3°¢6öç7BÖ…6—¦RÒÖF‚æÖ–â‡&×2æÖ…6—¦Róò3¢#B¢#BÂ3¢#B¢#B“° ¢–b‚F‚æ—4'6öÇWFR†f–ÆUF‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢uF‚×W7B&R'6öÇWFRrÂ6—¦S¢Ó°¢Ð¢–b‚—5F„ÆÆ÷vVB†f–ÆUF‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÂ6—¦S¢Ó°¢Ð ¢6öç7B7FBÒv—Bg2ç&öÖ—6W2ç7FB†f–ÆUF‚“°¢6öç7B6—¦RÒ7FBç6—¦S° ¢–b‡6—¦RâÖ…6—¦R’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢tf–ÆRFöòÆ&vRrÂ6—¦RÓ°¢Ð ¢–b†Væ6öF–ærÓÓÒv&6ScBr’°¢6öç7B'VffW"Òv—Bg2ç&öÖ—6W2ç&VDf–ÆR†f–ÆUF‚“°¢&WGW&â²7V66W73¢G'VRÂFF¢'VffW"çFõ7G&–ær‚v&6ScBr’Â6—¦RÂG'Væ6FVC¢fÇ6RÓ°¢Ð ¢òòWFc‚ÖöFP¢6öç7BDU…EôÄ”Ô•BÒ¢#B¢#C²òòÔ ¢–b‡6—¦RâDU…EôÄ”Ô•B’°¢òò&VBöæÇ’F†Rf—'7BÔ ¢6öç7Bf–ÆT†æFÆRÒv—Bg2ç&öÖ—6W2æ÷Vâ†f–ÆUF‚Âw"r“°¢G'’°¢6öç7B'VbÒ'VffW"æÆÆö2…DU…EôÄ”Ô•B“°¢v—Bf–ÆT†æFÆRç&VB†'VbÂÂDU…EôÄ”Ô•BÂ“°¢&WGW&â²7V66W73¢G'VRÂFF¢'VbçFõ7G&–ær‚wWFc‚r’Â6—¦RÂG'Væ6FVC¢G'VRÓ°¢Òf–æÆÇ’°¢v—Bf–ÆT†æFÆRæ6Æ÷6R‚“°¢Ð¢Ð ¢6öç7BFFÒv—Bg2ç&öÖ—6W2ç&VDf–ÆR†f–ÆUF‚ÂwWFc‚r“°¢&WGW&â²7V66W73¢G'VRÂFFÂ6—¦RÂG'Væ6FVC¢fÇ6RÓ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Â6—¦S¢Ó°¢Ð¢ÒÀ¢“° ¢òò&VBÆö6Âf–ÆRw2&r'—FW2f÷"–âÖ&VæFW&–ær†7W'&VçFÇ’Db&Wf–Wr’à¢òò&WGW&ç2V–çC„'&’÷fW"7G'V7GW&VB6ÆöæR–ç7FVBöb&6ScC¢Fbæ§0¢òòvWDFö7VÖVçB‡²FFÒ’vçG2'—FW2ÂæB6¶—–ær&6ScBfö–G2Æ&vP¢òòG&ç6–VçB7G&–ærÇW2Ö–â×F‡&VBFö"ö6†$6öFTBFV6öFRÆö÷–âF†P¢òò&VæFW&W"â6ÖR3Ô"62&VBÖf–ÆRÖf÷"ÖGF6†ÖVçBà¢òð¢òòF‚öÆ–7’—2F†R4Tå4•D•dRÔÔTD”&Æö6¶Æ—7BÂæ÷BF†R7—7FVÒöæRW6VB'’F†P¢òòGF6†ÖVçB•73¢F†—26†ææVÂ&WÆ6W2F†R†GBÖf–ÆS¢òò&÷Fö6öÂ2F†R'—FP¢òò6÷W&6Rf÷"Db&Wf–WrÂæBF†B&÷Fö6öÂFVæ–W27&VFVçF–Âò'&÷w6W"×&öf–ÆP¢òòF—'2†Æö6Äf–ÆU&÷Fö6öÂçG2’â&Wf–Wv–ærf–ÆW2÷WBöbâvVçB×w&—F&ÆP¢òòv÷&¶F—"ÖVç2F†R6Æ–6²WF†÷&—¦W2'6†÷rF†—2Db"Âæ÷B'&VBv†W&WfW"F†—0¢òò7–ÖÆ–æ²ö–çG2"Â6òF†R7G&–7FW"Æ—7B—2F†R&–v‡BöæR(	Bv÷&¶F— ¢òòÆV²çFbÓââòç76‚ö–E÷'6×W7Bæ÷B&V6‚F†R&VæFW&W"†W&Rv†VâF†P¢òò&÷Fö6öÂ—B&WÆ6VBv÷VÆB†fR&VgW6VB—Bâ6–&Æ–ær–ÖvU&Wf–Wr7F–ÆÂvöW0¢òòF‡&÷Vv‚†GBÖf–ÆS¢òòÂ6òF†—2¶VW2öæRöÆ–7’7&÷72F†Rf–ÆR'&÷w6W"à¢—4Ö–âæ†æFÆR€¢w&VBÖf–ÆRÖ'—FW2rÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²f–ÆUFƒ¢7G&–æs²Ö…6—¦Só¢çVÖ&W"ÒÀ¢“¢&öÖ—6SÇ²'—FW3¢V–çC„'&“²6—¦S¢çVÖ&W"ÓâÓâ°¢òò&V¦V7Bç’6ÆÆW"F†B—2æ÷BF†RG'W7FVBÖ–â&VæFW&W"(	Bà¢òòW†–Æ–'’v–æF÷rò6†–ÆBg&ÖRòvV'f–Wr&V&–ærF†R6†&VB&VÆö@¢òò×W7Bæ÷B&R&ÆRFòVÆÂ&rf–ÆR'—FW2âÖ—'&÷'2F†R6†VÆÃ¦÷Vâ×F€¢òòöÆ–7’†76W'EG'W7FVB²—5F„ÆÆ÷vVB’f÷"F‚×F¶–ær&—f–ÆVvVB•2à¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢òòfÆ–FF–öâ²öÆ–7’²&VwVÆ"Öf–ÆR²6—¦RÖ6²W†7BÖ6÷’Æ—fR–âF†P¢òò–æ¦V7F&ÆR6÷&R†f–ÆU&VD'—FW2çG2’6òF†W’&RVæ—B×FW7FVBv—F†÷W@¢òòVÆV7G&öã²f–ÇW&W2F‡&÷r6æ—F—¦VB—4W'&÷"F†B&V¦V7G2F†R–çfö¶R‚’à¢òòõôäôdôÄÄõröâF†Rf–æÂ6ö×öæVçC¢F†R6÷&R÷Vç2F†R&VÇF‚vBF&vWBÀ¢òòv†÷6RÆ7B6VvÖVçB—2&VÂf–ÆR(	B6òÆVv—B÷Vâ7V66VVG2Â'WB–bF†P¢òòf–æÂ6ö×öæVçBv27vVBFò7–ÖÆ–æ²–âF†R&VÇFŽ(i&÷Vâ&6R—@¢òòf–Ç2„TÄôõ’–ç7FVBöbföÆÆ÷v–ær–çFòFVæ–VBf–ÆRâfÆÇ2&6²Fò ¢òòv†W&RF†RÆFf÷&ÒÆ6·2F†RfÆr…v–æF÷w2’ÂÖF6†–ær6fT6†DGF6†ÖVçBà¢6öç7BæôföÆÆ÷rÒG—Vöbg2æ6öç7FçG2äõôäôdôÄÄõrÓÓÒvçVÖ&W"ròg2æ6öç7FçG2äõôäôdôÄÄõr¢°¢&WGW&â&VDf–ÆT'—FW4f÷%&Wf–Wr‡&×2Â°¢—5F„ÆÆ÷vVC¢‡’Óâ—5F„ÆÆ÷vVDv–ç7B‡ÂvWE6Vç6—F—fTÖVF–&Æö6¶Æ—7B‚’’À¢&VÇFƒ¢‡’Óâg2ç&öÖ—6W2ç&VÇF‚‡’À¢òò&–v–çB7FG3¢FWbö–æò–FVçF—G’×W7Bæ÷B&R&÷VæFVB‡6VRf–ÆT–FVçF—G•7FB’à¢7FC¢‡’Óâg2ç&öÖ—6W2ç7FB‡Â²&–v–çC¢G'VRÒ’À¢÷Vã¢7–æ2‡’Óâ°¢6öç7B†æFÆRÒv—Bg2ç&öÖ—6W2æ÷Vâ‡Âg2æ6öç7FçG2äõõ$DôäÅ’ÂæôföÆÆ÷r“°¢&WGW&â°¢7FC¢‚’Óâ†æFÆRç7FB‡²&–v–çC¢G'VRÒ’À¢&VC¢†'VffW"Âöfg6WBÂÆVæwF‚Â÷6—F–öâ’Óà¢†æFÆRç&VB†'VffW"Âöfg6WBÂÆVæwF‚Â÷6—F–öâ’À¢6Æ÷6S¢‚’Óâ†æFÆRæ6Æ÷6R‚’À¢Ó°¢ÒÀ¢Ò“°¢ÒÀ¢“° ¢òò)H)Hf–ÆR†VFW"VV²•2„bÔd’Ó‚fÆÆ&6²–æfW&Væ6R’)H)H ¢òò&VBBÖ÷7B'—FW6†FVfVÇBƒ“"Â†&BÖ6cD´"’g&öÒF†R†VBöbf–ÆP¢òòf÷"F†R&VæFW&W"Fò'VâÖv–2Ö'—FW2²UDbÓ‚6æ–ff–æröââ–æFWVæFVçBg&öÐ¢òò&VBÖf–ÆRÖf÷"ÖGF6†ÖVçB&V6W6S ¢òòÒ&WGW&ç27GVÄ'—FW2òF÷FÅ6—¦RÂæ÷B6—¦RòG'Væ6FV@¢òòÒ†2æòÖ…6—¦R&W7G&–7F–öâ‡VV²†VBöbç’f–ÆR6—¦R¢òòÒW&Ö—76–öâöÆ–7’Ö’WföÇfR–æFWVæFVçFÇ¢—4Ö–âæ†æFÆR€¢wVV²Öf–ÆRÖ†VFW"rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢°¢f–ÆUFƒ¢7G&–æs°¢'—FW3ó¢çVÖ&W#°¢ÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢&ööÆVã°¢W'&÷#ó¢7G&–æs°¢FFó¢7G&–æs°¢7GVÄ'—FW3¢çVÖ&W#°¢F÷FÅ6—¦S¢çVÖ&W#°¢ÓâÓâ°¢G'’°¢6öç7B²f–ÆUF‚ÒÒ&×3°¢6öç7B„$Eô4ÒcB¢#C°¢6öç7B&WVW7FVBÒÖF‚æÖ‚ƒÂÖF‚æÖ–â‡&×2æ'—FW2óòƒ“"Â„$Eô4’“° ¢–b‚F‚æ—4'6öÇWFR†f–ÆUF‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢uF‚×W7B&R'6öÇWFRrÂ7GVÄ'—FW3¢ÂF÷FÅ6—¦S¢Ó°¢Ð¢–b‚—5F„ÆÆ÷vVB†f–ÆUF‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÂ7GVÄ'—FW3¢ÂF÷FÅ6—¦S¢Ó°¢Ð ¢6öç7B7FBÒv—Bg2ç&öÖ—6W2ç7FB†f–ÆUF‚“°¢6öç7BF÷FÅ6—¦RÒ7FBç6—¦S° ¢–b‡F÷FÅ6—¦RÓÓÒ’°¢&WGW&â²7V66W73¢G'VRÂ7GVÄ'—FW3¢ÂF÷FÅ6—¦S¢Ó°¢Ð ¢6öç7BFõ&VBÒÖF‚æÖ–â‡&WVW7FVBÂF÷FÅ6—¦R“°¢–b‡Fõ&VBÓÓÒ’°¢&WGW&â²7V66W73¢G'VRÂ7GVÄ'—FW3¢ÂF÷FÅ6—¦RÓ°¢Ð ¢6öç7Bf–ÆT†æFÆRÒv—Bg2ç&öÖ—6W2æ÷Vâ†f–ÆUF‚Âw"r“°¢G'’°¢6öç7B'VbÒ'VffW"æÆÆö2‡Fõ&VB“°¢6öç7B²'—FW5&VBÒÒv—Bf–ÆT†æFÆRç&VB†'VbÂÂFõ&VBÂ“°¢6öç7B6Æ–6RÒ'Vbç7V&'&’ƒÂ'—FW5&VB“°¢&WGW&â°¢7V66W73¢G'VRÀ¢FF¢6Æ–6RçFõ7G&–ær‚v&6ScBr’À¢7GVÄ'—FW3¢'—FW5&VBÀ¢F÷FÅ6—¦RÀ¢Ó°¢Òf–æÆÇ’°¢v—Bf–ÆT†æFÆRæ6Æ÷6R‚“°¢Ð¢Ò6F6‚†W'"’°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢7GVÄ'—FW3¢À¢F÷FÅ6—¦S¢À¢Ó°¢Ð¢ÒÀ¢“° ¢òò)H)HFW‡DÆ–v‡F&÷‚•2‡FW‡BÖÆ–v‡F&÷‚cBôcR’)H)H ¢òð¢òò&VG2FW‡Bf–ÆRf÷"F†RFW‡DÆ–v‡F&÷‚&Wf–Wrâ†&B6—2#Ô"W ¢òòFW‡BÖÆ–v‡F&÷‚7V3²÷fW"Ö6f–ÆW2&R&V¦V7FVBv—F‚÷fW'6—¦V6òF†P¢òò&VæFW&W"6â&VæFW"F†R÷fW'6—¦R&öG’v—F†÷WB&R×7FGF–ærF†Rf–ÆRà¢òò&WW6W2F†R6ÖR—5F„ÆÆ÷vVF&Æö6¶Æ—7B2f–ÆRÖGF6†ÖVçB•72à¢—4Ö–âæ†æFÆR€¢wFW‡BÖf–ÆS§&VB×&Wf–WrrÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²f–ÆUFƒ¢7G&–ærÒÀ¢“¢&öÖ—6SÇ°¢7V66W73¢&ööÆVã°¢W'&÷#ó¢7G&–æs°¢ò¢¢v÷fW'6—¦RrÒf–ÆRâÔ…õ$Ud”UuôÔ#²&VæFW&W"6†÷VÆB7v—F6‚Fò÷fW'6—¦R&öG’â¢ð¢&V6öãó¢v÷fW'6—¦RrÂvæ÷Eöf÷VæBrÂvf÷&&–FFVârÂw&VEöf–ÆVBs°¢FFó¢7G&–æs°¢6—¦S¢çVÖ&W#°¢ò¢¢&Wf–Wr6–âÔ"(	B7W&f6VB6ò&VæFW&W"6â&VæFW"G–æÖ–26÷¢¢‚&W†6VVF–ærF†R¶Æ–Ö—DÖ'ÒÔ"&Wf–WrÆ–Ö—B"’v—F†÷WB†&BÖ6öF–ærâ¢ð¢Æ–Ö—DÖ#ó¢çVÖ&W#°¢ÓâÓâ°¢G'’°¢òò4D²öâv–æF÷w2VÖ—G2õ4•‚×7G–ÆRf–ÆU÷F‚†öRô•v÷&²òââæ“²6öçfW'@¢òòFòæF—fRv–ã3"†S¥Ä•v÷&µÂââæ’&Vf÷&Rç’F‚6†V6·2÷"g26ÆÇ2à¢òòæòÖ÷öâÖ2ôÆ–çW‚â6VR÷6—…Fõv–ã3"‚’&÷fRf÷"6öçFW‡Bà¢6öç7Bf–ÆUF‚Ò÷6—…Fõv–ã3"‡&×2æf–ÆUF‚“°¢òòFW‡BÖÆ–v‡F&÷‚7V2(	BcR™ˆŽXÎ8%7W&f6RÔ"6öç7FçB6òF†RfÇVR—0¢òò6–ævÆR×6÷W&6VBf÷"&÷F‚F†R'—FR6ö×&—6öâæBF†R•2&W7öç6P¢òò‡&VæFW&W"&VG2Æ–Ö—DÖ&Fò&VæFW"G–æÖ–26÷’’à¢òòÔ#®š(NŠxŽ‹[YÎjÚ^XZŽih~Šû²²K‹¾{«þzˆ¾š¹ŽKªîk‹.iù2ÎXhÞZJ~KÉ®iˆîi‹îXÚ¾™˜NK»n‹[‹zþ[èN˜þKÊ ¢òòKˆÞXÚ‹ùžiÚš(NŠxŽh‰iÊÂŽ™˜NK»n[.[{.KˆÞYÊ‚&VæFW&W"X®ZJ~[þ™™X‹b’ÎKŠNˆ^Šz>ˆ
+n8 ¢6öç7BÔ…õ$Ud”UuôÔ"Ò°¢6öç7BÔ…õ$Ud”UrÒÔ…õ$Ud”UuôÔ"¢#B¢#C° ¢–b‚f–ÆUF‚ÇÂF‚æ—4'6öÇWFR†f–ÆUF‚’’°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢uF‚×W7B&R'6öÇWFRrÀ¢&V6öã¢vf÷&&–FFVârÀ¢6—¦S¢À¢Æ–Ö—DÖ#¢Ô…õ$Ud”UuôÔ"À¢Ó°¢Ð¢–b‚—5F„ÆÆ÷vVB†f–ÆUF‚’’°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÀ¢&V6öã¢vf÷&&–FFVârÀ¢6—¦S¢À¢Æ–Ö—DÖ#¢Ô…õ$Ud”UuôÔ"À¢Ó°¢Ð ¢ÆWB7FC¢g2å7FG3°¢G'’°¢7FBÒv—Bg2ç&öÖ—6W2ç7FB†f–ÆUF‚“°¢Ò6F6‚°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢tf–ÆRæ÷Bf÷VæBrÀ¢&V6öã¢væ÷Eöf÷VæBrÀ¢6—¦S¢À¢Æ–Ö—DÖ#¢Ô…õ$Ud”UuôÔ"À¢Ó°¢Ð¢6öç7B6—¦RÒ7FBç6—¦S° ¢–b‡6—¦RâÔ…õ$Ud”Ur’°¢òòFöâwB&VBF†R&öG’(	B&VæFW&W"v–ÆÂ7v—F6‚Fò÷fW'6—¦Rf–Wr&6V@¢òòöâ&V6öã¢v÷fW'6—¦RvæBW6R6—¦Vf÷"F†RG–æÖ–26÷’à¢&WGW&â²7V66W73¢fÇ6RÂ&V6öã¢v÷fW'6—¦RrÂ6—¦RÂÆ–Ö—DÖ#¢Ô…õ$Ud”UuôÔ"Ó°¢Ð ¢6öç7BFFÒv—Bg2ç&öÖ—6W2ç&VDf–ÆR†f–ÆUF‚ÂwWFc‚r“°¢&WGW&â²7V66W73¢G'VRÂFFÂ6—¦RÂÆ–Ö—DÖ#¢Ô…õ$Ud”UuôÔ"Ó°¢Ò6F6‚†W'"’°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢&V6öã¢w&VEöf–ÆVBrÀ¢6—¦S¢À¢Æ–Ö—DÖ#¢À¢Ó°¢Ð¢ÒÀ¢“° ¢òò)H)HÖ&¶F÷vâÖÖöæ÷&Wò×&W6öÇfS¢6Ö'B&VÆF—fR×F‚&W6öÇfW")H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢òò–×ÆVÖVçFF–öâÆ—fW2–ââ÷F…&W6öÇfW"‡W&RÖöGVÆRÂVæ—B×FW7FVB’âF†—0¢òò†æFÆW"§W7BVæf÷&6W2F†R•26öçG&7BæB–æ¦V7G2—5F„ÆÆ÷vVF6ð¢òò6æF–FFW2&R7V&¦V7BFòF†R6ÖRÆÆ÷rÖÆ—7B2F—&V7Bf–ÆR&VG2à¢—4Ö–âæ†æFÆR€¢vg3§&W6öÇfR×F‚rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²‡&Vc¢7G&–æs²v÷&¶–ætF—#¢7G&–ærÒÀ¢“¢&öÖ—6SÇ°¢7FGW3¢wVæ—VRrÂv×VÇF—ÆRrÂvæöæRs°¢6æF–FFW3¢7G&–æuµÓ°¢¶–æCó¢vf–ÆRrÂvF—&V7F÷'’s°¢ÓâÓâ°¢G'’°¢&WGW&âv—B&W6öÇfUv÷&·76UF„66†VB‡&×2æ‡&VbÂ&×2çv÷&¶–ætF—"Â°¢—5F„ÆÆ÷vVBÀ¢Ò“°¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚u¶g3§&W6öÇfR×F…Òf–ÆVC¢rÂW'"“°¢&WGW&â²7FGW3¢væöæRrÂ6æF–FFW3¢µÒÓ°¢Ð¢ÒÀ¢“° ¢òòÖ&¶F÷vâÖÖöæ÷&Wò×&W6öÇfS¢$D4‚&W6öÇfW"âF†RÖ&¶F÷vâ&VæFW&W"&W6öÇfW0¢òòWfW'’F‚×6†VBF&vWBVvW&Ç’B&VæFW"F–ÖR†6†—öæÇ’v†VâF€¢òòVæ—VVÇ’&W6öÇfW2’â7v—F6†–ærFò6W76–öâv—F‚‡VæG&VG2öb7V6‚F&vWG0¢òòW6VBFòf—&R‡VæG&VG2öb–æFWVæFVçBg3§&W6öÇfR×F†6ÆÇ2ÂV6‚Fö–æp¢òò—G2÷vâgVÆÂ§7–æ6‡&öæ÷W2¢v÷&·76R$e2(	BF†RÖ–â&ö6W72g&÷¦Rf÷ ¢òò6V6öæG2âF†—26öÆÆ6W2öæR&VæFW"72w2‡&Vg2–çFò6–ævÆR7–æ2vÆ²à¢—4Ö–âæ†æFÆR€¢vg3§&W6öÇfR×F‚Ö&F6‚rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²‡&Vg3¢7G&–æuµÓ²v÷&¶–ætF—#¢7G&–ærÒÀ¢“¢&öÖ—6SÀ¢&V6÷&CÇ7G&–ærÂ²7FGW3¢wVæ—VRrÂv×VÇF—ÆRrÂvæöæRs²6æF–FFW3¢7G&–æuµÒÓà¢âÓâ°¢G'’°¢&WGW&âv—B&W6öÇfUv÷&·76UF„&F6„66†VB‡&×2æ‡&Vg2Â&×2çv÷&¶–ætF—"Â°¢—5F„ÆÆ÷vVBÀ¢Ò“°¢Ò6F6‚†W'"’°¢7&VFTÆövvW"‚vg3§&W6öÇfR×F‚Ö&F6‚r’æW'&÷"‚vf–ÆVBrÂ²W'&÷#¢7G&–ær†W'"’Ò“°¢6öç7BfÆÆ&6³¢&V6÷&CÀ¢7G&–ærÀ¢²7FGW3¢wVæ—VRrÂv×VÇF—ÆRrÂvæöæRs²6æF–FFW3¢7G&–æuµÒÐ¢âÒ·Ó°¢f÷"†6öç7B‡&Vböb&×2æ‡&Vg2óòµÒ’°¢fÆÆ&6µ¶‡&VeÒÒ²7FGW3¢væöæRrÂ6æF–FFW3¢µÒÓ°¢Ð¢&WGW&âfÆÆ&6³°¢Ð¢ÒÀ¢“° ¢òòf–ÆRÖ6†—Xû>™JîˆùÎXÙRòXh^{ÚîkXþŠxŽYš‚.YÊŽ{;¾{¹þkXþŠxŽYšŽh™>[È#®hê^iKn{¹ÞZûž‹zþ[èNh‰`¢òòiÊÎiË¢f–ÆS¢òòU$ÂÎj
+š¨Îhšž[^YÞYÊ‚…DÔÂy›ÞYÞXÙ^XhRÎxKnYî‹[{;¾{¹þ›¹ŽŠêBf–ÆS¢òð¢òòZHNynYš‚Ž{¹ÞZJ~ZI®i[õ2Kˆ¢æ‡FÖÂòæ‡FÒ˜;ÞiŠ[NX‹›¹ŽŠêNkXþŠxŽYš‚ž8.Y(À¢òò6†VÆÃ¦÷VâÖW‡FW&æÆXˆn[ÈiŠþYºK‹®Yîˆ^Xú®iKîŠÂ‡GG‡2’™‹.kº^yJƒ¾‹ùž˜xÎiKnz¨NX‹ ¢òòXù~hê~y¨Nhšž[^YÞ™¸nYŽYâÎiKîŠÂf–ÆS¢òòiŠþXúþhê~y¨N8 ¢6öç7B÷Väf–ÆT–ä'&÷w6W$ÆörÒ7&VFTÆövvW"‚w6†VÆÃ¦÷VâÖf–ÆRÖ–âÖ'&÷w6W"r“°¢6öç7B÷Väf–ÆUW&Åv—F…v–æF÷w4†æFÆW"Ò7&VFUv–æF÷w4f–ÆUW&Ä÷VæW"‡°¢ÆFf÷&Ó¢&ö6W72çÆFf÷&ÒÀ¢v–æF÷w4F—#¢&ö6W72æVçbåt”äD•"À¢W†V4f–ÆS¢†f–ÆRÂ&w2Â÷F–öç2Â6ÆÆ&6²’ÓâW†V4f–ÆR†f–ÆRÂ&w2Â÷F–öç2Â6ÆÆ&6²’À¢Ò“°¢—4Ö–âæ†æFÆR€¢w6†VÆÃ¦÷VâÖf–ÆRÖ–âÖ'&÷w6W"rÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢f–ÆUF„÷%W&Ã¢7G&–ærÀ¢“¢&öÖ—6SÇ²7V66W73¢G'VRÓâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7B&W7VÇBÒv—B†æFÆT÷Väf–ÆT–ä'&÷w6W"†f–ÆUF„÷%W&ÂÂ°¢—5F„ÆÆ÷vVBÀ¢—4'&÷w6W$÷Væ&ÆUF‚À¢W†—7G57–æ3¢g2æW†—7G57–æ2À¢÷VäW‡FW&æÃ¢‡W&Â’Óâ6†VÆÂæ÷VäW‡FW&æÂ‡W&Â’À¢÷VåFƒ¢†f–ÆUF‚’Óâ6†VÆÂæ÷VåF‚†f–ÆUF‚’À¢÷VåW&Åv—F…v–æF÷w4†æFÆW#¢÷Väf–ÆUW&Åv—F…v–æF÷w4†æFÆW"À¢öä÷VäW‡FW&æÄW'&÷#¢‡²f–ÆUF‚Â†5W&Å7FFRÂW'&÷"Ò’Óâ°¢÷Väf–ÆT–ä'&÷w6W$Æörçv&â‚v÷VäW‡FW&æÂf–ÆVBrÂ°¢f–ÆUF‚À¢†5W&Å7FFRÀ¢fÆÆ&6³¢†5W&Å7FFP¢ò÷Väf–ÆUW&Åv—F…v–æF÷w4†æFÆW ¢òwv–æF÷w2×W&ÂÖ†æFÆW"p¢¢vF—6&ÆVBp¢¢v÷VåF‚rÀ¢W'&÷#¢7G&–ær†W'&÷"’À¢Ò“°¢ÒÀ¢öåv–æF÷w5W&ÄfÆÆ&6´W'&÷#¢‡²f–ÆUF‚ÂW'&÷"Ò’Óâ°¢÷Väf–ÆT–ä'&÷w6W$Æörçv&â‚uv–æF÷w2f–ÆRU$ÂfÆÆ&6²f–ÆVBrÂ°¢f–ÆUF‚À¢W'&÷#¢7G&–ær†W'&÷"’À¢Ò“°¢ÒÀ¢Ò“°¢–b‚&W7VÇBç7V66W72’F‡&÷t—4W'&÷"‡&W7VÇBæW'&÷$6öFRÂ&W7VÇBæW'&÷"“°¢&WGW&â&W7VÇC°¢ÒÀ¢“° ¢òòFW‡BÖÆ–v‡F&÷‚cC¢÷Vâf–ÆRW6–ærF†Rõ2FVfVÇBÆ–6F–öà¢òò†RærâæÆör(i"æ÷FWBò6öç6öÆRÂçG2(i"VF—F÷"öb6†ö–6R’âÖ—'&÷'2F†P¢òò6†VÆÃ¦÷VâÖW‡FW&æÆöÆ–7“¢öæÇ’ÆÆ÷rF‡2F†B72—5F„ÆÆ÷vVFà¢—4Ö–âæ†æFÆR€¢w6†VÆÃ¦÷Vâ×F‚rÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢f–ÆUF„÷%W&Ã¢7G&–ærÀ¢“¢&öÖ—6SÇ²7V66W73¢&ööÆVã²W'&÷#ó¢7G&–ærÓâÓâ°¢G'’°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7Bf–ÆUF‚Ò&W6öÇfU6†VÆÄ÷VåF…F&vWB†f–ÆUF„÷%W&Â“°¢–b†f–ÆUF‚ÓÓÒçVÆÂ’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢uF‚×W7B&R'6öÇWFRrÓ°¢Ð¢–b‚—5F„ÆÆ÷vVB†f–ÆUF‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÓ°¢Ð¢òò6†VÆÂæ÷VåF‚&WGW&ç2rröâ7V66W72ÂW'&÷"7G&–æröâf–ÇW&Rà¢6öç7BW'$×6rÒv—B6†VÆÂæ÷VåF‚†f–ÆUF‚“°¢–b†W'$×6r’&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'$×6rÓ°¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒÀ¢“° ¢òòih~K»b6†—Xû>™Jî8Îh™>[Èikž[Èþ8Ó®ié®K‹âòhÈ~Zé®[©NyJŽh™>[Èò{;¾{¹þ˜žhºžZûžŠùÞjn8 ¢òòK‰®XªKÙ>YÊ‚÷Våv—F„2çG2ŽKéÞ‹Ynk:ŽXZRÎXÙ^kX¾y»Nhê^‹2†æFÆW"&öG’“¶–B(i"W†P¢òòiŠ[NXú®ZÙ‚Ö–âKêrÇ&VæFW&W"KÊ‹zþ[èNhš~ŠÎYÊŽ{¹>ièNKˆ®KˆÞXúþŠŽ‹ëâŽŠú^ih~K»nZKNk:Ž˜x¢ž8 ¢°¢òòævWDf–ÆT–6öâKÉ®XnXùhÈ.jÛ²ŽŠxf–ÆUF‡VÖ&æ–ÂçG2’Î‹ùž˜xÎYÎjËîzÎ‹h^i{b²hÈ¢òòW†R‹zþ[èNy¨N‹ù¾zˆ¾Xh^{É>ZÙ‚Žh™>[Èikž[ÈþˆùÎXÙ^XøÞZHÞ[^[ÈKˆÞ˜xÞZHÞK¹ŽXéþyIþ‹>yJŽh‰iÊÂž8 ¢6öç7B–6öä66†RÒæWrÖÇ7G&–ærÂ7G&–ærÂçVÆÃâ‚“°¢6öç7BvWD–6öâÒ7–æ2†W†UFƒ¢7G&–ær“¢&öÖ—6SÇ7G&–ærÂçVÆÃâÓâ°¢6öç7B¶W’ÒW†UF‚çFôÆ÷vW$66R‚“°¢6öç7B66†VBÒ–6öä66†RævWB†¶W’“°¢–b†66†VBÓÒVæFVf–æVB’&WGW&â66†VC°¢G'’°¢6öç7B–6öâÒv—B&öÖ—6Rç&6R…°¢ævWDf–ÆT–6öâ†W†UF‚Â²6—¦S¢w6ÖÆÂrÒ’À¢æWr&öÖ—6SÆçVÆÃâ‚‡&W6öÇfR’Óâ6WEF–ÖV÷WB‚‚’Óâ&W6öÇfR†çVÆÂ’ÂC’’À¢Ò“°¢6öç7BFFW&ÂÒ–6öâbb–6öâæ—4V×G’‚’ò–6öâçFôFFU$Â‚’¢çVÆÃ°¢–6öä66†Rç6WB†¶W’ÂFFW&Â“°¢&WGW&âFFW&Ã°¢Ò6F6‚°¢–6öä66†Rç6WB†¶W’ÂçVÆÂ“°¢&WGW&âçVÆÃ°¢Ð¢Ó°¢òò&VræW†R˜xÞZé®Y	‹é>X{®‹[hê~X‹nXûKº>zšRŽKŠÞih~{;¾{¹òt$²žˆÎ™ÙâUDbÓ‚ÎhÈžZÙ~ˆ¨.XùnY¹î8¢òòyJ‚6†7hê.kX¾X‹y¨NKº>zš^Šz>zÎY
+nX‰žKŠÞih~[©NyJŽYÞKÉ®Xù‚R´dddBK›z8 ¢ÆWB6öç6öÆT6öFWvU&öÖ—6S¢&öÖ—6SÆçVÖ&W"ÂçVÆÃâÂçVÆÂÒçVÆÃ°¢6öç7BvWD6öç6öÆT6öFWvRÒ‚“¢&öÖ—6SÆçVÖ&W"ÂçVÆÃâÓâ°¢6öç6öÆT6öFWvU&öÖ—6RóóÒæWr&öÖ—6R‚‡&W6öÇfR’Óâ°¢W†V4f–ÆR‚v6†7æ6öÒrÂ²v–æF÷w4†–FS¢G'VRÂF–ÖV÷WC¢3ÒÂ†W'"Â7FF÷WB’Óâ°¢&W6öÇfR†W'"òçVÆÂ¢'6T6†76öFWvR…7G&–ær‡7FF÷WBóòrr’’“°¢Ò“°¢Ò“°¢&WGW&â6öç6öÆT6öFWvU&öÖ—6S°¢Ó°¢6öç7B÷Våv—F‚Ò7&VFT÷Våv—F„†æFÆW'2‡°¢ÆFf÷&Ó¢&ö6W72çÆFf÷&ÒÀ¢—5F„ÆÆ÷vVBÀ¢f–ÆTW†—7G3¢‡’Óâg2æW†—7G57–æ2‡’À¢&VuVW'“¢7–æ2†¶W•F‚Â&w2ÒµÒ’Óâ°¢6öç7B6öFWvRÒv—BvWD6öç6öÆT6öFWvR‚“°¢&WGW&âæWr&öÖ—6SÇ7G&–æsâ‚‡&W6öÇfR’Óâ°¢W†V4f–ÆR€¢w&VræW†RrÀ¢²wVW'’rÂ¶W•F‚Âââæ&w5ÒÀ¢²v–æF÷w4†–FS¢G'VRÂF–ÖV÷WC¢SÂVæ6öF–æs¢v'VffW"rÒÀ¢†W'"Â7FF÷WB’Óà¢&W6öÇfR†W'"òrr¢FV6öFU&Vt÷WGWB‡7FF÷WBóò'VffW"æÆÆö2ƒ’Â6öFWvR’’À¢“°¢Ò“°¢ÒÀ¢vWD–6öâÀ¢7väFWF6†VC¢†6öÖÖæBÂ&w2’Óâ°¢6öç7B6†–ÆBÒ7vâ†6öÖÖæBÂ&w2Â²FWF6†VC¢G'VRÂ7FF–ó¢v–væ÷&RrÂv–æF÷w4†–FS¢fÇ6RÒ“°¢òòFWF6†VBZÙ‹ù¾zˆ¾izK«®y¹Y
+ÂvW'&÷"rKÉ®XùŽh‰WfVçDVÖ—GFW"iÊ®ZHNyn™IžŠúþy»Nhê^Xè¾Yêà¢òòÖ–âŽX[ŽYè³¦W†—7G57–æ2˜	®‹ø~YâW†RŠ*¾XÛŽ‹ÛÞy¨Nz©~Xú>iÉòž8'7vâ™IžŠúþiŠþ[È.jÚ^y¨BÀ¢òò•2[{.‹ùNY¹âÎXú®ˆ;ÞŠëiz^[ù~XYÎ[©R…"3ƒ3R&Wf–Wrž8 ¢6†–ÆBæöæ6R‚vW'&÷"rÂ†W'"’Óâ°¢7&VFTÆövvW"‚v÷Vâ×v—F‚r’çv&â‚w7vâf–ÆVBrÂ²6öÖÖæBÂÖW76vS¢W'"æÖW76vRÒ“°¢Ò“°¢6†–ÆBçVç&Vb‚“°¢ÒÀ¢Ò“°¢—4Ö–âæ†æFÆR‚v÷Vâ×v—Fƒ¦Æ—7BrÂ†WfVçBÂ&×3¢²f–ÆUFƒ¢7G&–ærÒ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â÷Våv—F‚æÆ—7B‡&×2“°¢Ò“°¢—4Ö–âæ†æFÆR‚v÷Vâ×v—Fƒ¦÷VârÂ†WfVçBÂ&×3¢²f–ÆUFƒ¢7G&–æs²–C¢7G&–ærÒ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â÷Våv—F‚æ÷Vâ‡&×2“°¢Ò“°¢Ð ¢òòZèžXZŽ™˜Þ{ª~™˜NK»n(	ÎXúnZÙŽK‹®(	ÞûÉ®k©ih~K»n[ø^š¾˜	®‹ø~{¹þKˆ‹zþ[èNzÙnyZ^ûÈÎŠz>iéyÉþZéî‹zþ[èNYî‹ùŽŠh¢òòKØÞK¨îˆ®ZJž™˜NK»bþ‹ùÎzˆ¾ih~K»n{É>ZÙŽXh^ûÉ¾[»®ŠêîYÞYÊ‚Ö–âKê~kˆ^kI~ûÈÎZHÞX‹nZèÎh‰YîKˆÞ‹>yJ€¢òò÷VåFŽûÈÎ˜þXXÞzÊnXû~™;îhê^‹h®yXÎh‰nh.ZHÞXéþhšž[^YÞYîŠ*¾ˆz®XªŽhš~ŠÎ8 ¢6öç7B6fT6†DGF6†ÖVçBÒ7&VFT6†DGF6†ÖVçE6fT†æFÆW"‡°¢—5F„ÆÆ÷vVBÀ¢&VÇFƒ¢†f–ÆUF‚’Óâg2ç&öÖ—6W2ç&VÇF‚†f–ÆUF‚’À¢7FC¢†f–ÆUF‚’Óâg2ç&öÖ—6W2ç7FB†f–ÆUF‚Â²&–v–çC¢G'VRÒ’À¢÷Vå6÷W&6S¢7–æ2†f–ÆUF‚’Óâ°¢6öç7BæôföÆÆ÷rÒG—Vöbg2æ6öç7FçG2äõôäôdôÄÄõrÓÓÒvçVÖ&W"ròg2æ6öç7FçG2äõôäôdôÄÄõr¢°¢6öç7B†æFÆRÒv—Bg2ç&öÖ—6W2æ÷Vâ†f–ÆUF‚Âg2æ6öç7FçG2äõõ$DôäÅ’ÂæôföÆÆ÷r“°¢&WGW&â°¢7FC¢‚’Óâ†æFÆRç7FB‡²&–v–çC¢G'VRÒ’À¢6÷•Fó¢7–æ2‡F&vWEF‚’Óâ°¢v—B—VÆ–æR€¢†æFÆRæ7&VFU&VE7G&VÒ‡²WFô6Æ÷6S¢fÇ6RÂ7F'C¢Ò’À¢g2æ7&VFUw&—FU7G&VÒ‡F&vWEF‚’À¢“°¢ÒÀ¢6Æ÷6S¢‚’Óâ†æFÆRæ6Æ÷6R‚’À¢Ó°¢ÒÀ¢6†÷u6fTF–Æös¢7–æ2†÷G2’Óâ°¢6öç7BF&vWEv–âÒvWEv–æF÷r‚’óò'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚“°¢6öç7B&W7VÇBÒF&vWEv–à¢òv—BF–Æörç6†÷u6fTF–Æör‡F&vWEv–âÂ÷G2¢¢v—BF–Æörç6†÷u6fTF–Æör†÷G2“°¢&WGW&â²6æ6VÆVC¢&W7VÇBæ6æ6VÆVBÂf–ÆUFƒ¢&W7VÇBæf–ÆUF‚ÇÂVæFVf–æVBÓ°¢ÒÀ¢vWDF÷væÆöG4F—#¢‚’ÓâævWEF‚‚vF÷væÆöG2r’À¢vWDÆÆ÷vVE6÷W&6U&ö÷G3¢‚’Óâ°¢–ÖvT66†U7F÷&RævWD66†U&ö÷B‚’À¢vWD6†DGF6†ÖVçD66†U&ö÷B‚’À¢vWE&VÖ÷FTf–ÆT66†U&ö÷B‚’À¢ÒÀ¢Ò“°¢6öç7B7FvT6†DGF6†ÖVçBÒ7&VFT6†DGF6†ÖVçE7FvT†æFÆW"‡°¢—5F„ÆÆ÷vVBÀ¢&VÇFƒ¢†f–ÆUF‚’Óâg2ç&öÖ—6W2ç&VÇF‚†f–ÆUF‚’À¢7FC¢†f–ÆUF‚’Óâg2ç&öÖ—6W2ç7FB†f–ÆUF‚Â²&–v–çC¢G'VRÒ’À¢÷Vå6÷W&6S¢7–æ2†f–ÆUF‚’Óâ°¢6öç7BæôföÆÆ÷rÒG—Vöbg2æ6öç7FçG2äõôäôdôÄÄõrÓÓÒvçVÖ&W"ròg2æ6öç7FçG2äõôäôdôÄÄõr¢°¢6öç7B†æFÆRÒv—Bg2ç&öÖ—6W2æ÷Vâ†f–ÆUF‚Âg2æ6öç7FçG2äõõ$DôäÅ’ÂæôföÆÆ÷r“°¢&WGW&â°¢7FC¢‚’Óâ†æFÆRç7FB‡²&–v–çC¢G'VRÒ’À¢6÷•Fó¢7–æ2‡F&vWEF‚’Óâ°¢v—B—VÆ–æR€¢†æFÆRæ7&VFU&VE7G&VÒ‡²WFô6Æ÷6S¢fÇ6RÂ7F'C¢Ò’À¢g2æ7&VFUw&—FU7G&VÒ‡F&vWEF‚Â²fÆw3¢ww‚rÒ’À¢“°¢ÒÀ¢6Æ÷6S¢‚’Óâ†æFÆRæ6Æ÷6R‚’À¢Ó°¢ÒÀ¢7FvT6÷“¢‡&×2’Óâ°¢6öç7B÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢–b‚÷væW$–B’F‡&÷ræWrW'&÷"‚t6ææ÷B7FvRâGF6†ÖVçBv—F†÷WBâ7F—fRFF÷væW"r“°¢&WGW&â7FvTÆö6Äf–ÆUFô66†R‡²ââç&×2Â÷væW$–BÒ“°¢ÒÀ¢Ò“°¢—4Ö–âæ†æFÆR€¢v6†BÖGF6†ÖVçC§7FvRrÀ¢†WfVçBÂ&×3¢²6÷W&6UFƒó¢Væ¶æ÷vã²7VvvW7FVDæÖSó¢Væ¶æ÷vâÒ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7FvT6†DGF6†ÖVçB‡&×2“°¢ÒÀ¢“°¢—4Ö–âæ†æFÆR‚v6†BÖGF6†ÖVçC¦6ÆVçWrÂ7–æ2†WfVçBÂf–ÆUF‡3¢&VFöæÇ’7G&–æuµÒ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‚'&’æ—4'&’†f–ÆUF‡2’’&WGW&ã°¢6öç7B÷væW%66÷T¶W’Ò7F—fT÷væW%66÷T¶W’‚“°¢6öç7B÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢–b‚÷væW$–BÇÂ—46W76–öä&÷VæF'•VæF–ær‚’’&WGW&ã°¢6öç7B—47W'&VçD÷væW"Ò‚’Óà¢7F—fT÷væW%66÷T¶W’‚’ÓÓÒ÷væW%66÷T¶W’bb—46W76–öä&÷VæF'•VæF–ær‚“°¢–b‚—47W'&VçD÷væW"‚’’&WGW&ã°¢v—B6ÆVçW÷væVEVçW'6—7FVE7FvVD6†DGF6†ÖVçG2‡°¢÷væW$–BÀ¢f–ÆUF‡2À¢6å&VÖ÷fS¢—47W'&VçD÷væW"À¢Ò“°¢Ò“°¢—4Ö–âæ†æFÆR€¢v6†BÖGF6†ÖVçC§6fRÖ2rÀ¢†WfVçBÂ&×3¢²6÷W&6UFƒó¢Væ¶æ÷vã²7VvvW7FVDæÖSó¢Væ¶æ÷vâÒ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â6fT6†DGF6†ÖVçB‡&×2“°¢ÒÀ¢“° ¢òò6WGF–æw2(i"&÷WC¢h™>[ÈÇW6W$FFâöÆöw2YÊŽ{;¾{¹þih~K»nzêynYšŽ8 ¢òò‹zþ[èNYÊŽK‹¾‹ù¾zˆ¾kKîyIþûÈ‡&VæFW&W"KˆÞ™ÈŠhK™þKˆÞ[©NŠú^yú^˜2W6W$FFXZŽ‹zþ[èNûÈž8 ¢òòyºî[Ù^KˆÞZÙŽYÊŽi{nXXŽX‰¾[»®ûÈÎ˜þXXÞz›®ZèžŠ8^šinjÊx+žX{¾ZK‹J^8 ¢—4Ö–âæ†æFÆR‚v¦÷VâÖÆöw2ÖF—"rÂ7–æ2‚“¢&öÖ—6SÇ²7V66W73¢&ööÆVã²W'&÷#ó¢7G&–ærÓâÓâ°¢G'’°¢6öç7BÆötF—"ÒF‚æ¦ö–â†ævWEF‚‚wW6W$FFr’ÂvÆöw2r“°¢g2æÖ¶F—%7–æ2†ÆötF—"Â²&V7W'6—fS¢G'VRÒ“°¢6öç7BW'$×6rÒv—B6†VÆÂæ÷VåF‚†ÆötF—"“°¢–b†W'$×6r’&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'$×6rÓ°¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢Ò“° ¢òò6WGF–æw2(i"6–æG’Ö¶S¢÷Vâ6–æG’w2&—fFRÖævVB×FööÂF—&V7F÷'’à¢òòF†RF‚—2FW&—fVB–âÖ–â6òF†R&VæFW&W"6ææ÷B6†ö÷6Râ&&—G&'’föÆFW"à¢—4Ö–âæ†æFÆR‚v¦÷VâÖ6–æG’ÖÖ¶R×FööÇ2ÖF—"rÂ7–æ2†WfVçB“¢&öÖ—6SÇ²7V66W73¢&ööÆVâÓâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â÷VäÖ¶UFööÇ4F—&V7F÷'’†ævWEF‚‚wW6W$FFr’Â°¢÷VåFƒ¢†F—&V7F÷'’’Óâ6†VÆÂæ÷VåF‚†F—&V7F÷'’’À¢Ò“°¢Ò“° ¢6öç7B&VDÆFW7E6÷W&6UfW'6–öâÒ7&VFTÆFW7E6÷W&6UfW'6–öå&VFW"‚‡W&ÂÂ–æ—B’Óà¢æWBæfWF6‚‡W&ÂÂ–æ—B’À¢“°¢6öæf–wW&UW7G&VÔÖW&vR‚†–B’ÓâvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ†–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6R“°¢—4Ö–âæ†æFÆR‚v¦6–æG’ÖÖ¶RÖÖW&vRrÂ7–æ2†WfVçBÂ–çWC¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7EW7G&VÔÖW&vR†–çWB“°¢Ò“°¢—4Ö–âæ†æFÆR‚v¦vWBÖ6–æG’ÖÖ¶R×6÷W&6R×7FGW2rÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7BW6W$FFÒævWEF‚‚wW6W$FFr“°¢6öç7B&ö÷BÒÖ¶U6÷W&6U&ö÷B‡W6W$FF“°¢6öç7B6†ææVÂÒæ—56¶vV@¢òvFWbp¢¢òÖ&WFƒó¥ÂçÂB’ö’çFW7B†ævWEfW'6–öâ‚’¢òv&WFp¢¢w&VÆV6Rs°¢&WGW&â&Vg&W6„6–æG•6÷W&6U7FGW2†6–æG”Ö¶TÖævW"Â°¢&VE7VÖÖ'“¢‚’Óâ&VD7W'&VçD6–æG•6÷W&6U7FGW2‡&ö÷B’À¢&VDÆö6Ã¢7–æ2‚’Óâ°¢ÆWBVçc¢v—FVCÅ&WGW&åG—SÇG—Vöb7&VFTÖ¶UFööÆ6†–äVçf—&öæÖVçCãâÂVæFVf–æVC°¢G'’°¢VçbÒv—B7&VFTÖ¶UFööÆ6†–äVçf—&öæÖVçB‡W6W$FF“°¢Ò6F6‚°¢òòF†RW'6—7FVB7FGW2&VÖ–ç2W6&ÆRv†VâFööÂF—66÷fW'’—2Væf–Æ&ÆRà¢Ð¢&WGW&â&VD7W'&VçD6–æG•6÷W&6U7FGW2‡&ö÷BÂVçb“°¢ÒÀ¢&VDÆFW7C¢‡6÷W&6R’Óâ&VDÆFW7E6÷W&6UfW'6–öâ‡6÷W&6RÂ6†ææVÂ’À¢Ò“°¢Ò“°¢òòk©zXxnZH~iŠþXZŽ[XÙ^Kè³®‹ù¾[ªn[›þi*Þ{¹žh˜iÈžz©~Xú2ÎK»¾hHþz©~Xú>˜;Þˆ;ÞXÎjÚ.Zè>8 ¢7V'67&–&T6–æG•6÷W&6U7FGW2†'&öF67D6–æG”Ö¶U6÷W&6U7FGW2“°¢6–æG”Ö¶TÖævW"ç7V'67&–&R†'&öF67D6–æG”Ö¶U7FFR“°¢6öæf–wW&T6–æG”Ö¶UF6´ÖævVÖVçB‡°¢—4Æ—fS¢†–B’ÓâvWDÖ¶W$–e&VG’‚“òæ—56W76–öäÆ—fR†–B’À¢—5'Vææ–æs¢†–B’ÓâvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ†–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6RÀ¢—5v÷&·76T'W7“¢‡v÷&¶–ætF—"’Óâ6–æG”Ö¶UFW7D6öçG&öÆÆW"æ—5W6–æuv÷&·76R‡v÷&¶–ætF—"’À¢6WE7FGW3¢F6…6W76–öäÖWF–äF"À¢&V7–6ÆS¢&V7–6ÆU6W76–öåv÷&·G&VTf÷%7FGW46†ævRÀ¢Ò“°¢6öæf–wW&T6–æG”Ö¶UFW7E'VçF–ÖR€¢†–B’ÓâvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ†–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6RÀ¢“°¢6öæf–wW&T6–æG”Ö¶TVF—F–ætwV&B‚†–B’Óâ6–æG”Ö¶UFW7D6öçG&öÆÆW"æ—5W6–æu6W76–öâ†–B’“°¢&Vv—7FW$Ö¶U&VÖ÷FU&W6÷W&6W2‚†–B’ÓâvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ†–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6R“°¢6öæf–wW&TÖ¶T†—7F÷'’‚†–B’ÓâvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ†–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6R“°¢—4Ö–âæ†æFÆR‚v¦6–æG’ÖÖ¶RÖ†—7F÷'’rÂ7–æ2†WfVçBÂ6VÆV7FVCó¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b€¢6VÆV7FVBÓÒVæFVf–æVBb`¢‡G—Vöb6VÆV7FVBÓÒw7G&–ærrÇÂõå´Õ¦×£Ó’Õ×³Ã#‡ÒBòçFW7B‡6VÆV7FVB’¢¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂt–çfÆ–B†—7F÷'’6VÆV7F–öâr“°¢G'’°¢&WGW&âv—BvWD6–æG”Ö¶T†—7F÷'’‡6VÆV7FVB27G&–ærÂVæFVf–æVB“°¢Ò6F6‚†W'&÷"’°¢6öç7BFWF–Ç2ÒW'&÷"2²æÖSó¢Væ¶æ÷vã²6öFSó¢Væ¶æ÷vã²ÖW76vSó¢Væ¶æ÷vâÓ°¢6öç7BÖW76vRÐ¢G—VöbFWF–Ç2æÖW76vRÓÓÒw7G&–ærp¢òFWF–Ç2æÖW76vP¢ç&WÆ6R‚õ´Õ¦×¥Ó¥µÅÂõÕµåÇ%Æå×³Ã#C×ÅÅÅÅÅµåÇ%Æå×³Ã#CÒörÂsÇFƒâr¢ç6Æ–6RƒÂ#C¢¢7G&–ær†W'&÷"’ç6Æ–6RƒÂ#C“°¢7&VFTÆövvW"‚v6–æG’ÖÖ¶S¦†—7F÷'’r’çv&â‚v†—7F÷'’&VBf–ÆVBrÂ°¢W'&÷$æÖS¢G—VöbFWF–Ç2ææÖRÓÓÒw7G&–ærròFWF–Ç2ææÖR¢VæFVf–æVBÀ¢W'&÷$6öFS¢G—VöbFWF–Ç2æ6öFRÓÓÒw7G&–ærròFWF–Ç2æ6öFR¢VæFVf–æVBÀ¢W'&÷$ÖW76vS¢ÖW76vRÀ¢Ò“°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂwVæf–Æ&ÆRr“°¢Ð¢Ò“°¢—4Ö–âæ†æFÆR€¢v¦6–æG’ÖÖ¶RÖ†—7F÷'’Ö7F–öârÀ¢7–æ2†WfVçBÂ'Vä–C¢Væ¶æ÷vâÂ7F–öã¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—B7D6–æG”Ö¶T†—7F÷'’‡'Vä–BÂ7F–öâ“°¢Ò6F6‚†W'&÷"’°¢6öç7BÖW76vRÒ†W'&÷"2²ÖW76vSó¢Væ¶æ÷vâÒ’æÖW76vS°¢6öç7B&V6öâÐ¢G—VöbÖW76vRÓÓÒw7G&–ærp¢òõåÅµ$T4ôäD•D”ôåôd”ÄTEÅÕÇ2¢†'W7—ÆF—'G—Æ6öæfÆ–7GÆ6ÆVçWf–ÆVGÆF—&V7F÷'”'W7—ÇVæf–Æ&ÆR’BòæW†V2€¢ÖW76vRÀ¢“òå³Ð¢¢VæFVf–æVC°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂ&V6öâóòwVæf–Æ&ÆRr“°¢Ð¢ÒÀ¢“°¢—4Ö–âæ†æFÆR‚v¦6–æG’ÖÖ¶RÖ†—7F÷'’Ö'V–ÆBrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—BvVæW&FT†—7F÷'•W'6öæÅfW'6–öâ‚“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂwVæf–Æ&ÆRr“°¢Ð¢Ò“°¢æöæ6R‚wv–ÆÂ×V—BrÂ7F÷Ö¶T†—7F÷'”'V–ÆB“°¢—4Ö–âæ†æFÆR‚v¦6–æG’ÖÖ¶RÖ†—7F÷'’Ö6æ6VÂÖ'V–ÆBrÂ7–æ2†WfVçBÂ'V–ÆD–C¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—B6æ6VÄ†—7F÷'•W'6öæÅfW'6–öâ†'V–ÆD–B“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂwVæf–Æ&ÆRr“°¢Ð¢Ò“°¢—4Ö–âæ†æFÆR‚v¦6–æG’ÖÖ¶RÖ†—7F÷'’Ö÷VâÖ'V–ÆBrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢v—B÷Vä†—7F÷'•W'6öæÄ'V–ÆB‚“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂwVæf–Æ&ÆRr“°¢Ð¢Ò“°¢6öæf–wW&T6–æG•fW'6–öç2€¢‚’Óâ6–æG”Ö¶UFW7D6öçG&öÆÆW"æ†47F—fT¦ö'2‚’ÇÂ6–æG”Ö¶TÖævW"æ†47F—fUv÷&²‚’À¢“°¢—4Ö–âæ†æFÆR‚v¦6–æG’×fW'6–öç2×7FFRrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—BvWD6–æG•fW'6–öç2‚“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂwVæf–Æ&ÆRr“°¢Ð¢Ò“°¢—4Ö–âæ†æFÆR‚v¦6–æG’×fW'6–öç2Ö7F–öârÂ7–æ2†WfVçBÂ7F–öã¢Væ¶æ÷vâÂ–C¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7D6–æG•fW'6–öâ†7F–öâÂ–B“°¢Ò“°¢æöæ6R‚wv–ÆÂ×V—BrÂ‚’Óâ6–æG”Ö¶UFW7D6öçG&öÆÆW"ç7F÷ÆÂ‚’“°¢—4Ö–âæ†æFÆR€¢v¦6–æG’ÖÖ¶R×FW7BrÀ¢7–æ2†WfVçBÂ6W76–öä–C¢Væ¶æ÷vâÂ6ö×ÆWF–öä–C¢Væ¶æ÷vâÂ7F–öã¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7D6–æG”Ö¶UFW7B‡6W76–öä–BÂ6ö×ÆWF–öä–BÂ7F–öâ“°¢ÒÀ¢“°¢6–æG”Ö¶TÖævW"ç6WE&ö¦V7D'W7•&ö&R€¢‡&ö÷B’Óà¢vWDÖ¶W$–e&VG’‚¢òæÆ—7D7F—fU6W76–öç2‚¢ç6öÖR‚‡6W76–öâ’Óâ°¢&WGW&â€¢6W76–öâæ—5GW&å'Vææ–ær‚’b`¢&ö÷BÓÓÒÖ¶U6÷W&6U&ö÷B†ævWEF‚‚wW6W$FFr’’b`¢—46–æG”Ö¶TÖævVEv÷&·G&VUF‚†ævWEF‚‚wW6W$FFr’Â6W76–öâçv÷&´F—"¢“°¢Ò’óòfÇ6RÀ¢“°¢—4Ö–âæ†æFÆR‚v¦vWBÖ6–æG’ÖÖ¶R×7FFRrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&Vg&W6…W7G&VÔÖW&vU&ö¦V7F–öâ‚“°¢G'’°¢v—B&W7F÷&T6–æG”Ö¶UF6µ7FFR‚“°¢f÷"†6öç7B·'Vä–BÂ&W÷'EÒöbö&¦V7BæVçG&–W2†6–æG”Ö¶TÖævW"ævWE7FFR‚’çF6·2óò·Ò’’°¢–b‡&W÷'BçF6²¢6–æG”Ö¶TÖævW"ç&ö¦V7EF6µ6W76–öâ‡'Vä–BÂ°¢W†V7WF–æs ¢vWDÖ¶W$–e&VG’‚“òævWE6W76–öâ‡&W÷'BçF6²ç6W76–öä–B“òæ—5GW&å'Vææ–ær‚’óòfÇ6RÀ¢Ò“°¢Ð¢fö–B&Vg&W6„6–æG”Ö¶UF6´–çFVw&F–öâ‚“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂt6÷VÆBæ÷B&W7F÷&R6–æG’Ö¶R&W&F–öâ7FFRr“°¢Ð¢&WGW&â6–æG”Ö¶TÖævW"ævWE7FFR‚“°¢Ò“°¢—4Ö–âæ†æFÆR€¢v¦ÖævRÖ6–æG’ÖÖ¶R×F6²rÀ¢7–æ2†WfVçBÂ6W76–öä–C¢Væ¶æ÷vâÂ7F–öã¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢v—BÖævT6–æG”Ö¶UF6²‡6W76–öä–BÂ7F–öâ’æ6F6‚‚†W'&÷"’Óâ°¢–b†W'&÷"–ç7Fæ6VöbW'&÷"bbW'&÷"æÖW76vRç7F'G5v—F‚‚u²r’’F‡&÷rW'&÷#°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂv6ÆVçWf–ÆVBr“°¢Ò“°¢ÒÀ¢“°¢—4Ö–âæ†æFÆR‚v¦6æ6VÂÖ6–æG’ÖÖ¶R×6÷W&6RrÂ7–æ2†WfVçB“¢&öÖ—6SÇ²7V66W73¢&ööÆVâÓâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â²7V66W73¢6æ6VÄ6–æG•6÷W&6U&W&F–öâ‚’Ó°¢Ò“° ¢—4Ö–âæ†æFÆR‚v¦÷VâÖ6–æG’ÖÖ¶R×6÷W&6RÖF—"rÂ7–æ2†WfVçB“¢&öÖ—6SÇ²7V66W73¢&ööÆVâÓâÓâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â÷VäÖ¶U6÷W&6TF—&V7F÷'’†ævWEF‚‚wW6W$FFr’Â°¢÷VåFƒ¢†F—&V7F÷'’’Óâ6†VÆÂæ÷VåF‚†F—&V7F÷'’’À¢Ò“°¢Ò“° ¢òòKŠ®K«®x˜ŽX‹nKÙÎK»¾Xªy¨NxºÎz¸¾[ÈXùyºî[ÙS®XXŽK¸îKŠ®K«®x˜ŽYû®{«þ[»®K»¾XªXˆniJò²v÷&·G&V^8 ¢òòXú®ŠêB'Vä–B[Ú.x«c¾‹zþ[èNXZŽ˜:ŽyKÖ–âK¸âW6W$FFkKîyIòÇ&VæFW&W"Xú®h»þY¹î{¹>iéÎ8 ¢—4Ö–âæ†æFÆR‚v§7F'BÖ6–æG’ÖÖ¶R×F6²rÂ7–æ2†WfVçBÂ–çWC¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7F'D6–æG”Ö¶UF6²†–çWBÂWfVçBç6VæFW"æ–B’æ6F6‚‚†W'&÷"’Óâ°¢–b†W'&÷"–ç7Fæ6VöbW'&÷"bbW'&÷"æÖW76vRç7F'G5v—F‚‚u²r’’F‡&÷rW'&÷#°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂt6÷VÆBæ÷B7F'B6–æG’Ö¶R&W&F–öâr“°¢Ò“°¢Ò“°¢—4Ö–âæ†æFÆR‚v¦6æ6VÂÖ6–æG’ÖÖ¶R×F6²rÂ7–æ2†WfVçBÂ'Vä–C¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‡G—Vöb'Vä–BÓÒw7G&–ærrÇÂ4”äE•ôÔ´Uõ%Tåô”EõEDU$âçFW7B‡'Vä–B’¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂt–çfÆ–B6–æG’Ö¶R'Vâr“°¢&WGW&â²7V66W73¢6–æG”Ö¶TÖævW"æ6æ6VÂ‡'Vä–BÂWfVçBç6VæFW"æ–B’ÓÓÒv6æ6VÆÆVBrÓ°¢Ò“°¢—4Ö–âæ†æFÆR‚v§&W&RÖ6–æG’ÖÖ¶R×v÷&·76RrÂ7–æ2†WfVçBÂ'Vä–C¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢–b‡G—Vöb'Vä–BÓÒw7G&–ærrÇÂ4”äE•ôÔ´Uõ%Tåô”EõEDU$âçFW7B‡'Vä–B’¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂt–çfÆ–B6–æG’Ö¶R'Vâr“°¢6öç7BW6W$FFÒævWEF‚‚wW6W$FFr“°¢G'’°¢&WGW&âv—B6–æG”Ö¶TÖævW"çv—F…&ö¦V7B†Ö¶U6÷W&6U&ö÷B‡W6W$FF’Â7–æ2‚’Óâ°¢6öç7B6–væÂÒ&÷'E6–væÂçF–ÖV÷WBƒ#¢có“°¢6öç7BVçbÒv—B7&VFTÖ¶UFööÆ6†–äVçf—&öæÖVçB‡W6W$FF“°¢6öç7B&ö6W74Vçf—&öæÖVçBÒv—B&W6öÇfTÖ¶UFööÄVçf—&öæÖVçB€¢VçbÀ¢²vv—BrÂvæöFRrÂwçÒrÂw—F†öâuÒÀ¢6–væÂÀ¢“°¢&WGW&â&W&T6–æG”Ö¶Uv÷&·76R‡W6W$FFÂ'Vä–BÂ6–væÂÂ²&ö6W74Vçf—&öæÖVçBÒ“°¢Ò“°¢Ò6F6‚°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂt6–æG’Ö¶Rv÷&·76R&W&F–öâf–ÆVBr“°¢Ð¢Ò“° ¢òòÆö6ÂW‡÷'B'—FW27F’–âÖVÖ÷'“²æWfW"&÷WFRF†—2Fò&VÖ÷FR†÷7Bà¢—4Ö–âæ†æFÆR„4õ•õäuõDõô4Ä•$ô$Eô4„ääTÂÂ†WfVçBÂ&×2’Óà¢6÷•æuFô6Æ—&ö&B†WfVçBÂ&×2Â°¢76W'EG'W7FVE6VæFW#¢76W'EG'W7FVD&VæFW&W$WfVçBÀ¢FV6öFS¢†'—FW2’ÓâæF—fT–ÖvRæ7&VFTg&öÔ'VffW"†'—FW2’À¢w&—FS¢†FF’Óâ6Æ—&ö&Bçw&—FR†FF’À¢Ò’À¢“° ¢òò)H)HæF—fR6Æ—&ö&B†VÇW'2†ÖVF–¦6÷’×FòÖ6Æ—&ö&B’)H)H ¢òð¢òòVÆV7G&öâw26Æ—&ö&Bçw&—FT–ÖvVw&—FW2&r&—FÖFF(	B7F&ÆR–à¢òò–ÖvR2'WBäõB–âW‡Æ÷&W"òf–æFW"Âv†–6‚W‡V7Bf–ÆRÖÆ—7@¢òòf÷&ÖB„4eô„E$õöâv–æF÷w2Âå57FV&ö&EG—Tf–ÆUU$ÂöâÖ4õ2’âvP¢òò6†VÆÂ÷WBFòF†Rõ26Æ—&ö&B†VÇW'2FòvWB&VÂ&6÷’öbf–ÆR ¢òòF†B7FRÖ–çFòÖföÆFW"66WG2â7vâ†æò6†VÆÂ’—2W6VBFò¶VWF†P¢òòF‚&wVÖVçB÷WBöbç’6†VÆÂ×V÷FR–çFW'&WFF–öâà ¢ò¢¢v–æF÷w3¢÷vW%6†VÆÂ6WBÔ6Æ—&ö&BÔÆ—FW&ÅF†w&—FW24eô„E$õâ¢ð¢gVæ7F–öâ6÷”f–ÆUFô6Æ—&ö&Ev–æF÷w2†'5Fƒ¢7G&–ær“¢&öÖ—6SÇfö–Câ°¢&WGW&âæWr&öÖ—6R‚‡&W6öÇfRÂ&V¦V7B’Óâ°¢òò6–ævÆR×V÷FVB27G&–ær—2Æ—FW&ÂW†6WBf÷"v—G6VÆc²F÷V&ÆR—@¢òòFòW66RâF‚6â6öçF–â76W2ÂFÂ&6·F–6·2ÂWF2â(	BÆÂ6fP¢òò–ç6–FR6–ævÆRV÷FW2à¢6öç7BW66VBÒ'5F‚ç&WÆ6R‚òrörÂ"rr"“°¢6öç7B46öÖÖæBÒ6WBÔ6Æ—&ö&BÔÆ—FW&ÅF‚rG¶W66VGÒv°¢6öç7B&ö2Ò7vâ‚w÷vW'6†VÆÂrÂ²rÔæõ&öf–ÆRrÂrÔæöä–çFW&7F—fRrÂrÔ6öÖÖæBrÂ46öÖÖæEÒÂ°¢v–æF÷w4†–FS¢G'VRÀ¢Ò“°¢ÆWB7FFW'"Òrs°¢&ö2ç7FFW'"æöâ‚vFFrÂ†B’Óâ°¢7FFW'"³ÒBçFõ7G&–ær‚“°¢Ò“°¢&ö2æöâ‚vW'&÷"rÂ&V¦V7B“°¢&ö2æöâ‚vW†—BrÂ†6öFR’Óâ°¢–b†6öFRÓÓÒ’&W6öÇfR‚“°¢VÇ6R&V¦V7B†æWrW'&÷"‡7FFW'"çG&–Ò‚’ÇÂ6WBÔ6Æ—&ö&BW†—FVBG¶6öFWÖ’“°¢Ò“°¢Ò“°¢Ð ¢ò¢ ¢¢Ö4õ3¢ÆU67&—B6WBF†R6Æ—&ö&BFò…õ4•‚f–ÆR(
+b–w&—FW2F†P¢¢å57FV&ö&EG—Tf–ÆUU$Â7FV&ö&BVçG'’âF†RF‚—276VB2à¢¢ÆU67&—B&wbFòfö–B–â×67&—BW66–ærà¢¢ð¢gVæ7F–öâ6÷”f–ÆUFô6Æ—&ö&DÖ4õ2†'5Fƒ¢7G&–ær“¢&öÖ—6SÇfö–Câ°¢&WGW&âæWr&öÖ—6R‚‡&W6öÇfRÂ&V¦V7B’Óâ°¢6öç7B&ö2Ò7vâ‚v÷667&—BrÂ°¢rÖRrÀ¢vöâ'Vâ&wbrÀ¢rÖRrÀ¢w6WBF†R6Æ—&ö&BFò…õ4•‚f–ÆR†—FVÒöb&wb’’rÀ¢rÖRrÀ¢vVæB'VârÀ¢'5F‚À¢Ò“°¢ÆWB7FFW'"Òrs°¢&ö2ç7FFW'"æöâ‚vFFrÂ†B’Óâ°¢7FFW'"³ÒBçFõ7G&–ær‚“°¢Ò“°¢&ö2æöâ‚vW'&÷"rÂ&V¦V7B“°¢&ö2æöâ‚vW†—BrÂ†6öFR’Óâ°¢–b†6öFRÓÓÒ’&W6öÇfR‚“°¢VÇ6R&V¦V7B†æWrW'&÷"‡7FFW'"çG&–Ò‚’ÇÂ÷667&—BW†—FVBG¶6öFWÖ’“°¢Ò“°¢Ò“°¢Ð ¢òò&–v‡BÖ6Æ–6²(i"&÷Vâf–ÆRföÆFW""â66WG2†GBÖ–ÖvS¢òòò†GB×f–FVó¢òòU$Ç0¢òò‡&W6öÇfVBf–F†RÖF6†–ær66†R7F÷&R’÷"â'6öÇWFRf–ÆRF‚âöà¢òò7V66W72Â&WfVÇ2F†Rf–ÆR–âF†Rõ2f–ÆRÖævW"„W‡Æ÷&W"òf–æFW"’à¢—4Ö–âæ†æFÆR€¢w6†VÆÃ§6†÷rÖ—FVÒÖ–âÖföÆFW"rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²W&Ãó¢7G&–æs²f–ÆUFƒó¢7G&–ærÒÀ¢“¢&öÖ—6SÇ²7V66W73¢&ööÆVã²W'&÷#ó¢7G&–ærÓâÓâ°¢G'’°¢ÆWB'5Fƒ¢7G&–ærÂçVÆÂÒçVÆÃ°¢–b‡&×3òçW&Ãòç7F'G5v—F‚‚w†GBÖ–ÖvS¢òòr’’°¢G'’°¢'5F‚Ò–ÖvT66†U7F÷&Rç&W6öÇfU6fR‡&×2çW&Â’æ'5Fƒ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òçW&Ãòç7F'G5v—F‚‚w†GB×f–FVó¢òòr’’°¢G'’°¢'5F‚Òf–FVô66†U7F÷&Rç&W6öÇfU6fR‡&×2çW&Â’æ'5Fƒ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òçW&Ãòç7F'G5v—F‚‚v6–æG’ÖÖVF–¢òòr’’°¢òòZ©.KÙ>h¾K¹2&Æö"ŽhHþŠønKª~xšžzØ’“®Kˆâ†GBÖ–ÖvRYÎK‹®iÊÎiË®{É>ZÙ‚Î‹[h¾K¹>Šz>ié8 ¢G'’°¢'5F‚Ò6–æG”ÖVF–&Æö%7F÷&Rç&W6öÇfU6fR‡&×2çW&Â’æ'5Fƒ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òæf–ÆUF‚bbF‚æ—4'6öÇWFR‡&×2æf–ÆUF‚’’°¢'5F‚Ò&×2æf–ÆUFƒ°¢Ð¢–b‚'5F‚’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢wW&Âh‰bf–ÆUF‚[ø^š¾K¨Î˜žKˆrÓ°¢Ð¢òòv–æF÷w2W‡Æ÷&W"÷6VÆV7BKˆÞŠêNjÚ>iiÎiÚ‹zþ[èB‡6†÷t—FVÔ–äföÆFW"KÉ®™Ùž›¹ŽizXøÞ[©B’À¢òò[Ù.Kˆh‰iÊÎiË®Xˆn™©NzÊcµõ4•‚[˜.zØž8 ¢'5F‚ÒF‚ææ÷&ÖÆ—¦R†'5F‚“°¢–b‚—5F„ÆÆ÷vVB†'5F‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÓ°¢Ð¢–b‚g2æW†—7G57–æ2†'5F‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~ih~K»nKˆÞZÙŽYÊ‚rÓ°¢Ð¢6†VÆÂç6†÷t—FVÔ–äföÆFW"†'5F‚“°¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒÀ¢“° ¢òò&–v‡BÖ6Æ–6²(i"&6÷’–ÖvRòf–FVò"â&W6öÇfW2F†RU$Â‡†GBÖ–ÖvS¢òò÷ ¢òò†GB×f–FVó¢òò’÷"'6öÇWFRF‚Fòf–ÆRæBw&—FW2—BFòF†R7—7FVÐ¢òò6Æ—&ö&B2d”ÄR$TdU$Tä4R(	Bæ÷B&r'—FW2âF†RW6W"6âF†Vâ7FP¢òò—B–çFòW‡Æ÷&W"òf–æFW"Â6†B2Âf–FVòVF—F÷'2ÂWF2à¢òòÖ—'&÷'2F†RU$ÂÖ÷"Ö'6öÇWFR×F‚6öçG&7Böb6†VÆÃ§6†÷rÖ—FVÒÖ–âÖföÆFW&à¢—4Ö–âæ†æFÆR€¢vÖVF–¦6÷’×FòÖ6Æ—&ö&BrÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²W&Ãó¢7G&–æs²f–ÆUFƒó¢7G&–ærÒÀ¢“¢&öÖ—6SÇ²7V66W73¢&ööÆVã²W'&÷#ó¢7G&–ærÓâÓâ°¢G'’°¢ÆWB'5Fƒ¢7G&–ærÂçVÆÂÒçVÆÃ°¢ÆWB¶–æC¢v–ÖvRrÂwf–FVòrÂwVæ¶æ÷vârÒwVæ¶æ÷vâs°¢–b‡&×3òçW&Ãòç7F'G5v—F‚‚w†GBÖ–ÖvS¢òòr’’°¢G'’°¢'5F‚Ò–ÖvT66†U7F÷&Rç&W6öÇfU6fR‡&×2çW&Â’æ'5Fƒ°¢¶–æBÒv–ÖvRs°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òçW&Ãòç7F'G5v—F‚‚w†GB×f–FVó¢òòr’’°¢G'’°¢'5F‚Òf–FVô66†U7F÷&Rç&W6öÇfU6fR‡&×2çW&Â’æ'5Fƒ°¢¶–æBÒwf–FVòs°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òçW&Ãòç7F'G5v—F‚‚v6–æG’ÖÖVF–¢òòr’’°¢òòZ©.KÙ>h¾K¹2&Æö#¦¶–æBhÈž‰Þy¹‚Ö–ÖRZé¢ŽY»âþŠxnš)X[yJŽYÎKˆXØþŠêâž8 ¢G'’°¢6öç7B&W6öÇfVBÒ6–æG”ÖVF–&Æö%7F÷&Rç&W6öÇfU6fR‡&×2çW&Â“°¢'5F‚Ò&W6öÇfVBæ'5Fƒ°¢¶–æBÒ&W6öÇfVBæÖ–ÖUG—Rç7F'G5v—F‚‚wf–FVòòr’òwf–FVòr¢v–ÖvRs°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒVÇ6R–b‡&×3òæf–ÆUF‚bbF‚æ—4'6öÇWFR‡&×2æf–ÆUF‚’’°¢'5F‚Ò&×2æf–ÆUFƒ°¢Ð¢–b‚'5F‚’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢wW&Âh‰bf–ÆUF‚[ø^š¾K¨Î˜žKˆrÓ°¢Ð¢–b‚—5F„ÆÆ÷vVB†'5F‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~KˆÞXXŠëŽŠëþ™zîŠú^‹zþ[èBrÓ°¢Ð¢–b‚g2æW†—7G57–æ2†'5F‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~ih~K»nKˆÞZÙŽYÊ‚rÓ°¢Ð¢òò6÷’2d”ÄR6òF†RW6W"6â7FR—B–çFòW‡Æ÷&W"òf–æFW ¢òò†æB–ÖvRòf–FVò2v–ÆÂ7F–ÆÂ66WBF†Rf–ÆR’âVÆV7G&öâw0¢òò7FæF&B6Æ—&ö&B’öæÇ’7W÷'G2–ÖvR&—FÖ2(	BF†B7FW0¢òò–çFò6†BòFö72'WBW‡Æ÷&W"–væ÷&W2—BÂæBF†W&R—2æòf–FVð¢òòWV—fÆVçBBÆÂâvR6†VÆÂ÷WBFòF†Rõ2ÖæF—fR6Æ—&ö&B†VÇW'0¢òòFòw&—FRF†Rf–ÆRÖÆ—7Bf÷&ÖC ¢òòÒv–æF÷w2(i"÷vW%6†VÆÂ6WBÔ6Æ—&ö&BÔÆ—FW&ÅF€¢òòÒÖ4õ2(i"÷667&—B6WBF†R6Æ—&ö&BFò…õ4•‚f–ÆRâââ¢òòÒÆ–çW‚(i"–ÖvS¢fÆÂ&6²FòæF—fT–ÖvR&—FÖà¢òòf–FVó¢æ÷B7W÷'FVB†æò÷'F&ÆRf–ÆRÖÆ—7Bf÷&Ö@¢òò7&÷72DW2v—F†÷WB†6Æ—÷vÂÖ6÷’&RÖ–ç7FÆÆVB’à¢G'’°¢–b‡&ö6W72çÆFf÷&ÒÓÓÒwv–ã3"r’°¢v—B6÷”f–ÆUFô6Æ—&ö&Ev–æF÷w2†'5F‚“°¢ÒVÇ6R–b‡&ö6W72çÆFf÷&ÒÓÓÒvF'v–âr’°¢v—B6÷”f–ÆUFô6Æ—&ö&DÖ4õ2†'5F‚“°¢ÒVÇ6R–b†¶–æBÓÓÒv–ÖvRrÇÂ¶–æBÓÓÒwVæ¶æ÷vâr’°¢6öç7B–ÖvRÒæF—fT–ÖvRæ7&VFTg&öÕF‚†'5F‚“°¢–b†–ÖvRæ—4V×G’‚’’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~izk9^Šû¾XùnY»îx˜~i[hÚârÓ°¢Ð¢6Æ—&ö&Bçw&—FT–ÖvR†–ÖvR“°¢ÒVÇ6R°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢~[Ù>X˜Þ[›>Xûi¨.KˆÞiJþhÈZHÞX‹nŠxnš)ih~K»brÓ°¢Ð¢Ò6F6‚†W'"’°¢&WGW&â°¢7V66W73¢fÇ6RÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ó°¢Ð¢&WGW&â²7V66W73¢G'VRÓ°¢Ò6F6‚†W'"’°¢&WGW&â²7V66W73¢fÇ6RÂW'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’Ó°¢Ð¢ÒÀ¢“° ¢òò)H)HY»îx˜rÆ–v‡F&÷‚Z©.KÙ>XªŽKÙÂŽyJŽ›¹ŽŠêN[©NyJŽh™>[ÈòXúnZÙŽK‹¢òXù˜X‹ZûžŠùÒž)H)H ¢òòK‰®XªKÙ>YÊ‚Æ–v‡F&÷„ÖVF–7F–öç2çG2ŽKéÞ‹Ynk:ŽXZRÎXÙ^kX¾yJŽXh^ZÙ‚f¶Ry»Nhê^‹2†æFÆW ¢òò&öG’’Î‹ùž˜xÎXú®X¢VÆV7G&öâhê^{«þ8 ¢°¢òò‹ùÎzˆ¾Y»î8ÎyJŽ›¹ŽŠêN[©NyJŽh™>[È8Þy¨NK‹Ni{n‰ÞK»niKîK‰>yJŽZÙyºî[ÙS®ih~K»nYÞhÈ’U$ÂY8Ž[ˆÎz‹>Zé ¢òòŽ˜xÞ[ÈŠhny¹bÎZ)î™[þiÈžyXÂ’Î˜X{®i{ni[Nyºî[Ù^kˆ^hš¾XYÎ[©^8.ZIn˜:Ž[©NyJŽXúþˆ;ÞK¸ÞXÚyJŽih~K»`¢òòŽ[
+NX[bv–æF÷w2ih~K»n™H’Ç&ÒZK‹J^™Ùž›¹Ž[ûÞyZ^(	N(	NYÎYÞŠhny¹b²Kˆ¾jÊ˜X{®kˆ^hš¾KÉ ¢òò{º~{ºÞiKniY¾8 ¢6öç7B&VÖ÷FT–ÖvW5F×F—"ÒF‚æ¦ö–â†ævWEF‚‚wFV×r’Âw†GBÖÖ¶W"×&VÖ÷FRÖ–ÖvW2r“°¢æöâ‚wv–ÆÂ×V—BrÂ‚’Óâ°¢G'’°¢g2ç&Õ7–æ2‡&VÖ÷FT–ÖvW5F×F—"Â²&V7W'6—fS¢G'VRÂf÷&6S¢G'VRÒ“°¢Ò6F6‚°¢òòih~K»nŠ*¾ZIn˜:Ž[©NyJŽXÚyJŽzØ“®yYž{¹žKˆ¾jÊŠhny¹bþkˆ^hš¾8 ¢Ð¢Ò“° ¢6öç7BÆ–v‡F&÷„ÖVF–Ò7&VFTÆ–v‡F&÷„ÖVF–†æFÆW'2‡°¢—5F„ÆÆ÷vVBÀ¢&W6öÇfT–ÖvT66†UW&Ã¢‡W&Â’Óà¢W&Âç7F'G5v—F‚‚v6–æG’ÖÖVF–¢òòr¢ò6–æG”ÖVF–&Æö%7F÷&Rç&W6öÇfU6fR‡W&Â¢¢–ÖvT66†U7F÷&Rç&W6öÇfU6fR‡W&Â’À¢òòŠxNX‰’#S¦Æ–v‡F&÷Ž8ÎXù˜X‹ZûžŠùÞ8Þy¨N{É>ZÙŽXižYÎj~‹ù¾Z©.KÙ>h¾K¹2ŽˆØžz‹þŠúÞK˜’À¢òòXù˜i{n{¹þKˆyK&Vv—7FW"çG2hÈ.[É^yJ‚’ÎKˆâ•2g&öÒ×F‚ög&öÒÖ'VffW"Kˆˆ{N8 ¢66†T–ÖvTg&öÕFƒ¢‡&×2’Óà¢6–æG”6†DGF6†ÖVçG2æ–ævW7D6†D–ÖvTg&öÕF‚‡°¢6÷W&6UFƒ¢&×2ç6÷W&6UF‚À¢÷&–v–æÄæÖS¢&×2æ÷&–v–æÄæÖRÀ¢Ò’À¢66†T–ÖvTg&öÔ'VffW#¢‡&×2’Óà¢6–æG”6†DGF6†ÖVçG2æ–ævW7D6†D–ÖvT'VffW"‡°¢'VffW#¢&×2æ'VffW"À¢Ö–ÖUG—S¢&×2æÖ–ÖUG—RÀ¢Ò’À¢6†÷u6fTF–Æös¢7–æ2†÷G2’Óâ°¢6öç7BF&vWEv–âÒvWEv–æF÷r‚’óò'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚“°¢6öç7B&W7VÇBÒF&vWEv–à¢òv—BF–Æörç6†÷u6fTF–Æör‡F&vWEv–âÂ÷G2¢¢v—BF–Æörç6†÷u6fTF–Æör†÷G2“°¢&WGW&â²6æ6VÆVC¢&W7VÇBæ6æ6VÆVBÂf–ÆUFƒ¢&W7VÇBæf–ÆUF‚ÇÂVæFVf–æVBÓ°¢ÒÀ¢÷VåFƒ¢†'5F‚’Óâ6†VÆÂæ÷VåF‚†'5F‚’À¢òòæWBæfWF6‚‹[6‡&öÖ—VÒ{Ù{¹Îj‚Ž{º~h›þKº>ynŠëî{Úâ“³32‹h^i{b²ZJ~[þKˆ®™™™‹.[ê8 ¢òò™™kX[ø^š²¢®‹ëžŠû¾‹ëžj8¢¢†6öÆÆV7E7G&VÕv—F„Æ–Ö—B“®izò‹îhªR6öçFVçBÔÆVæwF€¢òòy¨NY8Þ[©Nˆº^XX‚'&”'VffW"XhÞj8iúRÎKÉ®YÊŽj8iú^X˜ÞY>kºÖ–â‹ù¾zˆ¾Xh^ZÙ‚‡&Wf–Wrž8 ¢fWF6…&VÖ÷FT–ÖvS¢7–æ2‡W&Â’Óâ°¢6öç7B6öçG&öÆÆW"ÒæWr&÷'D6öçG&öÆÆW"‚“°¢6öç7BF–ÖW"Ò6WEF–ÖV÷WB‚‚’Óâ6öçG&öÆÆW"æ&÷'B‚’Â3ó“°¢G'’°¢6öç7B&W7öç6RÒv—BæWBæfWF6‚‡W&ÂÂ²6–væÃ¢6öçG&öÆÆW"ç6–væÂÒ“°¢–b‚&W7öç6Ræö²’F‡&÷ræWrW'&÷"†…EEG·&W7öç6Rç7FGW7Ö“°¢6öç7B6öçFVçDÆVæwF‚ÒçVÖ&W"‡&W7öç6Ræ†VFW'2ævWB‚v6öçFVçBÖÆVæwF‚r’óòsr“°¢–b†6öçFVçDÆVæwF‚â$TÔõDUô”ÔtUôÔ…ô%•DU2’F‡&÷ræWrW'&÷"‚~Y»îx˜~‹ø~ZJrÎizk9^Kˆ¾‹ÛÒr“°¢–b‚&W7öç6Ræ&öG’’F‡&÷ræWrW'&÷"‚vV×G’&W7öç6R&öG’r“°¢ÆWB'VffW#¢'VffW#°¢G'’°¢'VffW"Òv—B6öÆÆV7E7G&VÕv—F„Æ–Ö—B€¢&W7öç6Ræ&öG’ævWE&VFW"‚’À¢$TÔõDUô”ÔtUôÔ…ô%•DU2À¢“°¢Ò6F6‚†W'"’°¢6öçG&öÆÆW"æ&÷'B‚“°¢F‡&÷rW'#°¢Ð¢6öç7B&t6öçFVçEG—RÒ&W7öç6Ræ†VFW'2ævWB‚v6öçFVçB×G—Rr“òç7Æ—B‚s²r•³ÓòçG&–Ò‚“°¢&WGW&â°¢'VffW"À¢Ö–ÖUG—S¢&t6öçFVçEG—Sòç7F'G5v—F‚‚v–ÖvRòr’ò&t6öçFVçEG—R¢VæFVf–æVBÀ¢Ó°¢Òf–æÆÇ’°¢6ÆV%F–ÖV÷WB‡F–ÖW"“°¢Ð¢ÒÀ¢fWF6…&VÖ÷FTÖVF––ÖvS¢‡W&Â’ÓâfWF6…&VÖ÷FTÖVF––ÖvT'—FW2‡W&Â’À¢vWEFV×F—#¢‚’Óâ°¢g2æÖ¶F—%7–æ2‡&VÖ÷FT–ÖvW5F×F—"Â²&V7W'6—fS¢G'VRÒ“°¢&WGW&â&VÖ÷FT–ÖvW5F×F—#°¢ÒÀ¢f–ÆTW†—7G3¢†'5F‚’Óâg2æW†—7G57–æ2†'5F‚’À¢7FE6—¦S¢7–æ2†'5F‚’Óâ†v—Bg2ç&öÖ—6W2ç7FB†'5F‚’’ç6—¦RÀ¢6÷”f–ÆS¢‡7&2ÂFW7B’Óâg2ç&öÖ—6W2æ6÷”f–ÆR‡7&2ÂFW7B’À¢w&—FTf–ÆS¢†FW7BÂFF’Óâg2ç&öÖ—6W2çw&—FTf–ÆR†FW7BÂFF’À¢&VDf–ÆS¢†'5F‚’Óâg2ç&öÖ—6W2ç&VDf–ÆR†'5F‚’À¢vWDF÷væÆöG4F—#¢‚’ÓâævWEF‚‚vF÷væÆöG2r’À¢æ÷s¢‚’ÓâFFRææ÷r‚’À¢Ò“° ¢—4Ö–âæ†æFÆR‚vÖVF–¦÷Vâ×v—F‚ÖFVfVÇBÖrÂ…öWfVçBÂ&×3¢²W&Ã¢7G&–ærÒ’Óà¢Æ–v‡F&÷„ÖVF–æ÷Våv—F„FVfVÇD‡&×2’À¢“°¢—4Ö–âæ†æFÆR‚vÖVF–§6fRÖ2rÂ…öWfVçBÂ&×3¢²W&Ã¢7G&–ærÒ’Óà¢Æ–v‡F&÷„ÖVF–ç6fT2‡&×2’À¢“°¢—4Ö–âæ†æFÆR€¢vÖVF–¦66†RÖf÷"×6W76–öârÀ¢…öWfVçBÂ&×3¢²W&Ã¢7G&–æs²6W76–öä–C¢7G&–ærÒ’ÓâÆ–v‡F&÷„ÖVF–æ66†Tf÷%6W76–öâ‡&×2’À¢“°¢—4Ö–âæ†æFÆR‚vÖVF–§&VBÖ–ÖvRÖ'—FW2rÂ…öWfVçBÂ&×3¢²W&Ã¢7G&–ærÒ’Óà¢Æ–v‡F&÷„ÖVF–ç&VD–ÖvT'—FW2‡&×2’À¢“°¢Ð ¢òò™˜NK»nXÚ{ÊžyZ^Y»ã®{;¾{¹þ{ÊžyZ^Y»îiÈÞXª†Ö4õ2V–6´Æöö²òv–æF÷w26†VÆÂžhÈž‹zþ[èNX{®[þš(NŠxŽ8 ¢òòš¹ŽiØ>™™XZ^Xú>(	N(	NXXŽ‹ør6VæFW"™{‚ÎXhÞyK&VDf–ÆUF‡VÖ&æ–ÂX®‹zþ[èNzÙnyZ^Kˆâ–ÆöBj
+š¨Ã°¢òòK»¾KÙ^ZK‹J^˜;ÞY¹âçVÆÂÎyK&VæFW&W"Y¹î‰ÞX‹ˆz®{¹Žih~K»nY»îj~8 ¢—4Ö–âæ†æFÆR€¢vf–ÆS§F‡VÖ&æ–ÂrÀ¢7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²Fƒ¢7G&–æs²6—¦S¢çVÖ&W#²&WfÆ–FFSó¢&ööÆVâÒÀ¢’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â&VDf–ÆUF‡VÖ&æ–Â‡&×2“°¢ÒÀ¢“° ¢òò)H)H42vVçB4D²•2†æFÆW'2…7FvR"3ZJ~h›ž˜[Û’’)H)H ¢òòˆ62ÖvVçC¢¢†æFÆW"XZŽ˜:Ž˜[Û’(	N(	B&VæFW&W"[{.Xˆ~X‹Ö¶W"â¢„BôRô"ô"rô"rrô3ô3"ž8 ¢òòYNšži
+Î‹øXë¾Y	 ¢òòÒ6VæBÖÖW76vRò7F÷×6W76–öâò6Æ÷6R×6W76–öâòWFFR×W&Ö—76–öâÖÖöFRð¢òò6WBÖÖöFVÂò6WBÖVff÷'Bò6WBÖf7BÖÖöFRò6WB×F†–æ¶–ær×7VÖÖ&–W2ð¢òòvWBÖ6öçFW‡B×W6vRò6WB×6W76–öâ×f—6–&–Æ—G’òW&Ö—76–öâ×&W7öç6Rð¢òòç7vW"×W6W"×VW7F–öâòÆâ×&Wf–Wr×&W7öç6R(i"Ö¶W"â¢„3¢òòÒvVæW&FR×F—FÆRòÆâÖf–ÆR×w&—FR(i"Ö¶W"Ö—2÷F—FÆRçG2²Æâ×w&—FRçG2„3¢òòÒ&Wv–æC§&Wf–Wrò&Wv–æC¦6öÖÖ—B(i"Ö¶W"Ö—2÷&Wv–æBçG2„3"ÂiÊÎhùKªB ¢òò)H)H–ÖvRÆö6Â66†R•2†æFÆW'2†–ÖvRÖÆö6ÂÖ66†RÓ2’)H)H ¢òòŠxNX‰’#S®{)Ž‹KBþh¹nh»ÞXižXZ^‹[6–æG’ÖÖVF–Z©.KÙ>h¾K¹2Î‹ùNY¹à¢òò6–æG’ÖÖVF–¢òòXh^ZëžZû¾YØYËYØ8.XènXû"G&gBö6öÖÖ—GFVBx«nhiË®yK[É^yJŽŠêi[i»þKº3 ¢òòjÚNZHNXú®Xi’&Æö"KˆÞhÈ.[É^yJ‚ƒÞˆØžz‹ò’ÎXù˜i{b&Vv—7FW"çG2hÈ"6W76–öâÖGF6†ÖVç@¢òò[É^yJ‚ƒÞi˜¾XØrž8'6W76–öä–BXø.i[KùÞyYžX[ÎZë’&VæFW&W"zÛîYÒÎKˆÞXhÞXk>Zé®‰Þy¹ŽKØÞ{Úî8 ¢òòc¢G&rG&÷(i"&Æö"K¹2Ç&WGW&ç26–æG’ÖÖVF–¢òòW&À¢—4Ö–âæ†æFÆR€¢v–ÖvRÖ66†S¦g&öÒ×F‚rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²6W76–öä–C¢7G&–æs²6÷W&6UFƒ¢7G&–æs²÷&–v–æÄæÖS¢7G&–ærÒÀ¢“¢&öÖ—6SÇ²W&Ã¢7G&–æs²f–ÆVæÖS¢7G&–ærÓâÓâ°¢&WGW&â6–æG”6†DGF6†ÖVçG2æ–ævW7D6†D–ÖvTg&öÕF‚‡°¢6÷W&6UFƒ¢&×2ç6÷W&6UF‚À¢÷&–v–æÄæÖS¢&×2æ÷&–v–æÄæÖRÀ¢Ò“°¢ÒÀ¢“° ¢òòc¢6Æ—&ö&B7FR(i"&Æö"K¹2Ç&WGW&ç26–æG’ÖÖVF–¢òòW&À¢—4Ö–âæ†æFÆR€¢v–ÖvRÖ66†S¦g&öÒÖ'VffW"rÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢°¢6W76–öä–C¢7G&–æs°¢'VffW#¢V–çC„'&“°¢Ö–ÖUG—S¢7G&–æs°¢7VvvW7FVDæÖSó¢7G&–æs°¢ÒÀ¢“¢&öÖ—6SÇ²W&Ã¢7G&–æs²f–ÆVæÖS¢7G&–ærÓâÓâ°¢&WGW&â6–æG”6†DGF6†ÖVçG2æ–ævW7D6†D–ÖvT'VffW"‡°¢'VffW#¢&×2æ'VffW"À¢Ö–ÖUG—S¢&×2æÖ–ÖUG—RÀ¢Ò“°¢ÒÀ¢“° ¢òòÆö6Â7F÷&vR6öçG&öÇ2æWfW"66WBf–ÆW7—7FVÒF‚g&öÒF†R&VæFW&W"à¢—4Ö–âæ†æFÆR‚wv÷&·G&VR×&V7–6ÆS¦Æ—7BrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&âÆ—7Ev÷&·G&VU&V7–6ÆU7FGW2‚“°¢Ò“°¢—4Ö–âæ†æFÆR‚wv÷&·G&VR×&V7–6ÆS¦6öçG&öÂrÂ7–æ2†WfVçBÂ–çWC¢Væ¶æ÷vâ’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢v—B6öçG&öÅv÷&·G&VU&V7–6ÆR†–çWB“°¢Ò“° ¢òò)H)HZÙŽX*Žz›®™{NXÚx˜rŽX[>K¨îšR”•3®Z©.KÙ>h¾K¹>Y¹îiKnYš‚²Zûž‹Jn)H)H ¢òòK‰®XªKÙ>YÊ‚6–æG’ÖÖVF–÷7F÷&vT—2çG2ŽKéÞ‹Ynk:ŽXZRÎŠxNX‰’B’Î‹ùž˜xÎXú®X®hê^{«þ8 ¢°¢6öç7Bf—†VDF—&V7F÷'”—4ÆörÒ7&VFTÆövvW"‚vf—†VBÖF—&V7F÷'’Ö—2r“°¢6öç7B'Väf—†VDF—&V7F÷'”—47F–öâÒ7–æ2ÅCâ€¢7F–öäæÖS¢7G&–ærÀ¢7F–öã¢‚’Óâ&öÖ—6SÅCâÀ¢“¢&öÖ—6SÅCâÓâ°¢G'’°¢&WGW&âv—B7F–öâ‚“°¢Ò6F6‚†W'&÷"’°¢–b†—4—4W'&÷"†W'&÷"’’F‡&÷rW'&÷#°¢f—†VDF—&V7F÷'”—4Æörçv&â‚vf—†VBF—&V7F÷'’•27F–öâf–ÆVBrÂ°¢7F–öã¢7F–öäæÖRÀ¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂvf—†VB66†RF—&V7F÷'’7F–öâf–ÆVBr“°¢Ð¢Ó°¢6öç7B÷Väf—†VDF—&V7F÷'’Ò€¢&ö÷DF—#¢7G&–ærÀ¢6ä÷Vã¢‚’Óâ&ööÆVâÒ‚’ÓâG'VRÀ¢“¢&öÖ—6SÆ&ööÆVãâÓà¢÷Vä÷$7&VFTf—†VDF—&V7F÷'’‡&ö÷DF—"Â°¢6ä÷VâÀ¢÷VåFƒ¢†f–ÆUF‚’Óâ6†VÆÂæ÷VåF‚†f–ÆUF‚’À¢Ò“°¢òòF†W6R7F–öç2–çFVçF–öæÆÇ’66WBæò&VæFW&W"F‚âF†Rg&÷¦Vâ†GBÖ–ÖvP¢òò66†R†2æò÷væW"ÖWFFFÂ6ò—G26öæf—&ÖVB6ÆVçWÆ–W2FòF†Rv†öÆP¢òò&öf–ÆRÖÆWfVÂÆVv7’&ö÷Bâ6†BGF6†ÖVçG2&VÖ–â66÷VBFòF†R7F—fP¢òò÷væW"Â'WBÆ—fRG&gG2ÂÖW76vR†—7F÷'’ÂæBF†RÖVF–ÆVFvW"&Ræ÷B&VC ¢òòF†RW‡Æ–6—FÇ’6öæf—&ÖVB66†R—2G&VFVB2F—7÷6&ÆR–âgVÆÂà¢6öç7B6ÆV$f—†VDF—&V7F÷'’Ò7–æ2€¢&ö÷DF—#¢7G&–ærÀ¢6ä6ÆV#¢‚’Óâ&ööÆVâÒ‚’ÓâG'VRÀ¢“¢&öÖ—6SÇfö–CâÓâ°¢–b‚6ä6ÆV"‚’’F‡&÷ræWrW'&÷"‚vf—†VBF—&V7F÷'’÷væW"6†ævVB&Vf÷&R6ÆVçWr“°¢v—Bg2ç&öÖ—6W2ç&Ò‡&ö÷DF—"Â²&V7W'6—fS¢G'VRÂf÷&6S¢G'VRÒ“°¢Ó°¢6öç7B6öæf—&Ôf—†VDF—&V7F÷'”6ÆV"Ò7–æ2€¢WfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢Æ&VÇ3¢²F—FÆS¢7G&–æs²ÖW76vS¢7G&–æs²6öæf—&Ô'WGFöã¢7G&–ærÒÀ¢“¢&öÖ—6SÆ&ööÆVãâÓâ°¢6öç7B÷væW%v–æF÷rÒ'&÷w6W%v–æF÷ræg&öÕvV$6öçFVçG2†WfVçBç6VæFW"“°¢–b‚÷væW%v–æF÷rÇÂ÷væW%v–æF÷ræ—4FW7G&÷–VB‚’’°¢F‡&÷t—4W'&÷"€¢u$T4ôäD•D”ôåôd”ÄTBrÀ¢vf—†VBF—&V7F÷'’6ÆVçW&WV—&W2Æ—fR÷væW"v–æF÷rrÀ¢“°¢Ð¢6öç7B&W7VÇBÒv—BF–Æörç6†÷tÖW76vT&÷‚†÷væW%v–æF÷rÂ°¢G—S¢wv&æ–ærrÀ¢F—FÆS¢Æ&VÇ2çF—FÆRÀ¢ÖW76vS¢Æ&VÇ2æÖW76vRÀ¢'WGFöç3¢¶Æ&VÇ2æ6öæf—&Ô'WGFöâÂB‚w6WGF–æw2æ&÷WBç7F÷&vRæ6æ6VÄ'WGFöâr•ÒÀ¢FVfVÇD–C¢À¢6æ6VÄ–C¢À¢æôÆ–æ³¢G'VRÀ¢Ò“°¢&WGW&â&W7VÇBç&W7öç6RÓÓÒbb÷væW%v–æF÷ræ—4FW7G&÷–VB‚’bbWfVçBç6VæFW"æ—4FW7G&÷–VB‚“°¢Ó°¢6öç7B6GW&T7F—fT6†DGF6†ÖVçE&ö÷BÒ‚’Óâ°¢6öç7B÷væW%66÷T¶W’Ò7F—fT÷væW%66÷T¶W’‚“°¢6öç7B÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢–b‚÷væW$–BÇÂ—46W76–öä&÷VæF'•VæF–ær‚’’°¢F‡&÷t—4W'&÷"€¢u$T4ôäD•D”ôåôd”ÄTBrÀ¢v6†BGF6†ÖVçBF—&V7F÷'’&WV—&W27F&ÆRFF÷væW"rÀ¢“°¢Ð¢&WGW&â°¢&ö÷DF—#¢vWD6†DGF6†ÖVçD÷væW$66†U&ö÷B†÷væW$–B’À¢—47W'&VçD÷væW#¢‚’Óà¢7F—fT÷væW%66÷T¶W’‚’ÓÓÒ÷væW%66÷T¶W’bb—46W76–öä&÷VæF'•VæF–ær‚’À¢Ó°¢Ó°¢6öç7Bv—F„7F—fT6†DGF6†ÖVçE&ö÷BÒ7–æ2ÅCâ€¢7F–öã¢‡&ö÷DF—#¢7G&–ærÂ—47W'&VçD÷væW#¢‚’Óâ&ööÆVâ’Óâ&öÖ—6SÅCâÀ¢÷F–öç3¢²ÆÆ÷t÷væW$6†ævTgFW$7F–öãó¢&ööÆVâÒÒ·ÒÀ¢“¢&öÖ—6SÅCâÓâ°¢6öç7B²&ö÷DF—"Â—47W'&VçD÷væW"ÒÒ6GW&T7F—fT6†DGF6†ÖVçE&ö÷B‚“°¢6öç7B&W7VÇBÒv—B7F–öâ‡&ö÷DF—"Â—47W'&VçD÷væW"“°¢–b‚÷F–öç2æÆÆ÷t÷væW$6†ævTgFW$7F–öâbb—47W'&VçD÷væW"‚’’°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂv6†BGF6†ÖVçBF—&V7F÷'’÷væW"6†ævVBr“°¢Ð¢&WGW&â&W7VÇC°¢Ó° ¢òòYNz©~Xú>ˆØžz‹þ™˜NK»bU$ÂKˆ®hªR†6ö×÷6W$G&gE7F÷&R×WFF÷"[î˜:ŽhêŽ˜¾ZI®z©~Xú0¢òòi{nkˆ^ynXùnXZŽz©~Xú>[›n™¸bÎ™‹.ŠúþXŠXŠ¾y¨Nz©~Xú>y¨NˆØžz‹þY»âž8&f—&RÖæBÖf÷&vWB6VæN8 ¢—4Ö–âæöâ‚v6–æG’ÖÖVF–§&W÷'BÖG&gB×W&Ç2rÂ†WfVçBÂW&Ç3¢7G&–æuµÒ’Óâ°¢&Vv—7FW%v–æF÷tG&gEW&Ç2†WfVçBç6VæFW"ÂW&Ç2“°¢Ò“° ¢6öç7B7F÷&vT†æFÆW'2Ò7&VFU7F÷&vT—4†æFÆW'2‡°¢vWEVWVU66åFW‡G3¢6öÆÆV7DvVçD–çWEVWVU66åFW‡G2À¢ÆöE6æ6†÷E–ÆöG3¢ÆöDÆÅVWVU6æ6†÷E–ÆöG2À¢vWE&Vv—7FW&VDG&gEW&Ç3¢vWDÆÅ&Vv—7FW&VDG&gEW&Ç2À¢÷VäÆVv7”–ÖvW4F—#¢‚’Óâ÷Väf—†VDF—&V7F÷'’†–ÖvT66†U7F÷&RævWD66†U&ö÷B‚’’À¢6ÆV$ÆVv7”–ÖvW4F—#¢‚’Óâ6ÆV$f—†VDF—&V7F÷'’†–ÖvT66†U7F÷&RævWD66†U&ö÷B‚’’À¢vWDÆVv7”–ÖvW4F—%7FG3¢‚’ÓâvWDf—†VDF—&V7F÷'•7FG2†–ÖvT66†U7F÷&RævWD66†U&ö÷B‚’’À¢÷Vä6†DGF6†ÖVçG4F—#¢‚’Óà¢v—F„7F—fT6†DGF6†ÖVçE&ö÷B‚‡&ö÷DF—"Â—47W'&VçD÷væW"’Óà¢÷Väf—†VDF—&V7F÷'’‡&ö÷DF—"Â—47W'&VçD÷væW"’À¢’À¢6ÆV$6†DGF6†ÖVçG4F—#¢‚’Óà¢v—F„7F—fT6†DGF6†ÖVçE&ö÷B€¢‡&ö÷DF—"Â—47W'&VçD÷væW"’Óâ6ÆV$f—†VDF—&V7F÷'’‡&ö÷DF—"Â—47W'&VçD÷væW"’À¢²ÆÆ÷t÷væW$6†ævTgFW$7F–öã¢G'VRÒÀ¢’À¢vWD6†DGF6†ÖVçG4F—%7FG3¢‚’Óà¢vWD7F—fT6W76–öâ‚’æFF÷væW$–BÇÂ—46W76–öä&÷VæF'•VæF–ær‚¢ò&öÖ—6Rç&W6öÇfR‡²'—FW3¢Âf–ÆT6÷VçC¢Ò¢¢v—F„7F—fT6†DGF6†ÖVçE&ö÷B‚‡&ö÷DF—"’ÓâvWDf—†VDF—&V7F÷'•7FG2‡&ö÷DF—"’’À¢Ò“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–§7F÷&vR×7FG2rÂ‚’Óâ7F÷&vT†æFÆW'2ç7FG2‚’“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–§7F÷&vR×66ârÂ…öWfVçBÂ&×3¢²G&gEW&Ç3¢7G&–æuµÒÒ’Óà¢7F÷&vT†æFÆW'2ç66â‡&×2’À¢“°¢—4Ö–âæ†æFÆR€¢v6–æG’ÖÖVF–§7F÷&vRÖ6ÆVçWrÀ¢€¢öWfVçBÀ¢&×3¢°¢G&gEW&Ç3¢7G&–æuµÓ°¢¦W&õ&Vd†6†W3¢7G&–æuµÓ°¢Wf–7D66†T†6†W3¢7G&–æuµÓ°¢FVDF—$æÖW3¢7G&–æuµÓ°¢6ÆVåF×f–ÆW3¢&ööÆVã°¢ÒÀ¢’Óâ7F÷&vT†æFÆW'2æ6ÆVçW‡&×2’À¢“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–§7F÷&vR×&V6öæ6–ÆRrÂ‚’Óâ7F÷&vT†æFÆW'2ç&V6öæ6–ÆR‚’“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–¦ÆVv7’Ö–ÖvW2Ö÷VâÖF—"rÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7F÷&vT†æFÆW'2æ÷VäÆVv7”–ÖvW4F—"‚“°¢Ò“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–¦ÆVv7’Ö–ÖvW2Ö6ÆV"rÂ†WfVçB’Óà¢'Väf—†VDF—&V7F÷'”—47F–öâ‚vÆVv7’Ö–ÖvW2Ö6ÆV"rÂ7–æ2‚’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7B6öæf—&ÖVBÒv—B6öæf—&Ôf—†VDF—&V7F÷'”6ÆV"†WfVçBÂ°¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæÆVv7”–ÖvW46ÆV$6öæf—&ÕF—FÆRr’À¢ÖW76vS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæÆVv7”–ÖvW46ÆV$6öæf—&ÔFW67&—F–öâr’À¢6öæf—&Ô'WGFöã¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæÆVv7”–ÖvW46ÆV$6öæf—&Ô'WGFöâr’À¢Ò“°¢–b‚6öæf—&ÖVB’&WGW&â²6ÆV&VC¢fÇ6RÓ°¢v—B7F÷&vT†æFÆW'2æ6ÆV$ÆVv7”–ÖvW4F—"‚“°¢&WGW&â²6ÆV&VC¢G'VRÓ°¢Ò’À¢“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–¦6†BÖGF6†ÖVçG2Ö÷VâÖF—"rÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â7F÷&vT†æFÆW'2æ÷Vä6†DGF6†ÖVçG4F—"‚“°¢Ò“°¢—4Ö–âæ†æFÆR‚v6–æG’ÖÖVF–¦6†BÖGF6†ÖVçG2Ö6ÆV"rÂ†WfVçB’Óà¢'Väf—†VDF—&V7F÷'”—47F–öâ‚v6†BÖGF6†ÖVçG2Ö6ÆV"rÂ7–æ2‚’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢6öç7B÷væW%66÷RÒ6GW&T7F—fT6†DGF6†ÖVçE&ö÷B‚“°¢6öç7B6öæf—&ÖVBÒv—B6öæf—&Ôf—†VDF—&V7F÷'”6ÆV"†WfVçBÂ°¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæ6†DGF6†ÖVçG46ÆV$6öæf—&ÕF—FÆRr’À¢ÖW76vS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæ6†DGF6†ÖVçG46ÆV$6öæf—&ÔFW67&—F–öâr’À¢6öæf—&Ô'WGFöã¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæ6†DGF6†ÖVçG46ÆV$6öæf—&Ô'WGFöâr’À¢Ò“°¢–b‚6öæf—&ÖVB’&WGW&â²6ÆV&VC¢fÇ6RÓ°¢–b‚÷væW%66÷Ræ—47W'&VçD÷væW"‚’’°¢F‡&÷t—4W'&÷"€¢u$T4ôäD•D”ôåôd”ÄTBrÀ¢v6†BGF6†ÖVçBF—&V7F÷'’÷væW"6†ævVB&Vf÷&R6ÆVçWrÀ¢“°¢Ð¢v—B7F÷&vT†æFÆW'2æ6ÆV$6†DGF6†ÖVçG4F—"‚“°¢&WGW&â²6ÆV&VC¢G'VRÓ°¢Ò’À¢“° ¢òòæF—fRföÆFW"6VÆV7F–öâ&VÆöæw2FòF†—26ö×WFW#²–çFVçF–öæÆÇ’æ÷BW‡÷6VBf–FWf–6RÖÆ–æ²à¢6öç7BF–ÆöwVUv÷&·76T†æFÆW'2Ò7&VFTF–ÆöwVUv÷&·76T†æFÆW'2‡°¢6GW&U66÷S¢‚’Óâ°¢–b‚vWD7F—fT6W76–öâ‚’æFF÷væW$–BÇÂ—46W76–öä&÷VæF'•VæF–ær‚’’°¢F‡&÷t—4W'&÷"‚u$T4ôäD•D”ôåôd”ÄTBrÂvF–ÆöwVRv÷&·76R&WV—&W2â7F—fR÷væW"r“°¢Ð¢&WGW&â7F—fT÷væW%66÷T¶W’‚“°¢ÒÀ¢—566÷T7W'&VçC¢‡66÷R’Óâ—46W76–öä&÷VæF'•VæF–ær‚’bb7F—fT÷væW%66÷T¶W’‚’ÓÓÒ66÷RÀ¢&VC¢&VDF–ÆöwVUv÷&·76U6WGF–æw2À¢w&—FS¢w&—FTF–ÆöwVUv÷&·76TF—&V7F÷'’À¢6†ö÷6TF—&V7F÷'“¢7–æ2‚’Óâ°¢6öç7B÷F–öç3¢VÆV7G&öâä÷VäF–Æöt÷F–öç2Ò°¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF–ÆöwVTF—&V7F÷'”6†ö÷6Rr’À¢&÷W'F–W3¢²v÷VäF—&V7F÷'’rÂv7&VFTF—&V7F÷'’uÒÀ¢Ó°¢6öç7B÷væW%v–æF÷rÒ'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚’óòÖ–åv–æF÷u&Vc°¢6öç7B&W7VÇBÐ¢÷væW%v–æF÷rbb÷væW%v–æF÷ræ—4FW7G&÷–VB‚¢òv—BF–Æörç6†÷t÷VäF–Æör†÷væW%v–æF÷rÂ÷F–öç2¢¢v—BF–Æörç6†÷t÷VäF–Æör†÷F–öç2“°¢&WGW&â&W7VÇBæ6æ6VÆVBòçVÆÂ¢‡&W7VÇBæf–ÆUF‡5³ÒóòçVÆÂ“°¢ÒÀ¢òòFVF–6FVB÷væW"7V'G&VR&WfVçG2Vç&VÆFVBföÆFW'2g&öÒ&V–ærG&VFVB2ÖævVBF6·2à¢&W6öÇfTF—&V7F÷'“¢‡6VÆV7FVB’Óà¢7W7FöÔF–ÆöwVUv÷&·76U&ö÷B‡6VÆV7FVBÂF‚æ&6VæÖR†÷væW%66÷VEW6W$FFF‚‚’’’À¢6†V6µw&—F&ÆS¢6†V6´F–ÆöwVTF—&V7F÷'•w&—F&ÆRÀ¢÷VäF—&V7F÷'“¢†F—&V7F÷'’’Óâ6†VÆÂæ÷VåF‚†F—&V7F÷'’’À¢Ò“°¢f÷"†6öç7B7F–öâöb²vvWBrÂv6†ö÷6RrÂw&W6WBrÂv÷VâuÒ26öç7B’°¢—4Ö–âæ†æFÆR‚vF–ÆöwVR×v÷&·76S¢r²7F–öâÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢G'’°¢&WGW&âv—BF–ÆöwVUv÷&·76T†æFÆW'5¶7F–öåÒ‚“°¢Ò6F6‚†W'&÷"’°¢–b†—4—4W'&÷"†W'&÷"’’F‡&÷rW'&÷#°¢F$6Æ–VçDÆörçv&â‚vF–ÆöwVRv÷&·76R6WGF–æw2&WVW7Bf–ÆVBrÂ²7F–öâÒ“°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂvF–ÆöwVRv÷&·76R6WGF–æw2&WVW7Bf–ÆVBr“°¢Ð¢Ò“°¢Ð ¢6öç7BÆö6ÄF$Ö–çFVææ6T†æFÆW'2Ò7&VFTÆö6ÄF$Ö–çFVææ6T—4†æFÆW'2‡°¢6GW&T÷væW#¢‚’Óâ°¢6öç7B÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢–b‚÷væW$–BÇÂ—46W76–öä&÷VæF'•VæF–ær‚’’&WGW&âçVÆÃ°¢&WGW&â²÷væW$–BÂ66÷T¶W“¢7F—fT÷væW%66÷T¶W’‚’Ó°¢ÒÀ¢—4÷væW$7W'&VçC¢‡²÷væW$–BÂ66÷T¶W’Ò’Óà¢—46W76–öä&÷VæF'•VæF–ær‚’b`¢vWD7F—fT6W76–öâ‚’æFF÷væW$–BÓÓÒ÷væW$–Bb`¢7F—fT÷væW%66÷T¶W’‚’ÓÓÒ66÷T¶W’À¢vWDF$6Æ–VçBÀ¢vWDF$6Æ–VçD÷væW$–C¢vWD7W'&VçDF$6Æ–VçEW6W$–BÀ¢vWD7W'&VçDF%Fƒ¢‚’Óâ°¢6öç7B÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢&WGW&â÷væW$–BòvWDF%F„f÷%W6W"†÷væW$–B’¢çVÆÃ°¢ÒÀ¢vWEW6W$FFF—#¢‚’ÓâævWEF‚‚wW6W$FFr’À¢6å66†VGVÆS¢‚’Óâ&ö6W72æVçbå„EEõ54•dUõ4„$TEõU4U%ôDDÓÒsrÀ¢6VÆV7D&6·WF—&V7F÷'“¢7–æ2‚’Óâ°¢6öç7B÷F–öç2Ò°¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt&6·WF—&V7F÷'”F–ÆöuF—FÆRr’À¢&÷W'F–W3¢²v÷VäF—&V7F÷'’rÂv7&VFTF—&V7F÷'’uÒ2'&“À¢v÷VäF—&V7F÷'’rÂv7&VFTF—&V7F÷'’p¢âÀ¢Ó°¢6öç7B÷væW%v–æF÷rÒ'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚’óòÖ–åv–æF÷u&Vc°¢6öç7B&W7VÇBÐ¢÷væW%v–æF÷rbb÷væW%v–æF÷ræ—4FW7G&÷–VB‚¢òv—BF–Æörç6†÷t÷VäF–Æör†÷væW%v–æF÷rÂ÷F–öç2¢¢v—BF–Æörç6†÷t÷VäF–Æör†÷F–öç2“°¢&WGW&â&W7VÇBæ6æ6VÆVBòçVÆÂ¢‡&W7VÇBæf–ÆUF‡5³ÒóòçVÆÂ“°¢ÒÀ¢6öæf—&Ô7F—fUF6´6ÆVçW¢7–æ2‡²&6·WVæ&ÆVBÒ’Óâ°¢6öç7B7F—fUF6µv&æ–ærÒB€¢w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt–æ6ÇVFT7F—fT6öæf—&ÔFW67&—F–öârÀ¢“°¢6öç7BFWF–ÂÒ&6·WVæ&ÆV@¢ò7F—fUF6µv&æ–æp¢¢G¶7F—fUF6µv&æ–æwÕÆåÆâG·B€¢w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt6öæf—&ÔFW67&—F–öåv—F†÷WD&6·WrÀ¢—Ö°¢6öç7B÷F–öç3¢VÆV7G&öâäÖW76vT&÷„÷F–öç2Ò°¢G—S¢wv&æ–ærrÀ¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt–æ6ÇVFT7F—fT6öæf—&ÕF—FÆRr’À¢ÖW76vS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt–æ6ÇVFT7F—fT6öæf—&ÕF—FÆRr’À¢FWF–ÂÀ¢'WGFöç3¢°¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æu&W7F'D'WGFöâr’À¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæ6æ6VÄ'WGFöâr’À¢ÒÀ¢FVfVÇD–C¢À¢6æ6VÄ–C¢À¢æôÆ–æ³¢G'VRÀ¢Ó°¢6öç7B÷væW%v–æF÷rÒ'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚’óòÖ–åv–æF÷u&Vc°¢6öç7B&W7VÇBÐ¢÷væW%v–æF÷rbb÷væW%v–æF÷ræ—4FW7G&÷–VB‚¢òv—BF–Æörç6†÷tÖW76vT&÷‚†÷væW%v–æF÷rÂ÷F–öç2¢¢v—BF–Æörç6†÷tÖW76vT&÷‚†÷F–öç2“°¢&WGW&â&W7VÇBç&W7öç6RÓÓÒ°¢ÒÀ¢6öæf—&Õv—F†÷WD&6·W¢7–æ2‚’Óâ°¢6öç7B÷F–öç3¢VÆV7G&öâäÖW76vT&÷„÷F–öç2Ò°¢G—S¢wv&æ–ærrÀ¢F—FÆS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt6öæf—&ÕF—FÆRr’À¢ÖW76vS¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt6öæf—&ÕF—FÆRr’À¢FWF–Ã¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æt6öæf—&ÔFW67&—F–öåv—F†÷WD&6·Wr’À¢'WGFöç3¢°¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæF%6Æ–ÖÖ–æu&W7F'D'WGFöâr’À¢B‚w6WGF–æw2æ&÷WBç7F÷&vRæ6æ6VÄ'WGFöâr’À¢ÒÀ¢FVfVÇD–C¢À¢6æ6VÄ–C¢À¢æôÆ–æ³¢G'VRÀ¢Ó°¢6öç7B÷væW%v–æF÷rÒ'&÷w6W%v–æF÷rævWDfö7W6VEv–æF÷r‚’óòÖ–åv–æF÷u&Vc°¢6öç7B&W7VÇBÐ¢÷væW%v–æF÷rbb÷væW%v–æF÷ræ—4FW7G&÷–VB‚¢òv—BF–Æörç6†÷tÖW76vT&÷‚†÷væW%v–æF÷rÂ÷F–öç2¢¢v—BF–Æörç6†÷tÖW76vT&÷‚†÷F–öç2“°¢&WGW&â&W7VÇBç&W7öç6RÓÓÒ°¢ÒÀ¢&WfVÄf–ÆS¢7–æ2†f–ÆUF‚’Óâ°¢G'’°¢–b‚†v—Bg2ç&öÖ—6W2ç7FB†f–ÆUF‚’’æ—4f–ÆR‚’’&WGW&âfÇ6S°¢Ò6F6‚°¢&WGW&âfÇ6S°¢Ð¢6†VÆÂç6†÷t—FVÔ–äföÆFW"‡F‚ææ÷&ÖÆ—¦R†f–ÆUF‚’“°¢&WGW&âG'VS°¢ÒÀ¢&VÆVæ6ƒ¢‡&WVW7D–B’Óâ°¢F$6Æ–VçDÆöræ–æfò‚vFF&6R6Æ–ÖÖ–ær&VÆVæ6‚&WVW7FVBr“°¢–b†æ—56¶vVB’°¢òòFòæ÷B&WÆ’F†RæF—fR7F'GW&wbÂv†–6‚Ö’6öçF–ââ–×÷'B¶W’à¢ç&VÆVæ6‚‡²&w3¢&ö6W72æ&wbç6Æ–6Rƒ’Ò“°¢ÒVÇ6R°¢òòf÷&vR÷vç2F†Rf—FR6W'fW"â&&Rç&VÆVæ6‚‚’÷WFÆ—fW2f÷&vRÀ¢òòF†Vâ÷Vç2v†—FRv–æF÷rv–ç7BFVBÆö6Æ†÷7B&VæFW&W"âF†P¢òò&W÷6—F÷'’FWb'VææW"ö'6W'fW2F†RGW&&ÆR6ÆVçWÖ&¶W"æ@¢òò&W7F'G2F†RgVÆÂf÷&vRõf—FR7F6²gFW"F†—2&ö6W72W†—G2à¢6öç7BFVÆVvFVBÒw&—FTF%6Æ–ÖÖ–ætFWe&VÆVæ6…6–væÂ‡&WVW7D–B“°¢F$6Æ–VçDÆöræ–æfò‚vFF&6R6Æ–ÖÖ–ærFWb&VÆVæ6‚FVÆVvFVBFòFW6·F÷FWb'VææW"rÂ°¢FVÆVvFVBÀ¢Ò“°¢Ð¢çV—B‚“°¢ÒÀ¢Ò“°¢6öç7B–çfö¶TÆö6ÄF$Ö–çFVææ6T—2Ò7–æ2ÅCâ€¢7F–öã¢7G&–ærÀ¢÷W&F–öã¢‚’ÓâBÂ&öÖ—6SÅCâÀ¢“¢&öÖ—6SÅCâÓâ°¢G'’°¢&WGW&âv—B÷W&F–öâ‚“°¢Ò6F6‚†W'&÷"’°¢–b†—4—4W'&÷"†W'&÷"’’F‡&÷rW'&÷#°¢F$6Æ–VçDÆöræW'&÷"‚vFF&6R6Æ–ÖÖ–ær•2f–ÆVBrÂ°¢7F–öâÀ¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢F‡&÷t—4W'&÷"‚t”åDU$äÂrÂvFF&6RÖ–çFVææ6R&WVW7Bf–ÆVBr“°¢Ð¢Ó°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S§66ârÂ†WfVçBÂ–çWB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â–çfö¶TÆö6ÄF$Ö–çFVææ6T—2‚w66ârÂ‚’ÓâÆö6ÄF$Ö–çFVææ6T†æFÆW'2ç66â†–çWB’“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S¦6†ö÷6RÖ&6·WÖF—&V7F÷'’rÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â–çfö¶TÆö6ÄF$Ö–çFVææ6T—2‚v6†ö÷6RÖ&6·WÖF—&V7F÷'’rÂ‚’Óà¢Æö6ÄF$Ö–çFVææ6T†æFÆW'2æ6†ö÷6T&6·WF—&V7F÷'’‚’À¢“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S§66†VGVÆRrÂ†WfVçBÂ–çWB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â–çfö¶TÆö6ÄF$Ö–çFVææ6T—2‚w66†VGVÆRrÂ‚’Óà¢Æö6ÄF$Ö–çFVææ6T†æFÆW'2ç66†VGVÆR†–çWB’À¢“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S¦Æ7B×&W7VÇBrÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â–çfö¶TÆö6ÄF$Ö–çFVææ6T—2‚vÆ7B×&W7VÇBrÂ‚’Óà¢Æö6ÄF$Ö–çFVææ6T†æFÆW'2ævWDÆ7E&W7VÇB‚’À¢“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S¦÷VâÖÆ7BÖ&6·WÖF—&V7F÷'’rÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â–çfö¶TÆö6ÄF$Ö–çFVææ6T—2‚v÷VâÖÆ7BÖ&6·WÖF—&V7F÷'’rÂ‚’Óà¢Æö6ÄF$Ö–çFVææ6T†æFÆW'2æ÷VäÆ7D&6·WF—&V7F÷'’‚’À¢“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S§7F'GW×&öw&W72rÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&âvWDF%6Æ–ÖÖ–æu7F'GW&öw&W72‚“°¢Ò“°¢—4Ö–âæ†æFÆR‚vÆö6ÂÖF#¦Ö–çFVææ6S¦6æ6VÂ×7F'GWrÂ†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢&WGW&â²6æ6VÆÆVC¢6æ6VÄF%6Æ–ÖÖ–æu7F'GW&öw&W72‚’Ó°¢Ò“°¢7V'67&–&TF%6Æ–ÖÖ–æu7F'GW&öw&W72‚‡&öw&W72’Óâ°¢6öç7BF&vWBÒÖ–åv–æF÷u&Vc°¢–b‚F&vWBÇÂF&vWBæ—4FW7G&÷–VB‚’ÇÂF&vWBçvV$6öçFVçG2æ—4FW7G&÷–VB‚’’&WGW&ã°¢F&vWBçvV$6öçFVçG2ç6VæB„D%õ4Ä”ÔÔ”äuõ5D%EUõ$ôu$U55ô4„ätTEô4„ääTÂÂ&öw&W72“°¢Ò“°¢Ð ¢òòcS¢4D²6VæB×F–ÖRFV×÷&'’&6ScB&VB‡&VæFW&W"Ö–æ—F–FVC²Ö–âÖ–æ—F–FV@¢òò—2F†R&–Ö'’F‚–ç6–FRvVçDÖævW"æ'V–ÆD6öçFVçD&Æö6·2’à¢òòXøÎK‰nyXÃ¦6–æG’ÖÖVF–ikYËYØ‹[&Æö"K¹2Îˆ†GBÖ–ÖvRYËYØ‹[Xk¾{¹>y¨Nˆ7F÷&^8 ¢—4Ö–âæ†æFÆR€¢v–ÖvRÖ66†S§&VBÖ&6ScBrÀ¢7–æ2€¢öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÀ¢&×3¢²W&Ã¢7G&–ærÒÀ¢“¢&öÖ—6SÇ²&6ScC¢7G&–æs²Ö–ÖUG—S¢7G&–ærÓâÓâ°¢–b‡G—Vöb&×3òçW&ÂÓÓÒw7G&–ærrbb&×2çW&Âç7F'G5v—F‚‚v6–æG’ÖÖVF–¢òòr’’°¢6öç7B²'VffW"ÂÖ–ÖUG—RÒÒv—B6–æG”ÖVF–&Æö%7F÷&Rç&VDf–ÆR‡&×2çW&Â“°¢&WGW&â²&6ScC¢'VffW"çFõ7G&–ær‚v&6ScBr’ÂÖ–ÖUG—RÓ°¢Ð¢&WGW&â–ÖvT66†U7F÷&Rç&VD4&6ScB‡&×2çW&Â“°¢ÒÀ¢“° ¢òòcs¢6ÆVçWâVçF—&R6W76–öâw266†RF—&V7F÷'’†FVÆWFR6W76–öâ¢—4Ö–âæ†æFÆR€¢v–ÖvRÖ66†S¦6ÆVçW×6W76–öârÀ¢7–æ2…öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂ6W76–öä–C¢7G&–ær“¢&öÖ—6SÇfö–CâÓâ°¢v—B–ÖvT66†U7F÷&Rç&VÖ÷fU6W76–öâ‡6W76–öä–B“°¢òò6–æG’ÖÖVF–&Vg2&R&VÖ÷fVBöæÇ’'’F†RÖ–âÖ÷væVBÂV–W66VB6W76–öà¢òòFVÆWF–öâ6†–ââF†—2ÆVv7’•2–çFVçF–öæÆÇ’6ÆVç2†GBÖ–ÖvRf–ÆW0¢òòöæÇ“²FVÆWF–ærÆVFvW"&Vg2†W&R6÷VÆB&6RÆFR6–×VÆF÷"–ævW7Bà¢ÒÀ¢“° ¢òòcs¢6ÆVçWÆ—7Böbf–ÆW2Žz{¾™šN‹é>XZ^jb6†—òKŠ.[È>hŠ®Y»îˆØžz‹ò¢—4Ö–âæ†æFÆR€¢v–ÖvRÖ66†S¦6ÆVçWÖf–ÆW2rÀ¢7–æ2…öWfVçC¢VÆV7G&öâä—4Ö–ä–çfö¶TWfVçBÂW&Ç3¢7G&–æuµÒ“¢&öÖ—6SÇfö–CâÓâ°¢–b‚'&’æ—4'&’‡W&Ç2’’&WGW&ã°¢6öç7B6ÆVçWÆörÒ7&VFTÆövvW"‚v–ÖvRÖ66†Rr“°¢f÷"†6öç7BW&ÂöbW&Ç2’°¢òò6–æG’ÖÖVF–&Æö"iŠþXh^ZëžZû¾YØX[Kª¾ZÙ~ˆ¨"Æ6†—z{¾™šNKˆÞXŠK»¾KÙ^K‰ÎŠ[þ(	N(	@¢òòYÎXh^ZëžXúþˆ;ÞŠ*¾X[nZè>khŽhòþyK¾[¸®[É^yJ‚ÎXŠZÙ~ˆ¨.[ø^ŠúþKÊC¾iÊ®Xù˜y¨Niz[É^yJ‚&Æö ¢òòyKY¹îiKnYšŽiKn‹[8.XènXû"†GBÖ–ÖvRˆØžz‹þ{»NhÈxšžynXŠ™šN8 ¢–b‡G—VöbW&ÂÓÓÒw7G&–ærrbbW&Âç7F'G5v—F‚‚v6–æG’ÖÖVF–¢òòr’’6öçF–çVS°¢G'’°¢v—B–ÖvT66†U7F÷&Rç&VÖ÷fTf–ÆR‡W&Â“°¢Ò6F6‚†W'"’°¢6ÆVçWÆörçv&â‚v6ÆVçWf–ÆRf–ÆVBrÂ°¢W&ÂÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Ð¢Ð¢ÒÀ¢“°§Ó° ¢òò)H)H6Öö¶R×FW7BÖöFR‡&VÆV6RÒ¢æÖ§2÷7BÖ'V–ÆBfW&–f–6F–öâ’)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢òòv†VâÆVæ6†VBv—F‚Ò×6Öö¶R×FW7FÂ6†÷'BÖ6—&7V—BF†Ræ÷&ÖÂ7F'GWfÆ÷s ¢òò6¶—v–æF÷r7&VF–öâòôWF‚òWFò×WFFRòFVWÆ–æ²òvVçBòFö¶Vç2À¢òò§W7B'VâÆö6ÄF"–æ—Bv—F‚f¶RW6W$–B†g&öÒÒ×6Öö¶R×W6W#ÓÆ–Cæ’ÂVW'¢òò66†VÖ÷fW'6–öâ²6÷&RF&ÆW2ÂVÖ—B¥4ôâFò7FF÷WBÂæBW†—BâVÆV7G&öâw0¢òòæF—fRÒ×W6W"ÖFFÖF—&fÆr—2W‡V7FVBFò&R76VB'’F†R6Öö¶R67&—@¢òò6òF†Rf¶RD"Æ—fW2–â67&F6‚F—&V7F÷'’à¦gVæ7F–öâ'6U6Öö¶T&w2‚“¢°¢Væ&ÆVC¢&ööÆVã°¢W6W$–C¢7G&–æs°¢ÇVv–å7F÷&vS¢&ööÆVã°¢&W7VÇDf–ÆS¢7G&–ærÂçVÆÃ°§Ò°¢6öç7B&W7VÇDf–ÆRÒæ—56¶vV@¢ò&ö6W72æVçbå„EEõÅTt”åõ5Dõ$tUõ4Ôô´Uõ$U5TÅEôd”ÄSòçG&–Ò‚’ÇÂçVÆÀ¢¢çVÆÃ°¢6öç7BVæ&ÆVBÒ&ö6W72æ&wbæ–æ6ÇVFW2‚rÒ×6Öö¶R×FW7Br’ÇÂ&W7VÇDf–ÆRÓÒçVÆÃ°¢6öç7BW6W$fÆrÒ&ö6W72æ&wbæf–æB‚†’Óâç7F'G5v—F‚‚rÒ×6Öö¶R×W6W#Òr’“°¢6öç7BW6W$–BÒW6W$fÆròW6W$fÆrç6Æ–6R‚rÒ×6Öö¶R×W6W#ÒræÆVæwF‚’¢uõ÷6Öö¶U÷FW7Eõòs°¢&WGW&â°¢Væ&ÆVBÀ¢W6W$–BÀ¢ÇVv–å7F÷&vS¢&ö6W72æ&wbæ–æ6ÇVFW2‚rÒ×6Öö¶R×ÇVv–â×7F÷&vRr’ÇÂ&W7VÇDf–ÆRÓÒçVÆÂÀ¢&W7VÇDf–ÆRÀ¢Ó°§Ð ¦7–æ2gVæ7F–öâ'Vå6Öö¶UFW7B€¢W6W$–C¢7G&–ærÀ¢ÇVv–å7F÷&vS¢&ööÆVâÀ¢&W7VÇDf–ÆS¢7G&–ærÂçVÆÂÀ¢“¢&öÖ—6SÇfö–Câ°¢G'’°¢6öç7B&W7VÇBÒv—BÆö6ÄF$Vç7W&U&VG’‡W6W$–B“°¢–b‚&W7VÇBç&VG’’°¢&ö6W72ç7FFW'"çw&—FR€¢G´¥4ôâç7G&–æv–g’‡²ö³¢fÇ6RÂW'&÷#¢Vç7W&U&VG’f–ÆVC¢G·&W7VÇBæW'&÷"æ6öFWÒG·&W7VÇBæW'&÷"æÖW76vWÖÒ—ÕÆæÀ¢“°¢Æö6ÄF$6Æ÷6TF"‚“°¢æW†—Bƒ“°¢&WGW&ã°¢Ð¢6öç7BF"ÒÆö6ÄF$vWE&tF"‚“°¢6öç7B66†VÖ&÷rÒF ¢ç&W&R†4TÄT5BfÇVRe$ôÒÖ–w&F–öåöÖWFt„U$R¶W“Òw66†VÖ÷fW'6–öâv¢ævWB‚’2²fÇVS¢7G&–ærÒÂVæFVf–æVC°¢6öç7B66†VÖfW'6–öâÒ66†VÖ&÷rò'6T–çB‡66†VÖ&÷rçfÇVRÂ’¢Ó°¢6öç7B6W76–öç46÷VçBÒ†F"ç&W&R‚u4TÄT5B4õTåB‚¢’22e$ôÒ6W76–öç2r’ævWB‚’2²3¢çVÖ&W"Ò¢æ3°¢6öç7BÖW76vW46÷VçBÒ†F"ç&W&R‚u4TÄT5B4õTåB‚¢’22e$ôÒÖW76vW2r’ævWB‚’2²3¢çVÖ&W"Ò¢æ3°¢6öç7BÖWF6÷VçBÒ€¢F"ç&W&R‚u4TÄT5B4õTåB‚¢’22e$ôÒÖ–w&F–öåöÖWFr’ævWB‚’2²3¢çVÖ&W"Ð¢’æ3°¢6öç7BÇVv–å7F÷&vU&W7VÇBÒÇVv–å7F÷&vRòv—B'VåÇVv–å7F÷&vU6Öö¶R‡W6W$–B’¢VæFVf–æVC°¢6öç7B–ÆöBÒ°¢ö³¢G'VRÀ¢66†VÖ÷fW'6–öã¢66†VÖfW'6–öâÀ¢F&ÆW3¢°¢6W76–öç3¢6W76–öç46÷VçBÀ¢ÖW76vW3¢ÖW76vW46÷VçBÀ¢Ö–w&F–öåöÖWF¢ÖWF6÷VçBÀ¢ÒÀ¢âââ‡ÇVv–å7F÷&vU&W7VÇBò²ÇVv–å÷7F÷&vS¢ÇVv–å7F÷&vU&W7VÇBÒ¢·Ò’À¢Ó°¢6öç7B6W&–Æ—¦VBÒG´¥4ôâç7G&–æv–g’‡–ÆöB—ÕÆæ°¢–b‡&W7VÇDf–ÆR’g2çw&—FTf–ÆU7–æ2‡&W7VÇDf–ÆRÂ6W&–Æ—¦VBÂ²ÖöFS¢ócÒ“°¢&ö6W72ç7FF÷WBçw&—FR‡6W&–Æ—¦VB“°¢Æö6ÄF$6Æ÷6TF"‚“°¢çV—B‚“°¢Ò6F6‚†W'"’°¢6öç7B×6rÒW'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"“°¢&ö6W72ç7FFW'"çw&—FR†G´¥4ôâç7G&–æv–g’‡²ö³¢fÇ6RÂW'&÷#¢×6rÒ—ÕÆæ“°¢G'’°¢Æö6ÄF$6Æ÷6TF"‚“°¢Ò6F6‚°¢ò¢æö÷¢ð¢Ð¢æW†—Bƒ“°¢Ð§Ð ¦7–æ2gVæ7F–öâ'Vå6¶vVD”õ56–×VÆF÷%&VÆV6TvFR€¢ÖöFS¢”õ56–×VÆF÷%&VÆV6TvFTÖöFRÀ¢“¢&öÖ—6SÇfö–Câ°¢G'’°¢6öç7B&W÷'BÒv—B'Vä”õ56–×VÆF÷%&VÆV6TvFR‡°¢ÖöFRÀ¢6¶vVC¢æ—56¶vVBÀ¢ÆFf÷&Ó¢&ö6W72çÆFf÷&ÒÀ¢&6†—FV7GW&S¢&ö6W72æ&6‚À¢†÷7D÷5&VÆV6S¢÷2ç&VÆV6R‚’À¢&W6÷W&6W5Fƒ¢&ö6W72ç&W6÷W&6W5F‚À¢fW'6–öã¢ævWEfW'6–öâ‚’À¢Ò“°¢&ö6W72ç7FF÷WBçw&—FR†G´¥4ôâç7G&–æv–g’‡&W÷'B—ÕÆæ“°¢çV—B‚“°¢Ò6F6‚°¢&ö6W72ç7FFW'"çw&—FR€¢G´¥4ôâç7G&–æv–g’‡°¢66†VÖfW'6–öã¢À¢ö³¢fÇ6RÀ¢W'&÷$6öFS¢t”õ5õ4”ÕTÄDõ%õ$TÄT4UôtDUôd”ÄTBrÀ¢Ò—ÕÆæÀ¢“°¢æW†—Bƒ“°¢Ð§Ð ¢òòTÔ”BKˆžKØÞKˆKÙ3®[ø^š¾Kˆâå4•2–B†f÷&vRæ6öæf–rhÈžièN[»®XË®YùþK¸â'&æD–B‚’Xùb¢òòKˆî[ú¾hÛ~ikž[ÈòTÔ”B˜	ZÙ~zÊnKˆˆ{N8.XÎ{¸ò6†&VBö'&æE&Vv–öâhÈžièN[»®iÉþXË®Yùþx9ŽxI¢òò†6ãÖ6öÒç†Bæ6–æG–6âòvÆö&ÃÖ6öÒç†Bæ6–æGžûÉ¾iÊ®k:ŽXZR&Vv–öâi{n›¹ŽŠêBvÆö&Âž8 ¦6öç7Bt”äDõu5ôõU4U%ôÔôDTÅô”BÒ5U%$TåEôô”C° ¢ò¢ ¢¢kˆ^yb7F'BÖVçR˜xÎhÈ~Y	FWbæöFUöÖöGVÆW5ÆVÆV7G&öåÆF—7EÆVÆV7G&öâæW†Vy¨Njè¾yY’æÆæ¾8 ¢ ¢¢ˆ8ÎišþûÉ®‹ùž{²æÆæ²y¨BF&vWBiŠþŠ;‚FWbVÆV7G&öâæW†^8&wVÖVçG2K‹®z›®ûÈÎŠ*²v–æF÷w2k:ŽXhÀ¢¢h‰TÔ”BYîûÈŽZh"†GDÖ¶W"äFWf8VÆV7G&öâæç†GBÖÖ¶W&ûÈžûÈÎKˆizbFö7Bx+žX{¾ŠznXù¢¢TÔ”BkøkK¾iË®X‹nûÈÎ[KÉ®Y
+þXªŽKˆKŠ®k*iÈ’Xø.i[y¨BVÆV7G&öâæW†^ûÈÎ[ËžX{¢VÆV7G&öâ›¹ŽŠê@¢¢jÊ.‹øîšR(	N(	ByJŽh‹~ŠxnŠy.yÈ¾[iŠò.˜	®yú^x+žK¨nK˜¾Yî‹{>X‹KˆKŠ®z›®y›ÒVÆV7G&öâšR.8 ¢ ¢¢[{.yú^iÚ^k©ûÉ ¢¢Òˆx˜ŽiÊÂ6æ÷&UFö7BÖ–ç7FÆÆyYžKˆ¾y¨B†GDÖ¶W$FWbæÆæ¶ûÈ„TÔ”B†GDÖ¶W"äFWfûÈ¢¢ÒVÆV7G&öâˆz®‹ª¾hÈ’&öGV7DæÖRˆz®XªŽk:ŽXhÎy¨BVÆV7G&öâæÆæ¶ûÈ„TÔ”BVÆV7G&öâæç†GBÖÖ¶W&ûÈžûÈÀ¢¢FWbzÊÎKˆjÊY
+þXªŽYîXnxë ¢ ¢¢zÙnyZ^ûÉ ¢¢â[ú¾‹zþ[èNûÉ®hÈž[{.yú^ih~K»nYÞûÈ…†GDÖ¶W$FWbæÆæ¾ûÈžy»NXŠ ¢¢"â™‹.[êhš¾høþûÉ®ié®K‹â7F'BÖVçR&öw&×2Kˆ¾h˜iÈ’æÆæ¾ûÈÎXziŠòF&vWBhÈ~Y	¢¢æöFUöÖöGVÆW5ÆVÆV7G&öåÆF—7EÆVÆV7G&öâæW†VK‰B&wVÖVçG2K‹®z›®y¨NKˆ[è¾XŠ™š@¢ ¢¢™Ùž›¹‚G'’ö6F6ŽûÉ®yJŽh‹~h˜¾XªŽXŠ‹øròk*Š8^‹øròiØ>™™™zîš)‚ò÷vW%6†VÆÂ[È.[‹Ž˜;ÞKˆÞ[ÛY8ÞK‹¾kXzˆ¾8 ¢¢ð¦gVæ7F–öâ6ÆVçWÆVv7”FWe6†÷'F7WB‚“¢&öÖ—6SÇfö–Câ°¢–b‡&ö6W72çÆFf÷&ÒÓÒwv–ã3"r’&WGW&â&öÖ—6Rç&W6öÇfR‚“°¢6öç7BFFÒ&ö6W72æVçbäDD°¢–b‚FF’&WGW&â&öÖ—6Rç&W6öÇfR‚“°¢6öç7B7F'DÖVçTF—"ÒF‚æ¦ö–â†FFÂtÖ–7&÷6ögEÅÅv–æF÷w5ÅÅ7F'BÖVçUÅÅ&öw&×2r“° ¢òò[ú¾‹zþ[è@¢6öç7B¶æ÷väÆæ²ÒF‚æ¦ö–â‡7F'DÖVçTF—"Âu†GDÖ¶W$FWbæÆæ²r“°¢G'’°¢–b†g2æW†—7G57–æ2†¶æ÷väÆæ²’’°¢g2çVæÆ–æµ7–æ2†¶æ÷väÆæ²“°¢6öç6öÆRæÆör‚u´TÔ”EÒ6ÆVæVBWÆVv7’FWb6†÷'F7WC¢W2rÂ¶æ÷väÆæ²“°¢Ð¢Ò6F6‚†W'"’°¢6öç6öÆRçv&â‚u´TÔ”EÒf–ÆVBFò&VÖ÷fRÆVv7’FWb6†÷'F7WC¢W2rÂW'"“°¢Ð ¢òò™‹.[êhš¾høþûÉ®Šz>iéæÆæ²F&vWB[ø^š¾‹[u67&—Bå6†VÆÂ4ôÞûÈÎh˜Kº^‹[÷vW%6†VÆÎ8 ¢òòXÙ^[É^Xû~XÈ^‹zþ[èN[›nh¨®Xh^˜:‚v‹ÚÎh‰rvûÈ…2XÙ^[É^Xû~ZÙ~zÊnK‹.‹ÚÎK˜žûÈž8 ¢6öç7B5&ö÷BÒ7F'DÖVçTF—"ç&WÆ6R‚òrörÂ"rr"“°¢6öç7B2Ð¢G6‚ÒæWrÔö&¦V7BÔ6öÔö&¦V7Bu67&—Bå6†VÆÃ²°¢G&ö÷BÒrG·5&ö÷GÒs²°¢–b…FW7BÕF‚G&ö÷B’²°¢vWBÔ6†–ÆD—FVÒÕF‚G&ö÷BÕ&V7W'6RÔf–ÇFW"¢æÆæ²ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂf÷$V6‚Ôö&¦V7B²°¢G'’²°¢FÆæ²ÒG6‚ä7&VFU6†÷'F7WB‚EòägVÆÄæÖR“²°¢–b‚FÆæ²åF&vWEF‚ÖÖF6‚rƒö’–æöFUöÖöGVÆW5ÅÅÅÆVÆV7G&öåÅÅÅÆF—7EÅÅÅÆVÆV7G&öåÅÂæW†RBrÖæBÖæ÷BFÆæ²ä&wVÖVçG2’²°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚EòägVÆÄæÖRÔf÷&6S²°¢w&—FRÔ÷WGWB‚w&VÖ÷fVC¢r²EòägVÆÄæÖR’°¢Ò°¢Ò6F6‚·Ò°¢Ò°¢Ö° ¢&WGW&âæWr&öÖ—6R‚‡&W6öÇfR’Óâ°¢W†V4f–ÆR€¢w÷vW'6†VÆÂæW†RrÀ¢²rÔæõ&öf–ÆRrÂrÔæöä–çFW&7F—fRrÂrÔ6öÖÖæBrÂ5ÒÀ¢²F–ÖV÷WC¢ƒÂv–æF÷w4†–FS¢G'VRÒÀ¢†W'"Â7FF÷WB’Óâ°¢–b†W'"’°¢6öç6öÆRçv&â‚u´TÔ”EÒFWb6†÷'F7WB66âf–ÆVC¢W2rÂW'"æÖW76vR“°¢ÒVÇ6R–b‡7FF÷WBçG&–Ò‚’’°¢f÷"†6öç7BÆ–æRöb7FF÷WBçG&–Ò‚’ç7Æ—B‚õÇ#õÆâò’’°¢6öç6öÆRæÆör‚u´TÔ”EÒW2rÂÆ–æR“°¢Ð¢Ð¢&W6öÇfR‚“°¢ÒÀ¢“°¢Ò“°§Ð ¦æöâ‚w&VG’rÂ7–æ2‚’Óâ°¢G'’°¢6öç7B&VÆV6TvFRÒ'6T”õ56–×VÆF÷%&VÆV6TvFT&w2‡&ö6W72æ&wb“°¢–b‡&VÆV6TvFRæVæ&ÆVB’°¢v—B'Vå6¶vVD”õ56–×VÆF÷%&VÆV6TvFR‡&VÆV6TvFRæÖöFR“°¢&WGW&ã°¢Ð¢Ò6F6‚°¢&ö6W72ç7FFW'"çw&—FR€¢G´¥4ôâç7G&–æv–g’‡°¢66†VÖfW'6–öã¢À¢ö³¢fÇ6RÀ¢W'&÷$6öFS¢t”õ5õ4”ÕTÄDõ%õ$TÄT4UôtDUô$uTÔTåEô”ådÄ”BrÀ¢Ò—ÕÆæÀ¢“°¢æW†—Bƒ“°¢&WGW&ã°¢Ð ¢òò6Öö¶R×FW7BfÆr6†÷'BÖ6—&7V—C¢6¶—ÆÂæ÷&ÖÂ–æ—BF‡2à¢6öç7B6Öö¶RÒ'6U6Öö¶T&w2‚“°¢–b‡6Öö¶RæVæ&ÆVB’°¢v—B'Vå6Öö¶UFW7B‡6Öö¶RçW6W$–BÂ6Öö¶RçÇVv–å7F÷&vRÂ6Öö¶Rç&W7VÇDf–ÆR“°¢&WGW&ã°¢Ð ¢òòvV$WF†âiŠò÷6W76–öâ{ª~ˆ;ÞX©¾ûÉ®YÊŽK»¾KÙR%4"wVW7Bh‰b÷WvV$6öçFVçG2X‰¾[» ¢òòK˜¾X˜ÞŠ8^‹Jnh‹~˜žhºžY¹î‹>ûÉ¾jÚ>[ÈþzÛîYÞy¨BÖ4õ2XÈ^YÎi{nY
+þyJ‚F÷V6‚”B[›>XûŠêNŠøYšŽ8 ¢6öæf–wW&U'6$'&÷w6W%vV$WF†â‚“° ¢òò6fU7F÷&vRXúþŠx.kX¾h
+r‚3ƒs“®‹ùžiÚ™;î‹zþjÚNX˜ÞYÊŽiz^[ù~˜xÎZèÎXZŽKˆÞXúþŠxÎX{®™zîš)‚ŽyJŽh‹~YÊ€¢òò{;¾{¹þ™*^XÉžK‹.[Ëžz©~x+žK¨nh¹.{¹Ò(i"XªŠz>Zøn™Ùž›¹Ž™˜Þ{ª~ZK‹JRžXú®ˆ;Þ™Ú[Ëžz©~XøÞhêŽ8.‹ùž˜xÎXú®‰ÞkKîyIð¢òò‹ª¾K»ÒŽiÚyºîYÒÒÆææÖSâ6fR7F÷&vV’Â¢®X‹¾hHþKˆÞ‹2—4Væ7'—F–öäf–Æ&ÆR‚’¢ ¢òò(	N(	FÖ4õ2Kˆ®hê.kX¾iÊÎ‹ª¾Xúþˆ;ÞŠznXù™*^XÉžK‹.hèŽiØ>[Ëžz©rÎh¨¢3ƒsy¨N[Ëžz©~i{niË®hùX˜ÞX‹Y
+þXªƒ°¢òòXúþyJŽh
+rþZK‹J^YÊŽZéî™˜^KÛþyJŽx+žŠë[ÙR†WF„ÖævW"y¨B6fU7F÷&vR†VÇW'2ž8.KˆÞY
+¾XzÞŠø8 ¢7&VFTÆövvW"‚w6fR×7F÷&vRr’æ–æfò‚w6fU7F÷&vR–FVçF—G’rÂ°¢æÖS¢ævWDæÖR‚’À¢—56¶vVC¢æ—56¶vVBÀ¢Ò“° ¢òòZê.h‹~zºþzºþx+žkˆ^XÙS®Y
+þXªŽzÊÎKˆjÚ^8XXŽK¨îKˆXˆ~i»Nikj8iúRÂ¢®™‹¾ijÞ[Èò¢®Šz>ié‡6¶vVB‹[ ¢òòx9ŽxI’†÷Ff—‚4DâYû®YØ¶FWb›¹ŽŠêNŠû¾K¹>XhR6öæf–röVæGö–çBæ§6öâÂÒÖVæGö–çG2Ö6Fà¢òòi{nYÂ6¶vVC¾ZK‹JR(i"{;¾{¹þ™IžŠúþjn˜xÞŠùRþ˜X{¢Îiz{É>ZÙŽKˆîx9ŽxIžXYÎ[©Rž8 ¢òò[ø^š¾izžK¨îKˆXˆ~zºþx+žkhŽ‹KžikžX‰ÞZx¾XÉn8K‰NYÊ‚7&VFUv–æF÷r‚’X˜Þk:ŽXhÂ6VæE7–æ2•0¢òò‡&VÆöBjŠYÙ~{ª~YÎjÚ^Šû¾XùnKéÞ‹YnZè2ž8.yJŽh‹~YÊŽ™IžŠúþjn˜’.˜X{¢.i{bæW†—B[{.‹>yJ‚À¢òò‹ùž˜xÎy»NhêR&WGW&âKˆÞXhÞ{º~{ºÞY
+þXªŽ8 ¢–b‚†v—B–æ—D6Æ–VçDVæGö–çG2‚’’’°¢&WGW&ã²òòyJŽh‹~YÊŽ™IžŠúþjn˜žhºž˜X{¢ÆæW†—B[{.‹>yJ€¢Ð¢&Vv—7FW$6Æ–VçDVæGö–çG4—2‚“° ¢òò{ÙX[>XzÞhÚîˆz®XªŽKˆ¾Xù®Šê.™ˆ^y›¾[Ù^hŽy›¾[Ù^YîY	ÖöFVÂÖ66W72×6W'fW"h¸’VæGö–çB°¢òòyJŽh‹~K‰>[â¶W’’²k:ŽXhÂÖöFVÂÖ66W73¢¢•>8.š¾YÊ‚–æ—D6Æ–VçDVæGö–çG2K˜¾Yà¢òòŽKéÞ‹YbÖöFVÄ66W74”&6UW&Âzºþx+’ž8&VæFW&W"WFƒ¦–æ—F–Æ—¦RK˜¾X˜ÞŠ8^Šê.™ˆ^8 ¢–æ—DÖöFVÄ66W72‚“° ¢–æ—F–Æ—¦UWFFU&W6VçFF–öå&V6÷fW'’‚“° ¢òòÖ2FWbKˆ²Fö6²i‹îzK®y¨NiŠòVÆV7G&öâ›¹ŽŠêNY»îj~(	N(	FÖ4õ2[ûÞyZR'&÷w6W%v–æF÷ræ–6öâÀ¢òòFö6²Y»îj~Xùnˆz®Xúþhš~ŠÂ'VæFÆRy¨B–6ç2ÎˆÂFWb‹yy¨NiŠòæöFUöÖöGVÆW2˜xÎy¨NZéŽik¢òòVÆV7G&öâK¨Î‹ù¾X‹n8.‹ùž˜xÂFWbÖöæÇ’h˜¾XªŽŠëîh‰6–æG’Y»îjs·6¶vVBx˜ŽyK¢òò&W6÷W&6W2ö–6öâæ–6ç2ˆz®xKnyIþiX‚ÎKˆÞ™ÈŠhK™þKˆÞŠú^XªŽ8 ¢òòKÛþyJ‚–6öâÖFö6²çæ~ûÈ†vVæW&FRÖÖ2Ö–6ç2æÖ§2Kª~X{®ûÈÎ[{.ZYrÆRYÈnŠy.{ÙjÎûÈžûÉ°¢òò6WD–6öâKÉ®Xéþj~i‹îzK®‹XNk©ûÈÎKˆÞKÉ®i»þ[©NyJŽY»îj~ˆz®XªŽXªYÈnŠy.8 ¢–b‚æ—56¶vVBbb&ö6W72çÆFf÷&ÒÓÓÒvF'v–âr’°¢G'’°¢æFö6³òç6WD–6öâ‡F‚æ¦ö–â…õöF—&æÖRÂrââòââ÷&W6÷W&6W2ö–6öâÖFö6²çærr’“°¢Ò6F6‚†W'"’°¢òòK¸^[ÛY8ÒFWbFö6²Šx.hIòÎZK‹J^KˆÞhÊY
+þXª€¢7&VFTÆövvW"‚vFö6²Ö–6öâr’çv&â‚w6WD–6öâf–ÆVBrÂ²W'&÷#¢7G&–ær†W'"’Ò“°¢Ð¢Ð ¢v—BVç7W&TÖ–ä&W6Væ6R‚v×&VG’r“° ¢òò6–æG’Ö÷væVB6¶–ÆÂ7F—fF–öâæBÆÂ†öÖRÖÆWfVÂ&ö¦V7F–öç2†VâF‡&÷Vv€¢òòöæR7F&ÆRÖ÷væW"&÷VæF'’â76—fR6†&VB×W6W$FF–ç7Fæ6W2Ö’6öç7VÖRF†P¢òò7F—fR'VæFÆR'WB6ææ÷B7v—F6‚—B÷"—G2&ö¦V7F–öç2à¢G'’°¢v—BFW6·F÷6ÆVFTWF„FFW"æVç7W&U6†&VDvÆö&Å6¶–ÆÇ2‚“°¢Ò6F6‚†W'&÷"’°¢òò'&ö¶Vâ÷F–öæÂ6¶–ÆÂ×W7Bæ÷B&Æö6²F†RFW6·F÷g&öÒ7F'F–ærà¢7&VFTÆövvW"‚v'V–ÇBÖ–â×6¶–ÆÇ2r’çv&â‚v'V–ÇBÖ–â6¶–ÆÂ&W&F–öâf–ÆVBrÂ°¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢Ð ¢òòÖ4õ2G&ç6Æö6F–öâf—ƒ¢v†VâF†RW6W"ÆVæ6†W2F†Rv—F†÷W@¢òòG&vv–ær—BFòôÆ–6F–öç2f—'7BÂÖ4õ2'Vç2—Bg&öÒ&VBÖöæÇ¢òòFV×÷&'’F‚Âv†–6‚'&V·2F†R–âÖWFò×WFFW"â&ö×BF†P¢òòW6W"FòÖ÷fRF†R&Vf÷&Rç’÷F†W"–æ—Bv÷&²†Vç2à¢òð¢òò6¶—VB–âFWb†æ—56¶vVF“¢F†RFWbVÆV7G&öâ&–æ'’Æ—fW2–à¢òòæöFUöÖöGVÆW2Â—4–äÆ–6F–öç4föÆFW"‚’Çv—2&WGW&ç2fÇ6RÂæ@¢òòÖ÷fUFôÆ–6F–öç4föÆFW"‚’v÷VÆB7GVÆÇ’Ö÷fRF†RFWb&–æ'’–çFð¢òòôÆ–6F–öç2æB'&V²F†RFWfVÆ÷W"w2v÷&·76Rà¢–b†æ—56¶vVBbb&ö6W72çÆFf÷&ÒÓÓÒvF'v–ârbbæ—4–äÆ–6F–öç4föÆFW"‚’’°¢6öç7B6†÷6VâÒF–Æörç6†÷tÖW76vT&÷…7–æ2‡°¢G—S¢v–æfòrÀ¢F—FÆS¢B‚wWFFRæÖ÷fUFôÆ–6F–öç2çF—FÆRr’À¢ÖW76vS¢B‚wWFFRæÖ÷fUFôÆ–6F–öç2æÖW76vRr’À¢'WGFöç3¢·B‚wWFFRæÖ÷fUFôÆ–6F–öç2æÖ÷fRr’ÂB‚wWFFRæÖ÷fUFôÆ–6F–öç2æÆFW"r•ÒÀ¢FVfVÇD–C¢À¢6æ6VÄ–C¢À¢Ò“°¢–b†6†÷6VâÓÓÒ’°¢G'’°¢æÖ÷fUFôÆ–6F–öç4föÆFW"‚“°¢Ò6F6‚†W'"’°¢6öç6öÆRæW'&÷"‚u¶Ö–åÒÖ÷fUFôÆ–6F–öç4föÆFW"f–ÆVC¢rÂW'"“°¢Ð¢&WGW&ã°¢Ð¢Ð ¢òò–ÖvRÖÆö6ÂÖ66†RÓ"(	B×W7B&Vv—7FW"F†R&÷Fö6öÂ†æFÆW"gFW"&VG¢òò‡F†R66†VÖR—G6VÆbv2&Vv—7FW&VB2&—f–ÆVvVBBÖöGVÆRF÷’à¢òòv–æF÷w2TÔ”NûÉ®[ø^š¾Y(Âå4•2XižX‹7F'BÖVçR[ú¾hÛ~ikž[Èò7—7FVÒäW6W$ÖöFVÂä”@¢òòKˆ®y¨NXÎKˆˆ{NûÈÄVÆV7G&öâæ÷F–f–6F–öâh˜ÞKˆÞKÉ®Š*¾˜	®yú^KŠÞiê.™Ùž›¹ŽKŠ.[È>8 ¢òð¢òò‹ùž˜xÎ[ø^š¾Y»®Zé®K‹¢f÷&vRæ6öæf–rçG2˜xÎy¨B–N8.KˆÞŠh‹ùŠÎi{njŠ{8®hš¾høòvWBÕ7F'D>ûÉ ¢òòX[nK¹b7F'BÖVçRšžy¨B”BK™þXúþˆ;ÞXÈ^Y
+²'†GB.ûÈÎŠúþŠëîYâv–æF÷w2KÉ®hÈž™IžŠúòTÔ”@¢òòZûžK»¾XªjþXˆn{¸NY(ÎXùnY»îj~ûÈÎZûÎˆ{B†GBÖÖ¶W"K‹.X‹XŠ¾y¨N[©NyJŽY»îj~8 ¢òð¢òò[ø^š¾YÊŽX‰¾[»®K»¾KÙRæ÷F–f–6F–öâK˜¾X˜Þ‹>yJŽ8&Ö4õ2òÆ–çW‚KˆÞ™ÈŠh8 ¢–b‡&ö6W72çÆFf÷&ÒÓÓÒwv–ã3"r’°¢v—B6ÆVçWÆVv7”FWe6†÷'F7WB‚“°¢ç6WDW6W$ÖöFVÄ–B…t”äDõu5ôõU4U%ôÔôDTÅô”B“°¢6öç6öÆRæÆör‚u´TÔ”EÒ'VçF–ÖSÒW2rÂt”äDõu5ôõU4U%ôÔôDTÅô”B“°¢Ð ¢&Vv—7FW$–ÖvU&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW%f–FVõ&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW$Æö6Äf–ÆU&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW$VF–ôf–ÆU&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW$ÖöFVÅ&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW%&VÖ÷FTÖVF–&÷Fö6öÄ†æFÆW"‚“°¢&Vv—7FW$6–æG”ÖVF–&÷Fö6öÄ†æFÆW"‚“° ¢òò–æ¦V7B6öçFVçBÕ6V7W&—G’ÕöÆ–7’&W7öç6R†VFW"öçFòF†Rw2÷và¢òòF÷ÖÆWfVÂFö7VÖVçB†FVfVÇE6W76–öâÖ–äg&ÖR’&Vf÷&Rç’v–æF÷rÆöG2à¢òò&Æö6·2â…52g&öÒW66ÆF–ærFò&VÆöB&—f–ÆVvW2f––æÆ–æRòWfÀ¢òò67&—BâFWb…f—FRFWb6W'fW"’vWG2&VÆ†VBöÆ–7’‡Vç6fRÖWfÂ²–æÆ–æP¢òò²„Õ"w2“²6¶vVBf–ÆS¢òò'V–ÆBvWG267&—B×7&2w6VÆbrwVç6fRÖWfÂp¢òòwv6Ò×Vç6fRÖWfÂr‡Vç6fRÖWfÂf÷"fVæF÷&VBG&v–òÂv6Ò×Vç6fRÖWfÂf÷ ¢òò4BÖöFVÂFV6öFW'2’âW‡FW&æÂU$Ç2†RærâôWF‚vW2’&R76VBF‡&÷Vv€¢òòVæÖöF–f–VBâF†R%4"ÇvV'f–WsâW6W2¢òò6W&FR%$õu4U%õ%D•D”ôâ6W76–öâæB—2VæffV7FVBà¢òò&—4FWb"—2¶W–VBöfbF†Rf—FRFWb×6W'fW"U$ÂÂv†–6‚—2W†7FÇ’F†R'VçF–ÖP¢òò6öæF—F–öâVæFW"v†–6‚F†R&VæFW&W"—26W'fVB'’f—FRà¢6öç7B77FWe6W'fW%W&ÂÒÔ”åõt”äDõuõd•DUôDUeõ4U%dU%õU$ÂÇÂçVÆÃ°¢–ç7FÆÄ6öçFVçE6V7W&—G•öÆ–7’‡6W76–öâæFVfVÇE6W76–öâÂ°¢—4FWc¢&ööÆVâ†77FWe6W'fW%W&Â’À¢FWe6W'fW$÷&–v–ã¢'6T÷&–v–â†77FWe6W'fW%W&Â’À¢Ò“° ¢&Vv—7FW$—4†æFÆW'2‚“°¢&V&–æDFF&6U6—¦Uv&æ–æu6WGF–æw5vF6†W"‚“°¢7F'D–çWDFWf–6U'VçF–ÖR‚“°¢7F'D–çWDFWf–6W2‚“°¢òòiÊÎiË¢e2yºî[Ù^kXþŠx‚Žšžyºî˜žhºžYšŽ8Îk{¾Xª‹ùÎzˆ¾šžyºî8Þ˜	{ª~kXþŠxƒ¶FWf–6RÖÆ–æ²{¸þ™ª~˜>YÊŽŠ*¾hê~zºþhš~ŠÂž8 ¢òòizD"òizy›¾[Ù^KéÞ‹YbÎ™¨þX[nZè>šn["†æFÆW"Kˆ‹[~k:ŽXhÎXÛ>Xúþ8 ¢&Vv—7FW$g4'&÷w6T—2‚“°¢òò8Îh‰y¨B—77V^8ÞX‰~ŠŽiú^Šú.8.X‹¾hHþk:ŽXhÎYÊŽ‹ùž˜xÎˆÎKˆÞiŠò&Vv—7FW$Ö¶W$—74gFW%7Æ6ƒ ¢òòZè>KˆÞKéÞ‹YbÖ¶W"KˆâvVçBK¨Î‹ù¾X‹bÎˆÂö—77VW2YÊ‚7Æ6‚6†V6²ÖVçf—&öæÖVçBZèÎh‰X˜Ð¢òòŽh‰nK¨Î‹ù¾X‹b&÷f—6–öâZK‹J^i{bž[Xúþˆ;ÞŠ*¾h™>[È(	N(	BhÈ.YÊ‚7Æ6‚K˜¾YîKÉ®Šêžš^™Ú.h»þX‹ ¢òò$æò†æFÆW"&Vv—7FW&VB"K‰NKˆÞKÉ®ˆz®XªŽh.ZHÞ8 ¢&Vv—7FW$×”—77VW4—2‚“°¢òò6†BÖFFÖÆö6Æ—¦F–öâc"ôc^ûÉ®k:ŽXhÂÆö6ÄF"•2²[›.Xx˜X{®[ú¾xZ~™*žZÙ8 ¢òòKˆÞz¸¾XÛ>[ÈF.ûÉ¶Vç7W&U&VG’yKWF„6öçFW‡BYÊŽy›¾[Ù^h‰X©þYî˜	®‹ør•2ŠznXù8 ¢òòöå&VG’Y¹î‹>iŠò÷væW"D"iØ>Zˆ[{º®x+žûÉ¾Zè>XXŽiKîŠÎiÊÎYËŠû¾ûÈÎXhÞKˆâ7Æ6‚zºþy¨@¢òò&÷f–FW"6ö÷&F–æF÷"KÉ®YŽûÈÎYîXûZèÎh‰‹JnXû~‹zþyKX‰ÞZx¾XÉnYîh˜ÞY
+þXª‚66†VGVÆW.8 ¢òòšiny›¾‹Û¾˜xþi[hÚî‹øz{²†ÕFö2žy¨NzîŠêN[Ëžz©r•2(	N(	B[ø^š¾XXŽK¨â&Vv—7FW$Æö6ÄF$—2k:ŽXhÂÀ¢òòKùÞŠø&Vf÷&TVç7W&U&VG’hêŽ˜6öæf—&Òhi{b&VæFW&W"[{.ˆ;Ò–çfö¶RzîŠêN˜	®˜>8 ¢&Vv—7FW$ÆVv7”Ö–w&F–öä—2‚“°¢6WD†—7F÷'•FööÄæÖU&VFW"†vWD†—7F÷'•FööÄæÖR“°¢&Vv—7FW$Æö6ÄF$—2‡°¢—56W76–öåGW&åVæF–æt6ö×ÆWF–öâÀ¢&VD†—7F÷'”Æ—fTÖW76vW3¢vWE6W76–öåF†–æ¶–æu6æ6†÷G2À¢&W6öÇfT6öçFW‡Ev–æF÷s¢‡6W76–öâ’Óâ&W6öÇfU6W76–öä6öçFW‡Ev–æF÷r†vWD7F—fT6FÆör‚’Â6W76–öâ’À¢&WVW7Ev÷&·G&VU&V7–6ÆRÀ¢6æ6VÅ6W76–öä÷W&F–öç3¢6æ6VÄ”õ56–×VÆF÷%6W76–öä÷W&F–öç2À¢6ÆVçW&VÖ÷fVE6W76–öã¢6ÆVçW”õ56–×VÆF÷%&VÖ÷fVE6W76–öâÀ¢6Æ÷6T–FÆU6W76–öäf÷$Ö÷fS¢7–æ2‡6W76–öä–B’Óâ°¢6öç7BÖ¶W"ÒvWDÖ¶W$–e&VG’‚“°¢–b†Ö¶W#òævWE6W76–öâ‡6W76–öä–B“òæ—5GW&å'Vææ–ær‚’’&WGW&âfÇ6S°¢–b†Ö¶W"’°¢v—B&V‡–G&FT6Æ÷6U7W&W76–öâçv—F…7W&W76VB‡6W76–öä–BÂ‚’Óà¢Ö¶W"æ6Æ÷6U6W76–öâ‡6W76–öä–B’À¢“°¢Ð¢&WGW&âG'VS°¢ÒÀ¢&V6öæ6–ÆUW'6—7FVE6W76–öå'VçF–ÖW3¢&V6öæ6–ÆUW'6—7FVD”õ56–×VÆF÷$÷væW'6†—À¢v—F…6W76–öäÆö6³¢v—F…6VæEFõ6W76–öäÆö6²À¢òòÖ—'&÷'2W†7FÇ’v†BF†R&W7VÖR†æFÆW"&WV—&W2†Ö¶W"Ö—2÷&Vv—7FW"çG6“ ¢òòÆöFVB6W76–öâf÷"F†—2F6²v†÷6RvVçB—2’âv—F†÷WB—Bf–æ—6†V@¢òò'Vâ¶WBGfW'F—6–ær&W7VÖVgFW"&W7F'BæBF†R6–FV&"öffW&VB¢òòföÆÆ÷r×W6ö×÷6W"F†B6÷VÆBöæÇ’WfW"f–Âà¢—5&VçE•6W76–öäÆ—fS¢‡6W76–öä–B’Óâ°¢G'’°¢&WGW&âvWDÖ¶W$–e&VG’‚“òævWE6W76–öâ‡6W76–öä–B“òævVçD¶–æBÓÓÒw’s°¢Ò6F6‚°¢&WGW&âfÇ6S°¢Ð¢ÒÀ¢—4÷væW$7W'&VçC¢‡W6W$–B’Óà¢—4Æö6ÄF$÷væW$7W'&VçB†WF„ÖævW"ævWDWF…7FFR‚’ÂW6W$–BÂ—46W76–öä&÷VæF'•VæF–ær‚’’À¢F—66&E7FÆT÷væW#¢‡W6W$–B’Óà¢Æ–fV7–6ÆTF$6Æ–VçDÖævW"æF—7÷6R†7FÆRÖ÷væW"ÖgFW"×&VG“¢G·W6W$–GÖ’À¢&Vf÷&TVç7W&U&VG“¢7–æ2‡W6W$–B’Óâ°¢òò&÷f–FW"F—66÷fW'’—2FWF6†VBg&öÒD"&VB&VF–æW72f÷"F†R6ÖR÷væW"Â'WB¢òòF–ffW&VçB÷væW"×W7Bæ÷B&WÆ6RF†RD"v†–ÆRF†R&Wf–÷W266÷VçBF6²6â7F–ÆÀ¢òòWFFR÷væW"×66÷VB6FÆöw2÷"vVçBVçf—&öæÖVçG2à¢6öç7BæW‡E&÷f–FW%66÷T¶W’Ò7F—fT÷væW%66÷T¶W’‚“°¢6öç7B&Wf–÷W5&÷f–FW%F6µ6WGFÆVBÐ¢v—B66÷VçE&÷f–FW%&VF–æW74&'&–W"çv—Df÷%&Wf–÷W566÷R†æW‡E&÷f–FW%66÷T¶W’“°¢òòF†RöÆBF6²Ö’†fR6ö×ÆWFVB—G2÷væW"×66÷VBD"&VBgFW"FV&F÷vâ6ÆV&VBF†P¢òò&ö6W72ÖvÆö&Â6FÆörâ6ÆV"öæ6RÖ÷&RgFW"¦ö–æ–ær¦F–ffW&VçB÷væW"¢6ò¢òòf–ÆVBæW‡BÖ÷væW"&VÆöB6ææ÷B–æ†W&—BF†RöÆB6æ6†÷Bâ6ÖRÖ÷væW"vVæW&F–öà¢òò'V×2Ç6òv—B†W&RÂ'WB×W7B¶VWF†R7W'&VçB66÷VçBw27W7FöÒ&÷f–FW'2à¢–b€¢6†÷VÆD6ÆV$6FÆötgFW$¦ö–æ–æu&Wf–÷W566÷R‡°¢v—FVC¢&Wf–÷W5&÷f–FW%F6µ6WGFÆVBÀ¢7W'&VçE6ÖT÷væW$4æW‡C ¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æ†56ÖT÷væW$–FVçF—G’†æW‡E&÷f–FW%66÷T¶W’’À¢Ò¢’°¢6WD7W7FöÕ&÷f–FW'2…µÒ“°¢Ð¢6öç7BW6W"ÒWF„ÖævW"ævWDWF…7FFR‚’çW6W#°¢–b‡W6W"ÓÒçVÆÂÇÂW6W"æ–BÓÒW6W$–B’&WGW&ã°¢–b†WF„ÖævW"æ—576—fU6†&VEW6W$FF–ç7Fæ6R‚’’°¢6öç7B76—fU&VfÆ–v‡BÒv—B–ç7V7E76—fTÆö6Å&öf–ÆTF÷F–öâ€¢W6W"æ–BÀ¢7&VFU&öGV7F–öäÆö6Å&öf–ÆTFFÖ–w&F–öäFW2€¢ævWEF‚‚wW6W$FFr’À¢%$äEô”DTåD•E’æF$f–ÆU&Vf—‚À¢‚’Óâ†4W†6ÇW6—fU6†&VDÆVv7•W6W$FF66W72‚’À¢’À¢“°¢–b‡76—fU&VfÆ–v‡Bç7FGW2ÓÓÒw&WV—&VBr’°¢F‡&÷ræWrW'&÷"‚vÆö6Â&öf–ÆRFF&6RF÷F–öâ—2VæF–ær–âF†R&–Ö'’–ç7Fæ6Rr“°¢Ð¢–b‡76—fU&VfÆ–v‡Bç7FGW2ÓÓÒvf–ÆVBr’°¢F‡&÷ræWrW'&÷"€¢Æö6Â&öf–ÆRFF&6RF÷F–öâ&VfÆ–v‡Bf–ÆVC¢G·76—fU&VfÆ–v‡BæW'&÷'ÖÀ¢“°¢Ð¢&WGW&ã°¢Ð¢òòšiny›¾‹Û¾˜xþ‹øz{²Žˆ†GBÖÖ¶W"W6W$FF(i"6–æG’“®Xh^˜:Žˆz®[ŠbÖ&¶W"™‹.˜xÞXZ^Kˆà¢òòXZŽ˜xþXYÎ[©RÎ{¹ÞKˆÒF‡&÷rÎZK‹J^KˆÞ™‹¾Zîy›¾[ÙR†Vç7W&U&VG’xZ~[‹Ž[»®ik[©2ž8 ¢v—B'VäÆVv7•W6W$FFÖ–w&F–öäf÷%W6W"‡W6W"æ–B“°¢òòy›¾[Ù^X˜ÒÆö6Â×cKˆîy›¾[Ù^Yîy¨B6Æ÷VB÷væW"KÛþyJŽKˆÞYÎi[hÚî[©>ih~K»n8.yºîj~[©>KˆÞZÙŽYÊŽi{`¢òò˜x~yJŽiÊÎYË[©>ûÈÎ˜þXXÞyJŽh‹~X‰®y›¾[Ù^[yÈ¾X‹z›®y¨NK»¾Xªþšžyºîz›®™{NûÉ¾yºîj~[©>[{.ZÙŽYÊŽX‰žKùÞhÈXéþj~ûÈÀ¢òò{¹ÞKˆÞŠhny¹n‹JnXû~[{.iÈžXh^Zëž8 ¢6öç7BÆö6Å&öf–ÆTÖ–w&F–öâÒv—BF÷DÆö6Å&öf–ÆTFF&6R€¢W6W"æ–BÀ¢7&VFU&öGV7F–öäÆö6Å&öf–ÆTFFÖ–w&F–öäFW2€¢ævWEF‚‚wW6W$FFr’À¢%$äEô”DTåD•E’æF$f–ÆU&Vf—‚À¢‚’Óâ†4W†6ÇW6—fU6†&VDÆVv7•W6W$FF66W72‚’À¢&ö6W72çÆFf÷&ÒÓÓÒwv–ã3"p¢ò‚’Óà¢7V—&Uv–æF÷w56¶vVD–ç7Fæ6T&'&–W"‡°¢W6W$FFF—#¢ævWEF‚‚wW6W$FFr’À¢&öw&ÔæÖS¢%$äEô”DTåD•E’æW†V7WF&ÆTæÖRÀ¢Ò¢¢VæFVf–æVBÀ¢’À¢“°¢–b†Æö6Å&öf–ÆTÖ–w&F–öâç7FGW2ÓÓÒvf–ÆVBr’°¢F$6Æ–VçDÆöræW'&÷"‚vÆö6Â&öf–ÆRFF&6RF÷F–öâf–ÆVC²&Æö6¶–ær6Æ÷VBFF&6R÷VârÂ°¢W6W$–BÀ¢W'&÷#¢Æö6Å&öf–ÆTÖ–w&F–öâæW'&÷"À¢Ò“°¢F‡&÷ræWrW'&÷"†Æö6Â&öf–ÆRFF&6RF÷F–öâf–ÆVC¢G¶Æö6Å&öf–ÆTÖ–w&F–öâæW'&÷'Ö“°¢ÒVÇ6R–b†Æö6Å&öf–ÆTÖ–w&F–öâç7FGW2ÓÓÒv6Æ–ÖVBÖ'’Ö÷F†W"Ö÷væW"r’°¢F$6Æ–VçDÆörçv&â‚vÆö6Â&öf–ÆRFF&6R—2Ç&VG’&W6W'fVBf÷"æ÷F†W"6Æ÷VB÷væW"rÂ°¢W6W$–BÀ¢Ò“°¢ÒVÇ6R–b†Æö6Å&öf–ÆTÖ–w&F–öâç7FGW2ÓÓÒvF÷FVBr’°¢F$6Æ–VçDÆöræ–æfò‚vÆö6Â&öf–ÆRFF&6RF÷FVBf÷"f—'7B6Æ÷VB÷væW"rÂ°¢W6W$–BÀ¢Ò“°¢Ð¢ÒÀ¢öå&VG“¢7–æ2‡W6W$–B’Óâ°¢6öç7B7F'GW†öö·57F'FVDBÒW&f÷&Öæ6Rææ÷r‚“°¢ÆWB7F'GW†6U7F'FVDBÒ7F'GW†öö·57F'FVDC°¢6öç7BÆöu7F'GW†6RÒ‡†6S¢7G&–ær“¢fö–BÓâ°¢6öç7Bæ÷rÒW&f÷&Öæ6Rææ÷r‚“°¢F$6Æ–VçDÆöræ–æfò€¢¥4ôâç7G&–æv–g’‡°¢WfVçC¢vÆö6ÄF"ç7F'GWç†6RæFöæRrÀ¢†6RÀ¢VÆ6VD×3¢ÖF‚ç&÷VæB†æ÷rÒ7F'GW†6U7F'FVDB’À¢F÷FÄVÆ6VD×3¢ÖF‚ç&÷VæB†æ÷rÒ7F'GW†öö·57F'FVDB’À¢Ò’À¢“°¢7F'GW†6U7F'FVDBÒæ÷s°¢Ó°¢òò[ø^š¾XX‚v—BVç7W&TÆ–fV7–6ÆTF$6Æ–VçBŽXh^˜:‚v—B7&VFTF$6Æ–VçB(i"v÷&¶W ¢òò7vâ²F"÷Vâ²Ö–w&F–öâ66â²6Öö¶RÎ{ªbÓ'2’Îh¨¢6Æ–VçB{¸ð¢òò6WD7W'&VçDF$6Æ–VçBi«N™Ë.{¹žXZŽ[vWDF$6Æ–VçB‚’K˜¾YâÎYî{ºÒGFV×E7F'E66†VGVÆW"ð¢òòGFV×E7F'DVÖ&VFF–æt†÷7BzØžYî{ºÞY
+þXªŽK»¾Xªh˜Þˆ;Þh»þX‹&VG’y¨BF$6Æ–VçN8 ¢òð¢òòXènXû#¤Õ#"ãi{n‹ùž˜xÎiŠòf—&RÖæBÖf÷&vWBÇ66†VGVÆW"öVÖ&VFF–ær‹[ˆvWDG&—§¦ÆRövWE&tF ¢òò‹zþ[èNKˆÞXù~[ÛY8Þ8$Õ#"ã"h¨¢S‚6ÆÇ6—FRXˆ~X‹F$6Æ–VçBYâÆf—&RÖæBÖf÷&vWBŠêžYî{ºÐ¢òòGFV×BXZŽ˜:Ži)â$F$6Æ–VçBæ÷B&VG’"Ç66†VGVÆW"öVÖ&VFF–ærkŽKˆÞY
+þXª‚(i"&VæFW&W ¢òòXÚYÊ‚•2zØž[èR(i"y›Þ[þ8 ¢6öç7BF$6Æ–VçEF¶V÷fW"Òv—BVç7W&TÆ–fV7–6ÆTF$6Æ–VçB‡W6W$–B“°¢Æöu7F'GW†6R‚vF"Ö6Æ–VçB×F¶V÷fW"r“°¢–b†F$6Æ–VçEF¶V÷fW"æÖöFRÓÓÒvf–ÆVBrÇÂF$6Æ–VçEF¶V÷fW"æÖöFRÓÓÒw6¶—VBr’°¢òòFòæ÷BW‡÷6RF†R&Wf–÷W2÷væW"w27F'GW6æ6†÷BgFW"f–ÆV@¢òòF¶V÷fW"âÆFW"7V66W76gVÂF¶V÷fW"v–ÆÂ6GW&Rg&W6‚6æ6†÷Bà¢7F'GWFF&6U6—¦Uv&æ–æu7FGW2Ò²FF&6T'—FW3¢çVÆÂÓ°¢7F'GWFF&6U6—¦Uv&æ–æu7FGW46†V6¶VBÒfÇ6S°¢7F'GWFF&6U6—¦Uv&æ–æt÷væW%66÷RÒçVÆÃ°¢'&öF67DFF&6U6—¦Uv&æ–æt6†ævVB‚“°¢F$6Æ–VçDÆörçv&â‚u´F$6Æ–VçEÒÆ–fV7–6ÆR6Æ–VçBVæf–Æ&ÆS²6¶—F"Ö6Æ–VçB7F'GW†öö·2rÂ°¢W6W$–BÀ¢ÖöFS¢F$6Æ–VçEF¶V÷fW"æÖöFRÀ¢Ò“°¢òòFV&F÷vâÇ&VG’6Æ÷6VBF†R¶W–&ö&BâF†R&VæFW&W"7F–ÆÂVçFW'2F†P¢òòÖ–âT’Â6ò&W7F÷&R†&Gv&RWfVâv†VâF†RÆ–fV7–6ÆR6Æ–VçBF–Bæ÷Bà¢G'’°¢v—B&W7VÖT–çWDFWf–6UF6µ6Æ÷G2‚“°¢Ò6F6‚†W'&÷"’°¢F$6Æ–VçDÆörçv&â‚t–çWBFWf–6RF6²6Æ÷B&Vg&W6‚f–ÆVB†æöâÖfFÂ’rÂ°¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢Ð¢&WGW&ã°¢Ð¢6†V6´FF&6U6—¦Uv&æ–ætE7F'GW‚“°¢òò&÷B&V6÷fW'’—2÷væW"×66÷VBæB×W7B7F'BöæÇ’gFW"F$6Æ–Vç@¢òòF¶V÷fW"â&Vv—7FW$Ö¶W$—2Ç6ò–çfö¶W2F†—2öæ6R—G26W'f–6W2W†—7BÀ¢òò6÷fW&–ær&÷F‚÷76–&ÆR7Æ6‚öÆöv–â÷&FW&–æw2v—F†÷WBGWÆ–6FR'Vç2à¢fö–B&W7F÷&T&÷E'VçF–ÖTf÷$7W'&VçD÷væW"‚“°¢7F'E&VG•v÷&·G&VTÖ–çFVææ6R‚“°¢–b†F$6Æ–VçEF¶V÷fW"æÖöFRÓÓÒwVæ6†ævVBr’°¢òòXšþz©~Xú>KÉ®XhÞjÊ‹[Æö6ÄF"æVç7W&U&VGžûÉ¾YÂ÷væW"y¨BÆ–fV7–6ÆR6Æ–VçB[{.yKšinKŠ ¢òòöå&VG’ZèÎi[NY
+þXªŽûÈÎYºjÚN‹ùž˜xÎXú®KùÞyY’D"‹ùîhê^KªNhê^ûÈÎKˆÞ˜xÞZHÞhš~ŠÎ‹JnXû~{ª~Y
+þXªŽ{»NhªN8 ¢òòv÷&¶W"F¶V÷fW"KÉ®Šê’Vç7W&U&VG’K‹®iÊÎjÊXšþz©~Xú>˜xÞikh™>[ÈÖ–âD.ûÈÎKªNhê^ZèÎh‰Yîz¸¾XÛ0¢òò˜x®iKîŠú^yúÞi¨.‹ùîhê^ûÈÎ˜þXXÞZè>™[þiÉþXÚyJŽih~K»nXú^iøNY(Â÷F–Ö—¦RZé®i{nYšŽ8 ¢–b†F$6Æ–VçEF¶V÷fW"ç6†÷VÆE&VÆV6TÖ–äF"bb&ö6W72æVçbå„EEôD%ô”å$ô2ÓÒwG'VRr’°¢Æö6ÄF$6Æ÷6TF"‡²&W6W'fU66†VÖÖ–w&F–öäÆV6S¢G'VRÒ“°¢F$6Æ–VçDÆöræ–æfò‚u´F$6Æ–VçEÒGWÆ–6FR÷væW"Vç7W&R&VÆV6VB&V÷VæVBÖ–âF"rÂ°¢W6W$–BÀ¢Ò“°¢Ð¢òò6ÖRÖ÷væW"vVæW&F–öâ'V×Ç6òÆæG2†W&RâVç7W&RF÷G26WGFÆV@¢òòF—66÷fW'’F6²Â7F'G2öæR–b—BæWfW"ÆVæ6†VB‡VæF–ær7F'Bv0¢òò†VÆB7&÷72v†÷7B&÷VæF'’’ÂæB7F'G26öç7VÖW'2–bF†R÷&–v–æÀ¢òòF†Vâ‚’6¶—VBF†VÒv†–ÆR&÷VæF'•VæF–ærà¢fö–BVç7W&T7W'&VçD66÷VçE&÷f–FW%&VF–æW72‚“°¢òòÆöv÷WB7W7VæG2F†R¶W–&ö&Bâ&VÆöv–âöbF†R6ÖR÷væW"7F–ÆÂÆæG0¢òò†W&RÂ6ò&W7F÷&RF6²6Æ÷G2WfVâv†VâF†RÆ–fV7–6ÆR6Æ–VçB—2&WW6VBà¢G'’°¢v—B&W7VÖT–çWDFWf–6UF6µ6Æ÷G2‚“°¢Ò6F6‚†W'&÷"’°¢F$6Æ–VçDÆörçv&â‚t–çWBFWf–6RF6²6Æ÷B&Vg&W6‚f–ÆVB†æöâÖfFÂ’rÂ°¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢Ð¢&WGW&ã°¢Ð¢G'’°¢v—B&W7VÖT–çWDFWf–6UF6µ6Æ÷G2‚“°¢Ò6F6‚†W'&÷"’°¢F$6Æ–VçDÆörçv&â‚t–çWBFWf–6RF6²6Æ÷B&Vg&W6‚f–ÆVB†æöâÖfFÂ’rÂ°¢W'&÷#¢W'&÷"–ç7Fæ6VöbW'&÷"òW'&÷"æÖW76vR¢7G&–ær†W'&÷"’À¢Ò“°¢Ð¢G'’°¢v—B&W7VÖTFVÆWFVE•7V&vVçD6ÆVçW‚“°¢Ò6F6‚†W'"’°¢F$6Æ–VçDÆörçv&â‚u’7V&vVçBFVÆWFVB×F6²6ÆVçW&V6÷fW'’f–ÆVB†æöâÖfFÂ’rÂ°¢W6W$–BÀ¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Ð¢Æöu7F'GW†6R‚w’×7V&vVçBÖ6ÆVçW×&V6÷fW'’r“°¢òò†6Rã¢f–ÆRv÷&¶W"hê^zêD"‹ùîhê^YâÎ˜x®iKâÖ–âzºþy¨BöF"²÷F–Ö—¦RZé®i{nYšŽ8 ¢òòZh.iéÂv÷&¶W"F¶V÷fW"ZK‹J^[›n‹ù¾XZR–ç&ö2fÆÆ&6²ÆÖ–âöF"[ø^š¾{º~{ºÞKùÞyY’À¢òòY
+nX‰’fÆÆ&6²KÉ®h»þX‹[{.X[>™zÞy¨N‹ùîhê^8 ¢–b†F$6Æ–VçEF¶V÷fW"ç6†÷VÆE&VÆV6TÖ–äF"bb&ö6W72æVçbå„EEôD%ô”å$ô2ÓÒwG'VRr’°¢òòXú®h¨®‹ùîhê^KªN{¹’v÷&¶W.ûÈÎKˆÞˆ;Þ˜x®iKâ6†&VB×76—fR66†VÖ&VFW"ÆV6^ûÉ§v÷&¶W ¢òò‹ùŽKÉ®™[þiÉþhÈiÈžYÎKˆD.ûÉ¶ÆV6R[ø^š¾yYžX‹yÉþjÚ2Æöv÷WBòV—Bh˜Þ˜x®iKî8 ¢Æö6ÄF$6Æ÷6TF"‡²&W6W'fU66†VÖÖ–w&F–öäÆV6S¢G'VRÒ“°¢F$6Æ–VçDÆöræ–æfò‚u´F$6Æ–VçEÒÖ–â×6–FRöF"&VÆV6VBgFW"v÷&¶W"F¶V÷fW"r“°¢Ð¢6öç7B66÷VçE7v—F6„ÆörÒ7&VFTÆövvW"‚v7W7FöÒÖÖ7Ö66÷VçB×7v—F6‚r“°¢òò‹ª¾K»Þ{û¾‹ÚÎ˜~yYžy¨BF–ÆöwVR[z^KÙÎyºî[Ù^ˆz®hHƒ®h¨¢ÆVv7’W6W$FFX˜Þ{Èy¨@¢òò6W76–öç2çv÷&¶–æuöF—"h›ž˜xþiKžXižX‹[Ù>X˜ÒW6W$FFŽŠúnŠxF–ÆöwVUv÷&¶F—%6VÆd†VÂçG2ž8 ¢òò[ø^š²v—C¦Vç7W&R×&VG’•2‹ùNY¹îYâ&VæFW&W"h˜Þh¸žKÉ®ŠùÞX‰~Š‚ÎYÊŽjÚNK˜¾X˜ÞiKžXižZèÀ¢òòh˜Þˆ;ÞKùÞŠø&VæFW&W"h»þX‹y¨N[iŠþik‹zþ[èBŽiKžXižYîKˆÞXhÞYÞKŠÒÎz‹>h™»n[È™Hž8 ¢G'’°¢v—B7vVWÆVv7”F–ÆöwVUv÷&¶–ætF—'2‡°¢F#¢vWDF$6Æ–VçB‚’À¢W6W$FFF—#¢ævWEF‚‚wW6W$FFr’À¢ÆVv7•W6W$FFF—$æÖW3¢ÆVv7”F–ÆöwVUW6W$FFF—$æÖW2„5U%$TåEô4”äE•õ$Tt”ôâ’À¢7W'&VçDF–ÆöwVW5&ö÷C¢÷væW%66÷VEW6W$FFF‚‚vF–ÆöwVW2r’À¢FF—F–öæÄÆVv7”F–ÆöwVU&ö÷G3¢·F‚æ¦ö–â†ævWEF‚‚wW6W$FFr’ÂvF–ÆöwVW2r•ÒÀ¢Æös¢7&VFTÆövvW"‚vF–ÆöwVR×v÷&¶F—"×6VÆbÖ†VÂr’À¢Ò“°¢Ò6F6‚†W'"’°¢F$6Æ–VçDÆörçv&â‚vÆVv7’F–ÆöwVRv÷&¶F—"7vVWf–ÆVB†æöâÖfFÂ’rÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Ð¢Æöu7F'GW†6R‚vF–ÆöwVR×v÷&¶F—"×7vVWr“°¢òòiz~8Î‹XNiižiÊÎYËŠhnXiž8ÞikžjŽ˜[Û’ƒ##bÓržy¨NKˆjÊh
+~kˆ^yc®kˆ^[Ù>X˜Þ‹JnXû~YÞKˆ¾y¨@¢òò&öf–ÆRÖfF"Z©.KÙ>[É^yJŽKˆâ÷fW'&–FRiÚyºâŽih~K»niÚyºîXÛ>[˜.zØžj~ŠëÎZK‹J^Kˆ¾jÊy›¾[Ù^˜xÞŠùRž8 ¢fö–B†7–æ2‚’Óâ°¢6öç7B÷fW'&–FUF‚ÒF‚æ¦ö–â†ævWEF‚‚wW6W$FFr’Âw&öf–ÆRÖ÷fW'&–FRæ§6öâr“°¢6öç7BÆVv7•&öf–ÆTÆörÒ7&VFTÆövvW"‚w&öf–ÆTVF—Br“°¢v—B&öf–ÆTVF—Bæ6ÆVçWÆVv7•&öf–ÆT÷fW'&–FR€¢°¢&VD÷fW'&–FTf–ÆS¢‚’Óâ°¢G'’°¢&WGW&âg2ç&VDf–ÆU7–æ2†÷fW'&–FUF‚ÂwWFbÓ‚r“°¢Ò6F6‚°¢&WGW&âçVÆÃ°¢Ð¢ÒÀ¢òòF×·&VæÖRXéþZÙXi“®XižKˆXØ®[Jžk¨>KˆÞKÉ®h¨®XšžKÙž‹JnXû~y¨NiÚyºîXùŽh‰hÙþYØò¥4ôà¢òòŽhÙþYØþih~K»nKÉ®Š*¾kˆ^yn˜¾‹é[Ù2.izK¸îZé®KØÒ.i[NKÙ>XŠ™šBÎX[n[É^yJŽY¹îX‹k8NkÈþx«nhž8 ¢w&—FT÷fW'&–FTf–ÆS¢†6öçFVçB’Óâ°¢6öç7BF×ÒG¶÷fW'&–FUF‡ÒçF×°¢g2çw&—FTf–ÆU7–æ2‡F×Â6öçFVçBÂwWFbÓ‚r“°¢g2ç&VæÖU7–æ2‡F×Â÷fW'&–FUF‚“°¢ÒÀ¢FVÆWFT÷fW'&–FTf–ÆS¢‚’Óâg2çVæÆ–æµ7–æ2†÷fW'&–FUF‚’À¢&VÖ÷fU&Vg3¢&VÖ÷fTÖVF–&Vg2À¢Æöt–æfó¢†ÖW76vR’ÓâÆVv7•&öf–ÆTÆöræ–æfò†ÖW76vR’À¢Æöuv&ã¢†ÖW76vRÂW'"’ÓâÆVv7•&öf–ÆTÆörçv&â†ÖW76vRÂW'"’À¢ÒÀ¢W6W$–BÀ¢“°¢Ò’‚’æ6F6‚‚†W'"’Óâ°¢F$6Æ–VçDÆörçv&â‚vÆVv7’&öf–ÆR÷fW'&–FR6ÆVçWF‡&Wr†æöâÖfFÂ’rÂW'"“°¢Ò“°¢òòK»~jÎŠŽKÙÎyJŽYùþKéÞ‹Yn[Ù>X˜ÒÆö6ÄF"yJŽh‹~Kˆâ&÷f–FW"×6V7&WB÷væW#¾[ø^š¾zØžyJŽh‹rD"&VG’YîXhÞš(Nx:Þ8 ¢fö–B&Wv&ÔÖöFVÅ&–6–ær‚“°¢òòD"XúþŠû¾KˆâvVçBXúþY
+þXªŽiŠþKŠNKŠ®KˆÞYÎy¨B&VF–æW7>ûÉ®xëiÈžK»¾XªX‰~ŠŽXú®KéÞ‹YnX˜Þˆ^ûÈÎKˆÞˆ;Ð¢òòŠ*¾{Ù{¹ÎjŠYè¾Xùxë™‹¾ZîûÉ¾ik[»¢òXù˜X‰ž{¸ò&Vv—7FW$Ö¶W$—2y¨NKŠÞ[ø>XZ^Xú>zØž[è^Kˆ¾ik’&'&–W.ûÈÀ¢òòKùÞyY’—77VR3“by¨N‹zþyKjÚ>zîh
+~ûÈ„çF‡&÷–2kˆ^XÙ^Y¹îiÚ^X˜ÞKˆÞˆ;ÞXXŽhÈ’„B›¹ŽŠêN[»¢÷W>ûÈž8 ¢òð¢òòjŠYè¾Xùxë[ø^š¾hé.YÊ‚6öFW‚˜xÞY
+þ[¨þX‰~K˜¾YîûÉ®Yîˆ^iÊ¾[îKÉ®hÈ’WF‚‹ëžyXÎ˜xÞŠû°¢òòÖöFVÇ5ö66†^ûÈ†66†RÖ—72XÛ>kˆ^z›®™‹.K‹.Xû~ûÈžûÈÎ[›nXù‹yKÉ®ŠêžX‰®Xùxëy¨Nkˆ^XÙ^Š*¾z›®[ú¾xZ~Šhny¹n8 ¢6öç7B&W7VÖT–æ6ö×ÆWFTF—66÷fW'’Ò7–æ2‚“¢&öÖ—6SÇfö–CâÓâ°¢6öç7B†æFÆRÒ66÷VçE&÷f–FW%&VF–æW74&'&–W"æ7W'&VçD†æFÆR‚“°¢–b€¢†æFÆRÇÀ¢vWD7F—fT6W76–öâ‚’æFF÷væW$–BÓÒW6W$–BÇÀ¢66÷VçE&÷f–FW%&VF–æW74&'&–W"ææVVG4–æ6ö×ÆWFTF—66÷fW'•&W7VÖR††æFÆRç66÷T¶W’¢’°¢&WGW&ã°¢Ð¢6öç7B6FÆötÖ•w&—FRÒ‚’Óà¢†æFÆRæ—4Æ—fR‚’b`¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æ—47W'&VçDF÷F&ÆR‚’b`¢vWD7F—fT6W76–öâ‚’æFF÷væW$–BÓÓÒW6W$–C°¢v—BF—66÷fW$66÷VçE&÷f–FW$ÖöFVÇ2€¢°¢ÆöE†”Æ¶s¢ÆöE†”ÖöFVÇ4g&öÔF—6´66†RÀ¢&Vg&W6…&÷f–FW$ÖöFVÇ3¢&WVW7E&÷f–FW$ÖöFVÄWFõ&Vg&W6‚À¢Æös¢66÷VçE7v—F6„ÆörÀ¢ÒÀ¢6FÆötÖ•w&—FRÀ¢“°¢–b†6FÆötÖ•w&—FR‚’’†æFÆRæÖ&´F—66÷fW'”6ö×ÆWFR‚“°¢Ó°¢6öç7B7F'E&÷f–FW%&VF–æW72Ò‚“¢fö–BÓâ°¢–b‚Ö¶W%&÷f–FW%&Vg&W6„6öæf–wW&VB’°¢7F'EVæF–æt66÷VçE&÷f–FW%&VF–æW72Ò²÷væW$–C¢W6W$–BÂ7F'C¢7F'E&÷f–FW%&VF–æW72Ó°¢&WGW&ã°¢Ð¢6öç7B&÷f–FW%66÷T¶W’Ò7F—fT÷væW%66÷T¶W’‚“°¢6öç7B7W'&VçD÷væW$–BÒvWD7F—fT6W76–öâ‚’æFF÷væW$–C°¢–b‚7W'&VçD÷væW$–BÇÂ7W'&VçD÷væW$–BÓÒW6W$–B’°¢&WGW&ã°¢Ð¢–b†—46W76–öä&÷VæF'•VæF–ær‚’’°¢7F'EVæF–æt66÷VçE&÷f–FW%&VF–æW72Ò°¢÷væW$–C¢W6W$–BÀ¢7F'C¢7F'E&÷f–FW%&VF–æW72À¢Ó°¢&WGW&ã°¢Ð¢–b†66÷VçE&÷f–FW%&VF–æW74&'&–W"ææVVG4–æ6ö×ÆWFTF—66÷fW'•&W7VÖR‡&÷f–FW%66÷T¶W’’’°¢fö–B&W7VÖT–æ6ö×ÆWFTF—66÷fW'’‚“°¢&WGW&ã°¢Ð¢–b€¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æ†566÷R‡&÷f–FW%66÷T¶W’’ÇÀ¢†66÷VçE&÷f–FW%&VF–æW74&'&–W"æ†4F÷F&ÆU6ÖT÷væW"‡&÷f–FW%66÷T¶W’’b`¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æ—4F—66÷fW'”6ö×ÆWFR‚’¢’°¢&WGW&ã°¢Ð¢6öç7B&÷f–FW%&VF–æW72Ò66÷VçE&÷f–FW%&VF–æW74&'&–W"ç7F'B€¢&÷f–FW%66÷T¶W’À¢7–æ2††æFÆR’Óâ°¢6öç7B7F'FVDBÒW&f÷&Öæ6Rææ÷r‚“°¢G'’°¢òòˆz®Zé®K˜’Ô5Kˆîˆz®Zé®K˜žKé¾[©NYXn˜;ÞXú®iÈÞXªvVçB‹zþyKûÈÎKˆÞ[©NŠú^™‹¾ZîK»¾XªX‰~ŠŽ8 ¢òòK¨Îˆ^YÊŽXh^{ÚîjŠYè¾XùxëX˜ÞZèÎh‰ûÈÎzîKùÞYî{ºÒ&÷WFR6öç7VÖW"Xú®yÈ¾[Ù>X˜Þ‹JnXû~8 ¢G'’°¢òòXˆ~XûrFV&F÷vâKÉ¢&W6WBÖ¶W"Y(ÂÔ5&Vv—7G'ž8.XXŽ˜xÞ[»¢Ö¶W"Kº^˜xÞikk:ŽXhÀ¢òò&÷f–FW"'&—>ûÈÎXhÞzØžZè>y¨NX‰ÞZx¾X‹~ikûÉ¾Xk~Y
+þXªŽi{nX‰ÞZx¾X‹~ikXúþˆ;ÞizžK¨à¢òòD"&VG’ˆÎz›®‹yûÈÎh˜Kº^™¨þYî‹ùŽŠhi‹î[ÈþŠ^X‹~KˆjÊ[Ù>X˜Ò÷væW.8 ¢vWDÖ¶W$6÷&R‚“°¢v—Bv—Df÷$–æ—F–Ä7W7FöÔÖ7&Vg&W6‚‚“°¢v—B&Vg&W6„7W7FöÔÖ7&÷f–FW'2‚“°¢Ò6F6‚†W'"’°¢66÷VçE7v—F6„Æörçv&â‚w&Vg&W6„7W7FöÔÖ7&÷f–FW'2öâ66÷VçB7v—F6‚f–ÆVBrÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Ð¢òò6ÆVçW—2÷vVBFòF†—27F'B‚’VçG'’Âæ÷BF†R&ö6W72×v–FR&÷VæF'¢òòfÆrâ6ÖRÖ÷væW"v†÷7B&W—"†öÆG2&Vv–ä6W76–öä&÷VæF'’‚’7&÷70¢òòFV&F÷vâ²6öÖÖ—C²–bF†BfÆrvFVB&W6WBõ’6‡WFF÷vâÂâ–âÖfÆ–v‡@¢òò(i$"&W7F'D6öFW‚v÷VÆB6¶—6‡WFF÷vä6öFW„Vçf—&öæÖVçBf÷&WfW"v†–ÆP¢òòF—66÷fW'’7F–ÆÂÖ&¶VBF†RVçG'’6ö×ÆWFRæBF÷F&ÆRà¢6öç7BVçG'•7F–ÆÄÆ—fRÒ‚’Óâ†æFÆRæ—4Æ—fR‚“°¢òò6FÆörw&—FW2F–Rv—F‚&VÂ÷væW"FV&F÷vâ†–çfÆ–FFTF÷F–öæ’à¢òò6öFW‚õ’6ÆVçW7F—2÷vVBFòF†—2VçG'’7&÷726ÖRÖ÷væW"'V×à¢6öç7B6FÆötÖ•w&—FRÒ‚’Óà¢†æFÆRæ—4Æ—fR‚’bb66÷VçE&÷f–FW%&VF–æW74&'&–W"æ—47W'&VçDF÷F&ÆR‚“°¢v—B&Vg&W6„7W7FöÕ&÷f–FW'4–çFô6FÆör†6FÆötÖ•w&—FR“°¢òòæWr7F'B‚’—2Ç&VG’æWr–æ6&æF–öâ‡6ÖRÖ÷væW"&öÆÆ÷fW"F÷G0¢òò–ç7FVB’â&–æB&W6WBöF—66÷fW'’õ’FV&F÷vâFòF†—2VçG'’6òÆFW ¢òòvVæW&F–öâ'V×6ææ÷B6¶—(i$"6ÆVçWÂæB&WÆ6VBVçG'’6ææ÷@¢òòÖ&²F†RæW‡B–æ6&æF–öâ6ö×ÆWFRà¢–b†VçG'•7F–ÆÄÆ—fR‚’’°¢v—B&W6WD66÷VçE&÷f–FW%'VçF–ÖW2€¢°¢&W7F'D6öFWƒ¢&W7F'D6öFW„gFW$WF„ÖöFT6†ævRÀ¢6‡WFF÷vä6öFW„Vçf—&öæÖVçBÀ¢Æös¢66÷VçE7v—F6„ÆörÀ¢ÒÀ¢VçG'•7F–ÆÄÆ—fRÀ¢“°¢Ð¢–b†6FÆötÖ•w&—FR‚’’°¢v—BF—66÷fW$66÷VçE&÷f–FW$ÖöFVÇ2€¢°¢ÆöE†”Æ¶s¢ÆöE†”ÖöFVÇ4g&öÔF—6´66†RÀ¢&Vg&W6…&÷f–FW$ÖöFVÇ3¢&WVW7E&÷f–FW$ÖöFVÄWFõ&Vg&W6‚À¢Æös¢66÷VçE7v—F6„ÆörÀ¢ÒÀ¢6FÆötÖ•w&—FRÀ¢“°¢†æFÆRæÖ&´F—66÷fW'”6ö×ÆWFR‚“°¢Ð¢–b‚VçG'•7F–ÆÄÆ—fR‚’’&WGW&ã°¢òò’'&–FvRKˆâ6öFW‚YÎk©ûÈ„…EE'&–FvR²vFWv’¶WžûÈžûÈÎ‹JnXû~Xˆ~hÚ.YîK™þ[ø^š°¢òòkˆ^hèžiz~‹JnXû~xêþZ(>ûÈÎŠêžKˆ¾KˆjÊ’KÉ®ŠùÞhÈžik‹JnXû~XzÞŠø˜xÞ[»®8 ¢G'’°¢v—B6‡WFF÷vå”Vçf—&öæÖVçB‚“°¢Ò6F6‚†W'"’°¢66÷VçE7v—F6„Æörçv&â‚w6‡WFF÷vå”Vçf—&öæÖVçBöâ66÷VçB7v—F6‚f–ÆVBrÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Ð¢Ò6F6‚†W'"’°¢òòKˆîizrÆö6ÄF$vFR[þ™©ÎKˆˆ{NûÉ§&÷f–FW"&VF–æW72iŠò&W7BÖVff÷'NûÉ¾hHþZInZK‹J^Xú®Šë‹JnûÈÀ¢òòKˆÞh¨®[{.{¸þXúþŠû¾y¨NiÊÎYËD"Šúþhª^h‰Y
+þXªŽZK‹J^ûÈÎK™þKˆÞŠêžXù˜XZ^Xú>kŽK˜^h*ÎhÈ.8 ¢66÷VçE7v—F6„Æörçv&â‚v66÷VçB&÷f–FW"&VF–æW72F6²f–ÆVB†æöâÖfFÂ’rÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢Òf–æÆÇ’°¢66÷VçE7v—F6„Æöræ–æfò‚v66÷VçB&÷f–FW"&VF–æW726WGFÆVBrÂ°¢VÆ6VD×3¢ÖF‚ç&÷VæB‡W&f÷&Öæ6Rææ÷r‚’Ò7F'FVDB’À¢Ò“°¢Ð¢ÒÀ¢†W'"’Óâ°¢66÷VçE7v—F6„Æörçv&â‚v66÷VçB&÷f–FW"&VF–æW72&V¦V7FVBVæW‡V7FVFÇ’rÂ°¢W'&÷#¢W'"–ç7Fæ6VöbW'&÷"òW'"æÖW76vR¢7G&–ær†W'"’À¢Ò“°¢ÒÀ¢“°¢òò†öö²òW'6öæÂ”Òò66†VGVÆW"6â&W6öÇfR&÷WFW2&Vf÷&RÖ¶W"æ7&VFU6W76–öâÂ6ò&Ð¢òòF†VÒöæÇ’gFW"F—66÷fW'’6WGFÆW2âF†RÖ¶W"Æ–fV7–6ÆR†öö²&VÖ–ç2F†Rf–æÂwV&Bf÷ ¢òòWfW'’F—&V7B7&VFRF‚âF†R66÷R6†V6²&WfVçG2âöÆB6ö×ÆWF–öâg&öÒ&Wf—f–ær†÷7G0¢òògFW"â66÷VçB&÷VæF'’à¢6öç7B7F'FVD†æFÆRÒ66÷VçE&÷f–FW%&VF–æW74&'&–W"æ7W'&VçD†æFÆR‚“°¢fö–B&÷f–FW%&VF–æW72çF†Vâ‚‚’Óâ°¢–b€¢7F'FVD†æFÆSòæ—4Æ—fR‚’ÇÀ¢6†÷VÆE7F'E&VF–æW746öç7VÖW'2‡°¢6GW&VE66÷T¶W“¢&÷f–FW%66÷T¶W’À¢7W'&VçE66÷T¶W“¢7F—fT÷væW%66÷T¶W’‚’À¢&÷VæF'•VæF–æs¢—46W76–öä&÷VæF'•VæF–ær‚’À¢F÷F&ÆS¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æ—47W'&VçDF÷F&ÆR‚’À¢Ò’ÇÀ¢66÷VçE&÷f–FW%&VF–æW74&'&–W"æÖ&´6öç7VÖW'57F'FVB‚¢’°¢&WGW&ã°¢Ð¢7F'D66÷VçD–çFVw&F–öç4gFW$÷væW$F%&VG’‡W6W$–BÂ°¢—4÷væW$7W'&VçC¢†÷væW$–B’Óà¢—4Æö6ÄF$÷væW$7W'&VçB€¢WF„ÖævW"ævWDWF…7FFR‚’À¢÷væW$–BÀ¢—46W76–öä&÷VæF'•VæF–ær‚’À¢’À¢7F'D†öö´6öçG&öÄ66÷VçBÀ¢7F'D–Ô6öææV7F–öâÀ¢Æös¢F$6Æ–VçDÆörÀ¢Ò“°¢GFV×E7F'E66†VGVÆW"‚“°¢GFV×E7F'DVÖ&VFF–æt†÷7B‚“°¢Ò“°¢Ó°¢òòÆö6ÄF"Kˆâ7Æ6‚XúþKº^K»¾hHþXXŽYîZèÎh‰8.XØþ‹>YšŽ[{.˜XÞ{Úî[z¸¾XÛ>[ÈYîXûK»¾XªûÉ°¢òòY
+nX‰žXú®y›¾Šë[Ù>X˜Ò66÷Ry¨NY
+þXªŽ™zÞXÈ^ûÈÎKˆÞX‰¾[»®KˆKŠ®Xúþˆ;ÞkŽK˜RVæF–æry¨B&öÖ—6^8 ¢6WD66÷VçE&÷f–FW%&VF–æW75&VG”†æFÆW"‚†÷væW$–B’Óâ°¢7F'D66÷VçD–çFVw&F–öç4gFW$÷væW$F%&VG’†÷væW$–BÂ°¢—4÷væW$7W'&VçC¢†–B’Óà¢—4Æö6ÄF$÷væW$7W'&VçB†WF„ÖævW"ævWDWF…7FFR‚’Â–BÂ—46W76–öä&÷VæF'•VæF–ær‚’’À¢7F'D†öö´6öçG&öÄ66÷VçBÀ¢7F'D–Ô6öææV7F–öâÀ¢Æös¢F$6Æ–VçDÆörÀ¢Ò“°¢GFV×E7F'E66†VGVÆW"‚“°¢GFV×E7F'DVÖ&VFF–æt†÷7B‚“°¢Ò“°¢66÷VçE&÷f–FW%&VF–æW74&ÒçV&Æ—6‚€¢W6W$–BÀ¢7F'E&÷f–FW%&VF–æW72À¢&W7VÖT–æ6ö×ÆWFTF—66÷fW'’À¢“°¢–b†Ö¶W%&÷f–FW%&Vg&W6„6öæf–wW&VB’7F'E&÷f–FW%&VF–æW72‚“°¢VÇ6P¢7F'EVæF–æt66÷VçE&÷f–FW%&VF–æW72Ò²÷væW$–C¢W6W$–BÂ7F'C¢7F'E&÷f–FW%&VF–æW72Ó°¢Æöu7F'GW†6R‚w÷7BÖF"Ö†öö·2×66†VGVÆVBr“°¢ÒÀ¢Ò“°¢òòFWbÖöæÇ’•2f÷"VÖ&VFF–ærÖ†÷7B6Öö¶RFW7F–ær‡7FGW2²7–æ2VÖ&VB’âZèžXZƒ ¢òòXh^˜:Žˆz®[Šbæ—56¶vVBZèŽXÚ²Â6¶vVB'V–ÆBKˆ²&Vv—7FW"iŠòæòÖ÷8 ¢&Vv—7FW$FWdVÖ&VFF–æt—2‚“°¢òòv÷&·G&VR×&ÆÆVÂ×6W76–öç3¢k:ŽXhÂrKŠ¢v÷&·G&VS¢¢6†ææVÂŽX‰¾[»¢þiú^Šú"þX‰~Š‚÷&WfVÂòâââ¢òòXŠ™šN‹zþ[èNKˆÞi«N™Ë"•3²K¸^YÊ‚62ÖvVçC¦6Æ÷6R×6W76–öâXh^˜:Ž‹>yJ‚&VÖ÷fUv÷&·G&VTf÷%6W76–öî8 ¢&Vv—7FW%v÷&·G&VT—2†—4Ö–â“°¢òò6W76–öâÖv—B×"Ö6öçFW‡C¢v—BÖ6öçFW‡C¢¢6†ææVÂŽXˆniJþiú^Šú"ô„TBy¹Y
+Âõ"[É^yJ‚õ"x«nh¢&Vv—7FW$v—D6öçFW‡D—2‚“°¢&Vv—7FW$v—E&Wf–Wt—2‡°¢—56W76–öå'Vææ–æs¢‡6W76–öä–B’Óâ°¢G'’°¢&WGW&âvWDÖ¶W$6÷&R‚’ævWE6W76–öâ‡6W76–öä–B“òæ—5GW&å'Vææ–ær‚’ÓÓÒG'VS°¢Ò6F6‚°¢&WGW&âfÇ6S°¢Ð¢ÒÀ¢Ò“°¢òòFWf–6RÖÆ–æ²‹ùÎzˆ²v—BZêiúRŽXú®Šû²“¦v—B×&Wf–Ws§&VÖ÷FRÖ÷†æFÆW"ŽŠ*¾hê~zºþŠy.ˆ›#°¢òò–çfö¶R×&Vv—7G'’hÙ^ˆë~YîKé¾hê~X‹nzºþ™ª~˜>‹>yJ‚ÎiÊÎiË¢&VæFW&W"KˆÞ‹>yJ‚ž8 ¢&Vv—7FW$v—E&Wf–WtFWf–6T÷‚“°¢&Vv—7FW$ÖöFVÅf—6–&–Æ—G”÷væW$6Æ–Ô—2‚“°¢&Vv—7FW$ÖöFVÅf—6–&–Æ—G•7–æ4—2‚“°¢&Vv—7FW%6–FV&%6WGF–æw4—2‚“°¢&Vv—7FW%&ö¦V7D÷&FW$—2‚“°¢&Vv—7FW%&VÖ÷FU&V7&VFVEv÷&·G&VTÆVFvW$—2‚“°¢òò%4"FW&Ö–æÂF#¢E’&6¶VæB²‚KŠ¢FW&Ö–æÃ¢¢•26†ææVÇ2†7&VFR÷w&—FR÷&W6—¦RöF—7÷6R÷&W7F'@¢òò²Æ—7Df–Æ&ÆU6†VÆÇ2òvWGÇ6WDFVfVÇE6†VÆÅ&Vbž8&÷væW"vV$6öçFVçG2FW7G&÷–VBi{c ¢òòÒ%4"xºÎz¸¾ZÙz©~Xú>™HjøŽiKn‹[ròYŽ[›nY¹îK‹¾z©rž(i"E’‹ÚÎz{¾{¹žK‹¾z©~KùÞkK²Î‹é>X{¢6–æ²iKžhêŽK‹¾z©rÀ¢òòKˆîXh^[XÎ[Ú.h.iKn‹[~Kê~jþKˆÞiØ{¸Žzºò.ŠúÞK˜žKˆˆ{C¾K‹¾z©~˜xÞhÈ.{¸ŽzºþYîKÉ®[˜.zØ’&RÖGF6‚hê^zê8 ¢òòÒK‹¾z©~™Hjø†˜X{¢ž(i"fÆÆ&6²Šz>iéKˆÞX‹kK²vV$6öçFVçG2ÅG”ÖævW"Y¹î‰ÒF—7÷6RÀ¢òòiz™ÈYÊŽ‹ùž˜xÎh˜¾Xª‚v—&R6‡WFF÷vâ™*žZÙ8 ¢&Vv—7FW%FW&Ö–æÄ†æFÆW'2‡°¢vWDfÆÆ&6´÷væW#¢‚’Óà¢Ö–åv–æF÷u&VbbbÖ–åv–æF÷u&Vbæ—4FW7G&÷–VB‚’òÖ–åv–æF÷u&VbçvV$6öçFVçG2¢çVÆÂÀ¢Ò“°¢&Vv—7FW$Æö6ÅF†VÖW4—2‚“°¢&Vv—7FW%fö–6T–çWD—2‚“°¢&Vv—7FW$vÆö&Åfö–6T–çWD—2‡°¢vWDÖ–åv–æF÷s¢‚’ÓâÖ–åv–æF÷u&VbÀ¢òòKÉ®ŠùÞXšþz©~Xú>‹yYÎKˆZY~‹zþyKÎŠëî{Úîš^YÊŽ˜xÎ™Ú.xZ~j~h™>[é~[ÈÎh˜Kº^[Ëž{;¾{¹þhèŽiØ>z©~˜*>KŠNiÚ•2ŠhŠêNZè>8 ¢—56V6öæF'”v–æF÷rÀ¢Ò“°¢òòˆwW6vS¦vWB×FöF’×7VæBr[{.˜[Û’(	N(	B&VæFW&W"‹[Ö¶W#§W6vS§FöF’‚v6ÆVFRÖ6öFRr’h¸ž8 ¢òò&VEFöF•7VæBK¸ÞYÊ‚Ö–â÷W6vT'&öF67FW"çG2Xh^˜:ŽŠ*²&VDvVçEFöF•W6vRyJŽ8 ¢òòK‹¾iË®š9îKšbFö¶Vâ™;î[{.˜[Û’ƒ##bÓrÓr“®š9îKšnhèŽiØ>iKžyK†BÖfV—6‡RhHþŠøn{¸ð¢òòôWF‚'&ö¶W"ˆz®hÈ8.ˆy›¾[Ù^™;îyYžYÊŽz8y¹Žy¨Nš9îKšb&Vg&W6‚Fö¶VâKˆjÊh
+~kˆ^hè¢òòŽXzÞŠøXÚ¾yIó®ŠúR%B[{.izK»¾KÙ^khŽ‹Kžik’ÎKˆÞyYžjÛ¾XzÞŠøž8.[˜.zØ’ÎZK‹J^K¸^Y®ŠÚn8 ¢G'’°¢g2çVæÆ–æµ7–æ2‡F‚æ¦ö–â†ævWEF‚‚wW6W$FFr’Âw6fR×7F÷&vRrÂvfV—6‡U÷&Vg&W6…÷Fö¶VâæVæ2r’“°¢7&VFTÆövvW"‚vfV—6‡RÖÆVv7’Ö6ÆVçWr’æ–æfò€¢vÆVv7’fV—6‡R&Vg&W6‚Fö¶Vâ&VÖ÷fVB††÷7BfV—6‡RFö¶Vâ6†–â&WF—&VB’rÀ¢“°¢Ò6F6‚†W'"’°¢òòTäôTåBÒK¸îiÊ®iÈž‹ø~h‰n[{.kˆRÎ™Ùž›¹ƒ¾X[nZè>™IžŠúò…v–æF÷w2UU$ÒôT%U5’zØ’žY®ŠÚbÀ¢òòKˆ¾jÊY
+þXªŽ˜xÞŠùR†&W7BÖVff÷'BÎKˆÞ™‹¾ijÒž8 ¢–b‚†W'"2æöFT¥2äW'&æôW†6WF–öâ’æ6öFRÓÒtTäôTåBr’°¢7&VFTÆövvW"‚vfV—6‡RÖÆVv7’Ö6ÆVçWr’çv&â€¢vÆVv7’fV—6‡R&Vg&W6‚Fö¶Vâ&VÖ÷fÂf–ÆVC¢rÀ¢W'"À¢“°¢Ð¢Ð¢òò”Ò6†ææVÇ2„6–æG’ö–Ò“¢ZèÎXZŽxºÎz¸²v÷&·76RXÈ^ûÈÎ‹yþ™¨òyIþYÞYŽiÉþ8 ¢òòk:ŽXhÂ•2†æFÆW'2[ø^š¾YÊ‚–æ—BK˜¾X˜Þ(	N(	F–æ—BZK‹J^i{bVÖ—By¨Nx«nhK¨¾K»nKéÞ‹Yb•2'&–FvR‹ÚÎXù8 ¢òò•2†æFÆW'2[ø^š¾iziÚK»nk:ŽXhÃ®yJŽh‹~YÊ‚6WGF–æw2š^KùÞZÙŽXzÞŠøi{bÂ&VæFW&W"‹[‹ùžK©°¢òò6†ææVÂ‹yòÖ–â˜	®KúÂ‹yþyJŽh‹~y›¾[Ù^hizX[>8 ¢–Òç&Vv—7FW$—2‚“°¢òòFVÆVw&ÒKŠ®K«¢&÷BŠÎK‹¢þK«®jÂþ{êNXø.Kˆî˜XÞ{Úîy¨B•2ŽŠëî{ÚîXÚi[hÚî™Ú"’ÎKˆâ–Òç&Vv—7FW$—0¢òòYÎiÉþiziÚK»nk:ŽXhÃ¾KˆÞˆ;ÞiKâ†÷7BçG2jŠYÙ~šn["†Öö6²VÆV7G&öây¨NXÙ^kX¾iKn™¸niÉþKÉ®x+‚ž8 ¢&Vv—7FW%FVÆVw&Ô&÷D6öæf–t—2‚“°¢òòh¨¢FVÆVw&ÒG&ç7÷'Bk:ŽXZRFWf–6RÖÆ–æ²y¨N‹zŽŠëîZH~Kˆ®Kˆ¾{«þhš~ŠÎYšŽ8.yJŽk:ŽXZ^ˆÎ™Ùà¢òò™Ùžh–×÷'C¢FWf–6RÖÆ–æ²Kê~y»Nhê^[ÉR–Òö†÷7BKÉ®h¨®i[NKŠ¢”ÒZÙ{;¾{¹þh»Þ‹ù¾Zè>y¨NKéÞ‹Yn™;à¢òò††÷7BçG2jŠYÙ~šn[.[‹2ævWEF‚ò—4Ö–âæ†æFÆR’ÎˆÂÖ–â‹ù¾zˆ¾XøŽzhjÚ.‹ùŠÎi{`¢òòXªŽh–×÷'BŽiënièNKˆÞXùŽ[Èò*s"ž(	N(	Nk:ŽXZ^iŠþYJþKˆYŽŠxNK‰NKˆÞzNYØþXÙ^kX¾iKn™¸ny¨Nhê^k9^8 ¢6WEFVÆVw&Õ&VÖ÷FU6÷W&6R‡FVÆVw&Ô–Ò“°¢òòhÈ.K‰®Xª÷&6†W7G&F÷#¢Šê.™ˆRfV—6‡T–ÒæöäÖW76vRòæöä6&D7F–öî8&÷&6†W7G&F÷ ¢òò[ø^š¾YÊ‚7&VFUv–æF÷rX˜ÞhÈ.Z[ÒÎ˜þXXÒ&VæFW&W"‹[~iÚ^YîzÊÎKˆk:"•2òWfVçBh›îKˆÞX‹ ¢òò†æFÆW.8$fV—6‡T&÷By¨Bu2™[þ‹ùîhê^[ø^š¾zØž[Ù>X˜ÞyJŽh‹rÆö6ÄF"&VG’YîXhÞY
+þXªŽ8 ¢7F'D–Ô÷&6†W7G&F÷'2‚“°¢òò&VæFW&W"(i"Ö–ây¨B.[©NyJŽyÉþjÚ>[{º¢"X[ÎZëžKúXû~8$Æö6ÄF$vFRYÊ€¢òòÆö6ÄF"æVç7W&U&VG’h‰X©þK˜¾Yî‹>KˆjÊ8$†öö²KˆâfV—6‡T&÷By¨NiØ>ZˆY
+þXªŽ[{.yK¢òòÆö6ÄF"öå&VG’hé.X‹&÷f–FW"&VF–æW72K˜¾YîûÉ¾‹ùž˜xÎYÎj~zØž[è^[þ™©ÎûÈÎXhÞK‹®iz~i{n[¨ð¢òòKˆîyêÎi{nZK‹J^KùÞyYž[˜.zØž˜xÞŠù^8 ¢—4Ö–âæ†æFÆR‚v§&VG’Öf÷"Ö&÷BrÂ7–æ2†WfVçB’Óâ°¢76W'EG'W7FVD&VæFW&W$WfVçB†WfVçB“°¢v—Bv—Df÷$7W'&VçD66÷VçE&÷f–FW$ÖöFVÇ5&VG’‚“°¢7F'D†öö´6öçG&öÄ66÷VçB‚“°¢7F'D–Ô6öææV7F–öâ‚“°¢&WGW&â²ö³¢G'VRÓ°¢Ò“°¢òò[Ë®X‹n[É^yJŽ˜þXXÒG&VR×6†¶–ær[›.hè’fV—6‡T–ÞûÈ†–Ô†÷7B[{.˜	®‹ør–Ò™{Nhê^hÈiÈžûÈÎKØbÖ–âö–ÒK™þy»Nhê^yJŽZè>ûÈ¢fö–BfV—6‡T–Ó°¢òòzºþx+žkˆ^XÙ^[{.[{º®8•2[{.k:ŽXhÂÎjÚNYâ6V6öæBÖ–ç7Fæ6Rò7F—fFRXXŠëŽhÈž™È[»®z©~8 ¢òòKÛþyJŽ{¹þŠê…FD"žy¨NYÎhHþ™{ƒ®[ø^š¾YÊ‚7&VFUv–æF÷r¢®K˜¾X˜Ò¢®k:ŽXhÎ8'&VæFW&W"y¨@¢òòFF$6Æ–VçBKˆhÈ.‹ÛÞ[–çfö¶RæÇ—F–73§6WGF–æw2ÖvWBiÚ^Xk>Zé®iŠþY
+nX‰ÞZx¾XÉb4D²À¢òò†æFÆW"‹ùŽk*k:ŽXhÎy¨NŠùÞ˜*>jÊ–çfö¶RKÉ¢&V¦V7BÎˆÎZè>iŠòf–Â6Æ÷6VBy¨B(	N(	B[{.YÎhHð¢òòy¨NyJŽh‹~KÉ®Kˆy»NKˆÞKˆ®hªRÎy»NX‹h˜¾XªŽXë¾Šëî{Úî˜xÎhºŽKˆKˆ¾[ÈX[>8 ¢–æ—DæÇ—F–756WGF–æw56W'f–6R‚“°¢òòiz^[ù~Kˆ®hªS®YÎj~[ø^š¾YÊ‚7&VFUv–æF÷rK˜¾X˜Þk:ŽXhÂ(	N(	BŠëî{Úîš^KˆhÈ.‹ÛÞ[–çfö¶P¢òòÆör×WÆöC§6WGF–æw2ÖvWBXk>Zé®XZ^Xú>XúþyJŽh
+s¾i»N˜xÞŠhy¨NiŠþ[Jžk¨>XÛ>i{n‹zþ[èNŠhYÊ€¢òòöäfFÅ6‡WFF÷vâKˆ®[KØÒÎY
+nX‰’7&VFUv–æF÷rK˜¾Yîz¸¾X‹¾[Jžy¨N˜*>KˆjÊh»þKˆÞX‹j~Šë8 ¢–æ—DÆöuWÆöE6W'f–6R‚“°¢òòÆö6Â&öf–ÆW2'—72WF„ÖævW"w26Æ÷VB6Æ–ÒF‚âv—BF†R6ÖP¢òò7–æ6‡&öæ÷W2”B&÷fVææ6R66â&Vf÷&RF†Rf—'7B'&÷w6W%v–æF÷rW†—7G26ð¢òò6–FV&"w27–æ6‡&öæ÷W2ÆVv7’Ö–w&F–öâ&VG26â6öç7VÖRâW†7B&ööbà¢–b†vWD7F—fT6W76–öâ‚’æÖöFRÓÓÒvÆö6Âr’°¢v—Bv&Õ7FÆU&ö6W75&÷fVææ6R‚“°¢Ð¢òòXúþŠx[z^KÙÎiŽŠh{û¾ŠùiŠò÷væW"{ª~XZŽ[i‹îzK®Z)î[Ë®8&†æFÆW"Xú®YÊŽŠû~k.XùyIþi{nŠû¾Xù`¢òòŠëî{Úâõ&÷f–FW.ûÈÎXéþZx²vVçBK¨¾K»nKˆîY
+þXªŽX[>™Jî‹zþ[èNYØ~KˆÞzØž[è^{Ù{¹Î8 ¢&Vv—7FW%f—6–&ÆUFW‡EG&ç6ÆF–öä—2‡²vWDÖ¶W#¢vWDÖ¶W$6÷&RÒ“°¢7F'GWv–æF÷t7&VF–öäÆÆ÷vVBÒG'VS°¢7&VFUv–æF÷r‚“°¢òòF†RÖ4õ2&VÆV6RvF6†W"7F—2F—6&ÖVBVçF–ÂF6²G&r&Vv–ç2â7F'@¢òò—G2F–ç’†VÇW"gFW"F†Rf—'7Bv–æF÷rW†—7G26òG&rÆFVæ7’æWfW"—0¢òòFWb7v–gF26ö×–ÆR÷"&ö6W72×7vâ6÷7Bà¢&Wv&Õ6W76–öäG&u&VÆV6T†VÇW"‚“°¢òòš(Nx:ÞK¸^iÈÞXªFWbÖ4õ>ûÈÎ[»n‹ùþhš~ŠÎ˜þXXÞY(ÎY
+þXªŽX[>™Jî‹zþ[èNK¨žyJ‚5^ûÉ¾ZK‹J^yKXZ^Xú>Xh^˜:ŽY	îhèž8 ¢6WEF–ÖV÷WB‚‚’Óâ°¢&Wv&ÔÖ46ö×WFW%W&Ö—76–öäwV–FT†VÇW"‚“°¢ÒÂ5ó“°¢–æ—EWFFU6W'f–6R‚“°¢òòYÊŽ{«þK«®i[[ø>‹{3¤Y
+þXªŽXÛ>Kˆ®hªRÎXh^˜:Ž‹[FWf–6T–BòW6W$–BXYÎ[©RÎy›¾[Ù^X˜ÞYî˜;ÞkK°¢–æ—D†V'F&VE6W'f–6R‚“°¢òòŠëîZH~K©.ˆBŽ‹zŽŠëîZH~‹ùÎzˆ¾hê~X‹b“®y›¾[Ù^Yî‹ùâ&VÆ’Îy›¾X{®XÛ>ijÓ¾[ÈX[>KˆîŠëîZH~X‰~Š‚•2Kˆ[›nk:ŽXhÀ¢ÆWBWFFU&VÆVæ6…&VÖ÷FT'W7’ÒfÇ6S°¢–æ—DFWf–6TÆ–æµ6W'f–6R‡°¢öåWFFU&VÆVæ6„'W7”6†ævVC¢†'W7’’Óâ°¢6öç7BG&ç6—F–öâÒFV6–FUWFFU&VÆVæ6„'W7•G&ç6—F–öâ‡WFFU&VÆVæ6…&VÖ÷FT'W7’Â'W7’“°¢WFFU&VÆVæ6…&VÖ÷FT'W7’ÒG&ç6—F–öâææW‡D'W7“°¢–b‡G&ç6—F–öâç6†÷VÆDæ÷F–g’’æ÷F–g•WFFTWFõ&VÆVæ6„'W7•7FFT6†ævVB‚“°¢ÒÀ¢Ò“°¢òòKˆ®jÊy›¾X{®i{nk*XŠ[›.Xxy¨N‹ùÎzˆ¾KÉ®ŠùÞ™YÎX8þ{É>ZÙ‚Žih~K»n™HòiØ>™™XÚyJ‚’Î[ÈiË®XhÞkˆ^KˆjÊ8 ¢òòKˆÞ™‹¾ZîY
+þXªŽX[>™Jî‹zþ[èBÎZK‹J^yYžYÊŽ™‰þX‰~˜xÎzØžKˆ¾KˆjÊŽŠxÖ—'&÷$66†UW&vUVWVRž8 ¢òòKØb¢®{É>ZÙŽŠû²¢®ŠhzØžZè>‰ÞZé£®Y
+nX‰’&VæFW&W"y¨B‡–G&FRXúþˆ;ÞŠû¾X‹jÚ>YÊŽŠ*¾XŠy¨N˜*>K»ÞiˆîihrÀ¢òòˆÂG&–âZèÎh‰K™þiKnKˆÞY¹î[{.{¸þyK¾X‹[þKˆ®y¨NŠÂ‡&Wf–Ws¢6öFW‚ž8 ¢òòš®[¨þiÈžŠë.z›c¦G&–âKˆâvFR[ø^š¾hé.YÊ‚&Vv—7FW$FWf–6TÆ–æ´—2‚’¢®K˜¾X˜Ò¢¢(	N(	B†æFÆW"Kˆk:ŽXhÀ¢òò&VæFW&W"[Xúþˆ;ÞXù‹[~{É>ZÙŽŠû²ÎˆÂvFR›¹ŽŠêNiŠò.[{.iKîŠÂ"‡&Wf–Ws¢6÷–Æ÷Bž8 ¢6öç7B7F'GWW&vTG&–âÒG&–åW&vUVWVR‚“°¢6WDÖ—'&÷$66†U&VDvFR‡7F'GWW&vTG&–â“°¢òò7F&ÆRÖöGVÆRÖæWWG&Âf:vFRâfVGW&R&÷f–FW'2vW&R&Vv—7FW&VBv—F‚F†V— ¢òò÷væ–ærÖöGVÆW2&÷fS²gWGW&R6öÆÆV7F–öç2ö7F–öç2Fòæ÷BFBGVææVÂ6†ææVÇ2à¢&Vv—7FW%&VÖ÷FU&W6÷W&6W4—2‚“°¢&Vv—7FW$FWf–6TÆ–æ´—2‚“°¢&Vv—7FW$f–ÆUVW$—2‚“°¢&Vv—7FW%&VÖ÷FTFW6·F÷—2†—4vÆö&Åfö–6T–çWD÷fW&Æ•6VæFW"“°¢fö–B7F'GWW&vTG&–à¢çF†Vâ‚‡²W&vVBÂVæF–ærÒ’Óâ°¢–b‡W&vVBâÇÂVæF–ærâ’°¢7&VFTÆövvW"‚vFWf–6RÖÆ–æ³¦Ö—'&÷"Ö66†R×W&vRr’æ–æfò€¢7F'GWW&vRG&–ã¢W&vVCÒG·W&vVGÒVæF–æsÒG·VæF–æwÖÀ¢“°¢Ð¢Ò¢æ6F6‚‚‚’ÓâVæFVf–æVB“°¢òòk:ƒ¦–çfö¶RÖ6GW&Rˆz®j8†76W'D6GW&T†VÇF‡’žKˆÞYÊŽ‹ùž˜xÎ(	N(	FÖ¶W#¦7&VFR×6W76–öâòÖ¶W#§6Væ@¢òòyK7Æ6‚Yîy¨B&Vv—7FW$Ö¶W$—74gFW%7Æ6‚[»n‹ùþk:ŽXhÂÎjÚNX‹¾[	®iÊ®k:ŽXhÎ8.ˆz®j8[{.hÊ®X‹Šú^X{Þi[iÊ¾[à¢òòŽŠxKˆ®ik’’Î˜*>˜xÎh˜iÈ’6VçF–æVÂ˜;Þ[{.[KØÒÎ{¹>iéÎh˜ÞXxnzî8  ¢òòyÚ˜i.y›Þ[þXùnŠø§7W7VæB÷&W7VÖRöÆö6²÷VæÆö6²XZŽ˜:Ž‰Þiz^[ùrÎ{¹’&VæFW&W"Kêp¢òò&VæFW"×vF6†Föry¨NkÈ.z{²þiz[Š~iz^[ù~hùKé¾i{n™{N™I®x+ž8 ¢–ç7FÆÅ÷vW$WfVçDF–væ÷7F–72‡²÷vW$Ööæ—F÷"Ò“° ¢òòhÈ.‹[rþ™H[þi{n˜	®yúR&VæFW&W"˜x®iKîŠúÞ™û>‹é>XZ^y¨NKùÞkK¾›ªnXX¾š8âŽyJŽh‹~[{.zk¾[ÈÎXhÞXÚyØ˜x~™¸`¢òòŠëîZH~Xú®Xšž™©zxhÈ~zK®xþ[‹ŽKªîY(Â–FÆR×6ÆVW76W'F–öây¨NKº>K»rž8 ¢–ç7FÆÅfö–6T–çWE÷vW%&VÆV6R‡°¢÷vW$Ööæ—F÷"À¢&VÆV6T7F—fU6†÷'F7WC¢&VÆV6T7F—fTvÆö&Åfö–6T–çWE6†÷'F7WBÀ¢'&öF67C¢†6†ææVÂÂ–ÆöB’Óâ°¢'&öF67Efö–6T–çWE÷vW%7FFR€¢'&÷w6W%v–æF÷rævWDÆÅv–æF÷w2‚’À¢6†ææVÂÀ¢–ÆöBÀ¢fö–6U÷vW$'&öF67DÆörÀ¢“°¢ÒÀ¢Ò“° ¢òò)H)H7—7FVÒ&W7VÖS¢&Vg&W6‚Fö¶Vç2gFW"6ÆVWö†–&W&æFR)H)H ¢÷vW$Ööæ—F÷"æöâ‚w&W7VÖRrÂ‚’Óâ°¢WF„7&VFVçF–Å&V6÷fW'’ç&WVW7B‚“°¢WF„ÖævW"æ†æFÆU&W7VÖR‚“°¢†æFÆU&÷f–FW$ÖöFVÅ7—7FVÕ&W7VÖR‚“°¢7–æ5ÇVv–äÖ&¶WDf÷$7F—fT÷væW"ƒ3ó“°¢òòFWf–6RÖÆ–æ³®yÚ˜i.z¸¾XÛ>˜xÞ‹ùâ&VÆ’ÎKˆÞ[›.zØž˜˜þŠêi{nYš‚²[ø>‹{>XŠNjÛ²ŽiÈYØþYŽŠêãsW2ž8 ¢†æFÆTFWf–6TÆ–æµ7—7FVÕ&W7VÖR‚“°¢Ò“°¢÷vW$Ööæ—F÷"æöâ‚wVæÆö6²×67&VVârÂ†æFÆU&÷f–FW$ÖöFVÅ67&VVåVæÆö6²“°¢÷vW$Ööæ—F÷"æöâ‚vÆö6²×67&VVârÂWF„7&VFVçF–Å&V6÷fW'’æöå67&VVäÆö6²“°¢÷vW$Ööæ—F÷"æöâ‚wVæÆö6²×67&VVârÂWF„7&VFVçF–Å&V6÷fW'’æöå67&VVåVæÆö6²“°¢öåV—B€¢vWF‚Ö7&VFVçF–Â×&V6÷fW'’rÀ¢‚’Óâ°¢WF„7&VFVçF–Å&V6÷fW'’æF—7÷6R‚“°¢÷vW$Ööæ—F÷"ç&VÖ÷fTÆ—7FVæW"‚vÆö6²×67&VVârÂWF„7&VFVçF–Å&V6÷fW'’æöå67&VVäÆö6²“°¢÷vW$Ööæ—F÷"ç&VÖ÷fTÆ—7FVæW"‚wVæÆö6²×67&VVârÂWF„7&VFVçF–Å&V6÷fW'’æöå67&VVåVæÆö6²“°¢ÒÀ¢w7–æ2rÀ¢“°¢WF„7&VFVçF–Å&V6÷fW'’ç&WVW7B‚“° ¢òòÖVÖ÷'’F–væ÷7F–72(	BFWböæÇ’ÂÆörW"×&ö6W72ÖVÖ÷'’WfW'’30¢–b‚æ—56¶vVB’°¢6WD–çFW'fÂ‚‚’Óâ°¢6öç7B'G2Ò ¢ævWDÖWG&–72‚¢æÖ€¢†Ò’Óà¢G¶ÒçG—WÓ¢G²†ÒæÖVÖ÷'’çv÷&¶–æu6WE6—¦Rò#B’çFôf—†VBƒ—ÔÔ"òG¶Òæ7RçW&6VçD5UW6vRçFôf—†VBƒ—ÒVÀ¢“°¢6öç6öÆRæÆör†¶ÖVÕÒG·'G2æ¦ö–â‚rÂr—Ö“°¢ÒÂ3ó“°¢Ð§Ò“° ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òò˜X{¢ò[Jžk¨>{¹þKˆ{Énhé"(	N(	Bh˜iÈžkˆ^yn˜¾‹é˜	®‹øröåV—B‚’k:ŽXhÎX‹Æ–fV7–6ÆRjŠYÙ~y¨@¢òòXÙ^KˆF—7÷6W"&Vv—7G'’ÂyK–ç7FÆÅV—D†æFÆW"‚’h¨®Kº^Kˆ¾XZ^Xú>˜;Þhê^X‹YÎKˆiÚ6†–ã ¢òð¢òòÒæöâ‚v&Vf÷&R×V—Br’(	N(	ByJŽh‹rþKº>zK‹¾XªŽ˜X{ ¢òòÒ&ö6W72æöâ‚u4”t”åBròu4”uDU$Òr’(	N(	B7G&Â´2ò¶–ÆÂ”B†FWb{¸Žzºþ[ø^Š8R¢òòÒ&ö6W72æöâ‚wVæ6Vv‡DW†6WF–öârž(	N(	BÖ–â‹ù¾zˆ¾iÊ®hÙ^ˆë~[È.[‹€¢òòÒæöâ‚w&VæFW"×&ö6W72ÖvöæRr’(	N(	B&VæFW&W"[J’†Ö–â‹ùŽkK²¢òð¢òòKˆžKŠ®™‹një^K‹.h‰7–æ2(i"7–æ2Ž[›nXù³g2‹h^i{bÂŠxKˆ¾ik’–ç7FÆÅV—D†æFÆW"’(i"÷7BÖ7–æ2À¢òòxKnYâæW†—BƒÆ6öFSâž8 ¢òòiZ>‰Þy¨Bf—&RÖæBÖf÷&vWB[{.{¸þiKnhè’Â‹ù¾zˆ¾KˆÞKÉ®YÊ‚F—7÷6W"‹yZèÎK˜¾X˜ÞjÛ¾8 ¢òòyÉþzÎ[J’‡6VvfVÇBò¶–ÆÂÓ’’¥2[.izˆ;ÞK‹®X©²ÂZÙ‹ù¾zˆ¾™Ú7FF–âTôbˆz®jÛ¾8 ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢òò7–æ2™‹njëS¢YÎjÚ^ŠznXùÂKˆÞzØž{¹>iéÎ8.Xú®iKîyÉþjÚ>YÎjÚ^y¨Nkˆ^ybŽ˜x®iKîiÊÎYËXú^iøBòXùnkhŽZé®i{nYš‚ž8 ¢òòÒ&VÖ6ÆVFRÖ6†–ÆG&Vã¢[ø^š¾YÊ‚6‡WFF÷vâÖÖ¶W"K˜¾X˜ÞYÎjÚ^ZèÎh‰ûÉµ4D²&÷'Bhéhè¢òò6ÆVFRæW†RYâv–æF÷w2Kˆ®ZÙ‹ù¾zˆ¾KÉ®Š*²&W&VçBX‹7—7FVÒÂ”B™;îijÞK¨n[izk9^ZèžXZŽŠønXŠ¾8 ¢òòÒWF„ÖævW"òvöövÆRWFƒ¢YÎjÚ^˜x®iKîZé®i{nYš‚¾Y¹î‹>[É^yJŽ8 ¢òòk:ŽhHòFö¶VâæF—7÷6R‚’Xú®kˆ^Xh^ZÙŽx«nhÂKˆÞXŠy¹ŽKˆ®y¨B&Vg&W6‚Fö¶VâŽ˜*>iŠòÆöv÷WB[›.y¨Bž8 ¢òò–çFW''WFVB×GW&â×&W7VÖS®˜X{®{Énhé.KˆY
+þXªŽ[Xk¾{¹>8ÇGW&âYÊŽš9î8Þj~Šëy¨NXižXZR(	N(	BY
+nX‰¢òòKˆ¾ik’6‡WFF÷vâÖÖ¶W"X[26W76–öâŠznXùy¨BÖ&µ6W76–öåGW&äVæFVBKÉ®h¨¢.˜X{®i{n‹ùŽYÊŽš9à¢òòy¨BGW&â.KÊ®Š8^h‰jÚ>[‹ŽiKn[âÎ˜xÞY
+þYîKŠÞijÞXÚKˆÞX{®xëŽXú®XšžzÎ[Jžk¨>ˆ;ÞŠznXùž8'7–æ2™‹një^XXŽK¨à¢òò7–æ2y¨B6‡WFF÷vâÖÖ¶W"Îš®[¨þiÈžKùÞŠø8 ¦öåV—B€¢wÇVv–âÖÖ&¶WB×W&–öF–2×7–æ2rÀ¢‚’Óâ°¢–b‡ÇVv–äÖ&¶WEW&–öF–57–æ5F–ÖW"’6ÆV$–çFW'fÂ‡ÇVv–äÖ&¶WEW&–öF–57–æ5F–ÖW"“°¢ÇVv–äÖ&¶WEW&–öF–57–æ5F–ÖW"ÒçVÆÃ°¢ÒÀ¢w7–æ2rÀ¢“°¦öåV—B€¢w6W76–öâÖ7F—fR×GW&âÖg&VW¦RrÀ¢‚’Óâ°¢g&VW¦U6W76–öä7F—fUGW&äÖ&¶W'2‚“°¢ÒÀ¢w7–æ2rÀ¢“°¦öåV—B€¢w&VÖ6ÆVFRÖ6†–ÆG&VârÀ¢‚’Óâ°¢&V6ÆVFT÷'†ç57–æ2‚“°¢ÒÀ¢w7–æ2rÀ¢“°¦öåV—B‚vWF‚ÖÖævW"rÂ‚’ÓâWF„ÖævW"æF—7÷6R‚’Âw7–æ2r“°¦öåV—B‚wv–æF÷w2×&ö6W72×66â×v÷&¶W'2rÂF—7÷6Uv–æF÷w5&ö6W7566åv÷&¶W'2Âw7–æ2r“°¦öåV—B‚w&W6÷W&6R×W6vR×v–æF÷rrÂ‚’Óâ&W6÷W&6UW6vUv–æF÷t6öçG&öÆÆW"æF—7÷6R‚’Âw7–æ2r“°¦öåV—B‚w'6"×v–æF÷rrÂ‚’Óâ'6%v–æF÷t6öçG&öÆÆW"æF—7÷6R‚’Âw7–æ2r“°¦öåV—B‚vv†÷7B×æVÂ×v–æF÷w2rÂ‚’Óâv†÷7EæVÅv–æF÷w46öçG&öÆÆW"æF—7÷6R‚’Âw7–æ2r“°¦öåV—B‚vÖ&FvRÖ6ÆV"rÂ‚’Óâ6ÆV$ÆÅ6W76–öäGFVçF–öâ‚’Âw7–æ2r“°¦öåV—B‚w6W76–öâÖG&r×&Wf–WrrÂ‚’ÓâF—7÷6U6W76–öäG&u&Wf–Wr‚’Âw7–æ2r“°¦öåV—B‚v–çWBÖFWf–6W2rÂ‚’ÓâF—7÷6T–çWDFWf–6W2‚’Âv7–æ2r“°¢òòˆz®[ŠbF"y¨N[‹Žš›²6W'fW"ZèŽhªN‹ù¾zˆ¾™¨þ˜X{®iKnhè’†f—&RÖæBÖf÷&vWBFWF6†VB7vâÀ¢òòKˆÞ™‹¾Zâž8.KˆÞiKnKÉ®Kˆy»N™HZèžŠ8^yºî[Ù^˜xÎy¨BF"æW†RÎ[ÈNhÈ.Z)î˜xþi»Nik†÷2W'&÷"3"ž8 ¦öåV—B‚væG&ö–BÖF"Ö¶–ÆÂ×6W'fW"rÂ‚’ÓâF—7÷6TæG&ö–DF"‚’Âw7–æ2r“°¦öåV—B€¢w6¶–ÆÆ‡V"ÖWFò×7–æ2ÖÆ—7FVæW"rÀ¢‚’Óâ°¢F—7÷6U6¶–ÆÆ‡V$WFõ7–æ4WF„Æ—7FVæW#òâ‚“°¢F—7÷6U6¶–ÆÆ‡V$WFõ7–æ4WF„Æ—7FVæW"ÒçVÆÃ°¢ÒÀ¢w7–æ2rÀ¢“°¦öåV—B€¢w&÷f–FW"Ö66W72ÖWF‚ÖÆ—7FVæW"rÀ¢‚’Óâ°¢F—7÷6U&÷f–FW$66W74WF„Æ—7FVæW#òâ‚“°¢F—7÷6U&÷f–FW$66W74WF„Æ—7FVæW"ÒçVÆÃ°¢ÒÀ¢w7–æ2rÀ¢“°¢òò7–æ2™‹njëS¢[›nXù‹yÂg2‹h^i{nXYÎ[©^8 ¢òòÒ6‡WFF÷vâÖÖ¶W#¢[›nXùFWF6‚6W76–öç2KˆâF—7÷6RvVçG>ûÈÎzØž[è^‹ù¾zˆ¾˜X{®8 ¢òòf—&RÖæBÖf÷&vWBKÉ®Šê’æW†—Bhª.XXŽ{¹>iÙòæöF^8 ¢òòÒ–ÒæF—7÷6S¢w46Æ–VçBç7F÷‚’Xh^˜:ŽXXŽXùææ÷Væ6RöffÆ–æR‡V—BF‚v—G2BãW2¢òòXhÒ6Æ÷6Ru>8"¢®i[NKŠ®iKž˜
+y¨NjŽ[ø>yºîj~(	N(	N[ø^š²v—N8"¢ ¢òòÒ6öFW‚xêþZ(>8&÷‡’Y(ÂD"YÊ‚÷7BÖ7–æ2iKn[îûÈÎjÚ>[‹Ž˜X{®i{nKùÞyYžX‹Ö¶W"ZèÎh‰8 ¢òò†6ÆVâÖW†—B×6æ6†÷B[{.z{¾™šB(	B˜X{®i{nKˆÞXhÞX¢F"æ&6·WÂZëžxîiKžyK5Æ—FRtÂ7&6€¢òò&V6÷fW'’XYÎ[©RÂŠúnŠxÆö6ÄF"ö–æFW‚çG2ih~K»nZKBE"ÔdSrKúîŠê.ŠûNiˆî8"¢ò¢ ¢¢ÆVæ6‚fVæ6R&—6VB'’F†RV—B7vVWÂ†VÆB7&÷72F†Rv†öÆR7–æ2†6Rà¢ ¢¢&VÆV6VB'’F†R÷7BÖ7–æ2f–æÂ7vVWÂæ÷B'’F†RF—7÷6W"F†B&—6W2—C ¢¢’×7V&vVçB×'VææW'6æB6‡WFF÷vâÖÖ¶W&'Vâ6öæ7W'&VçFÇ’Â6òv†VâF†Rf—'7@¢¢7vVW&WGW&ç2F†R&VçB’&ö6W76W2Ö’7F–ÆÂ&RÆ—fRâG&÷–ærF†RfVæ6P¢¢F†W&R&RÖ÷VæVBGW&&ÆRÆVæ6†W2f÷"F†R&W7BöbF†RV—BÂæBç—F†–ærF†@¢¢V&VBF†Vâ†BæòÆFW"7vVWFò6öÆÆV7B—Bà¢¢ð¦ÆWB&VÆV6UV—DÆVæ6„fVæ6S¢‚‚’Óâ&öÖ—6SÇfö–Câ’ÂçVÆÂÒçVÆÃ° ¢ò¢ ¢¢F–BF†RV—BfVæ6R7GVÆÇ’vòWð¢ ¢¢6W&FRg&öÒ&VÆV6UV—DÆVæ6„fVæ6VÂv†–6‚—2Ç6òçVÆÂöæ6RF†RfVæ6R†0¢¢&VVâ¦Æ÷vW&VB¢âF†Rf–æÂ7vVW†2FòFVÆÂ&æWfW"&—6VB"g&öÒ'&—6VBæ@¢¢&VÆV6VB"Â&V6W6R—G2÷vâÆörW6VBFò6Æ–Ò—Bv2†öÆF–ærfVæ6RF†B†@¢¢æWfW"W†—7FVB(	BæB&V6W6R&æWfW"&—6VB"—2F†RöæR7FFRF†BæVVG2¢¢&WG'’æBfÆÆ&6²à¢¢ð¦ÆWBV—DÆVæ6„fVæ6U&—6VBÒfÇ6S° ¢ò¢ ¢¢†÷rÆöærF†Rf–æÂ7vVW¶VW2&R×66ææ–ærv†Vâ—B†2æòfVæ6RæBF†P¢¢&VçB—2æ÷B&÷f&Ç’F÷vâà¢ ¢¢6—¦VBv–ç7BF†—2†6Rw2g2W"ÖF—7÷6W"&6RÂgFW"F†Rã"ãW2F†Rf—'7@¢¢72Ö’F¶S¢F‡&VRã2&÷VæG2f—Bv—F‚†VG&ööÒâV6‚&÷VæB—2FVÆ–&W&FVÇ¢¢F–v‡FW"F†âF†R6–ævÆR6öæ6ÇW6—fR72(	BF†Rö–çB—2Fò¶VWæ'&÷v–ærF†P¢¢v–æF÷r–âv†–6‚7W'f—f–ær&VçB6÷VÆBV&Æ—6‚Âæ÷BFòv—B÷WBç’öæP¢¢'VææW"à¢¢ð¦6öç7BdTä4TÄU55õT•Eõ$U5tTUô%TDtUEôÕ2Ò%óS°¦6öç7BdTä4TÄU55õT•Eõ$U5tTUô”åDU%dÅôÕ2ÒC° ¢ò¢ ¢¢F–B6‡WFF÷väÖ¶W"‚–'VâÆÂF†Rv’F‡&÷Vvƒð¢ ¢¢öæÇ’gVÆf–ÆÖVçB6÷VçG2ÂæBF†RF—7F–æ7F–öâ—2æ÷BVFçF–3¢6‡WFF÷väÖ¶W& ¢¢v—G2v—Df÷%GW&ä6†ævU6WD7F–öç2‚–¦&Vf÷&R¢—BWfW"&V6†W0¢¢Ö¶W"ç6‡WFF÷vâ‡²&V6öã¢v×V—BrÒ–Â6ò&V¦V7F–öâ6âÖVâF†RÖ¶W ¢¢v2æWfW"6‡WBF÷vâBÆÂæBWfW'’&VçB’&ö6W72—27F–ÆÂ'Vææ–ærâöà¢¢gVÆf–ÆÖVçBF†Bv—B6ö×ÆWFVBÂæBÖ¶W"ç6‡WFF÷væ–âGW&âv—FVBWfW'¢¢6W76–öâæFWF6†(	Bv†–6‚f÷"’VæG2–âv—B&ö2æ6Æ÷6R‚–âF†B—2F†P¢¢&ööbF†RV—BfVæ6RæVVG2&Vf÷&R—B6â&RÆ÷vW&VBà¢ ¢¢&W6–GVÂÂ7FFVBÆ–æÇ“¢6‡WFF÷väÖ¶W&7vÆÆ÷w2âW'&÷"F‡&÷vâ¦'’ ¢¢Ö¶W"ç6‡WFF÷væÂæBÖ¶W"ç6‡WFF÷væ6öÆÆV7G2W"×6W76–öâFWF6‚f–ÇW&W0¢¢&F†W"F†âF‡&÷v–ærâ6ògVÆf–ÆÖVçBFöW2æ÷B&÷fRWfW'’6–ævÆR’&ö6W70¢¢W†—FVB(	BöæÇ’F†BV6‚v2v—FVBæB—G2f–ÇW&RÆövvVBâF†÷6R7G&vvÆW'0¢¢&Rv†BF†Rf–æÂ7vVW—2f÷"ÂæBv†B—G2W'&÷"'&æ6‚&W÷'G2à¢¢ð¦ÆWBÖ¶W%6‡WFF÷vå6WGFÆVBÒfÇ6S° ¦öåV—B€¢w’×7V&vVçB×'VææW'2rÀ¢7–æ2‚’Óâ°¢6öç7BvVçD†öÖRÒF‚æ¦ö–â†ævWEF‚‚wW6W$FFr’Âw’ÖvVçBÖ†öÖRr“°¢òò6Æ÷6RF†RFö÷"&Vf÷&R66ææ–ærÂW†7FÇ’2F†RWFFR&VÆVæ6‚FöW2à¢òð¢òòF†—2F—7÷6W"æB6‡WFF÷vâÖÖ¶W&&R&÷F‚7–æ6Â6òF†W’'Và¢òò6öæ7W'&VçFÇ“¢&VçB’&ö6W726â7F–ÆÂ&RÆ—fR†W&RæB6âVçFW ¢òòÆVæ6„GW&&ÆU'Væv†–ÆRF†—27vVW—2vÆ¶–ærâV×G’F—&V7F÷'’âF†P¢òò7vVWv÷VÆBf–æ—6‚6ÆVâÂF†RÆVæ6†W"v÷VÆBV&Æ—6‚—G2'VâF—&V7F÷'’¢òòÖöÖVçBÆFW"ÂæBF†BFWF6†VB'VææW"v÷VÆB÷WFÆ—fRF†RV—B†öÆF–ærF†P¢òò7&VFVçF–Ç2—B–æ†W&—FVBà¢òð¢òòF†R×WGVÂW†6ÇW6–öâ—2F†R6ÖR÷&FW&–ær&wVÖVçB2F†R&VÆVæ6‚Âæ@¢òòæVVG2æò6W&–Æ—6F–öâv—F‚6‡WFF÷vâÖÖ¶W& ¢òð¢òòV—C¢w&—FRfVæ6RÓâ66à¢òòÆVæ6†W#¢w&—FR'VäF—"Óâ&VBfVæ6P¢òð¢òò÷÷6—FR÷&FW'2Â6ò–bF†RÆVæ6†W"&VG2æòfVæ6R—G2'VâF—&V7F÷'’v0¢òòÇ&VG’V&Æ—6†VBæBWfW'’66â†W&R6VW2—B‡v—FVBöâÂF†VâW66ÆFV@¢òòFòfW&–f–VB¶–ÆÂ“²–b—B&VG2F†RfVæ6R—B&VgW6W2æB&öÆÇ2&6²à¢G'’°¢&VÆV6UV—DÆVæ6„fVæ6RÒv—B7V—&U•7V&vVçDÆVæ6„fVæ6R†vVçD†öÖR“°¢V—DÆVæ6„fVæ6U&—6VBÒG'VS°¢Ò6F6‚†W'"’°¢òòæ÷B&V6öâFò†öÆBWF†RV—BÂæBW7VÆÇ’G&ç6–VçB’ôó¢F†Rf–æÀ¢òò7vVW&WG&–W2&Vf÷&R—B66ç2Â6òF†RfVæ6VÆW72v–æF÷r—26öæf–æVBFð¢òòF†—2†6R&F†W"F†âÆ7F–ærF†Rv†öÆRV—Bà¢•7V&vVçDÆörçv&â‚v6÷VÆBæ÷B&—6RF†R7V&vVçBÆVæ6‚fVæ6R&Vf÷&RF†RV—B7vVW¢rÂW'"“°¢Ð¢°¢òò'VFvWB&—F†ÖWF–2v–ç7BF†Rg27–æ2†6S¢"ãW2v—F–ærf÷"F†R7F÷ ¢òòÖ–Æ&÷‚ÂF†VâBÖ÷7B72öbW66ÆF–öââF†R&V6Æ–×2'Vâ6öæ7W'&VçFÇ’æ@¢òòF†V—"–FVçF—G’&ö&R—27–æ2Â6òF†B72—26V–Æ–ærf÷"F†Rv†öÆR6W@¢òò&F†W"F†âW"×'VææW"6÷7B(	BF†RöÆB6W&–Â6†R×VÇF—Æ–VBãã‡2ö`¢òòW†—B6öæf—&ÖF–öâ'’F†RçVÖ&W"öb'VææW'2æB6÷VÆB÷fW''VâF†R†6Röà¢òò—G2÷vââ"ãR²2ÆVfW2†Æb6V6öæBöb†VG&ööÓ²ç—F†–ær7F–ÆÀ¢òòVæ6öæf—&ÖVBv†VâF†R'VFvWBW‡—&W2—2&W÷'FVB2Vç&V6Æ–ÖVBÂv†–6‚—0¢òòv‡’F†Rf–ÇW&RÆör&VÆ÷r†2Fò7F’G'VRà¢6öç7B7F÷VBÒv—B7F÷ÆÅ•7V&vVçE'Vç4f÷$W†—B†vVçD†öÖRÂ%óSÂ°¢¶–ÆÄ'VFvWD×3¢5óÀ¢òòöæÇ’÷W"÷vâ6†–ÆG&Vâ‡ÇW2VæGG&–'WF&ÆRòFVBÖ÷væW"÷'†ç2’â¢òò6öæ7W'&VçB–ç7Fæ6R6†&–ærF†—2vVçB†öÖR¶VW2'Vææ–ærà¢†÷7E–C¢&ö6W72ç–BÀ¢òòV—B—2F†R6ÖR7&VFVçF–Â&ö&ÆVÒ2â66÷VçB&÷VæF'“¢F†—0¢òò&ö6W72—2&÷WBFòF—6V"ÂæB'VææW"F†BæWfW"6öç7VÖVB—G0¢òòÖ–Æ&÷‚¶VW27VæF–ærF†R%”ôÒ7&VFVçF–Ç2—B–æ†W&—FVBæB¶VW0¢òòVF—F–ærF†Rv÷&·76Rv—F‚æö&öG’ÆVgBFò7WW'f—6R—BâW66ÆFRFòF†P¢òò–FVçF—G’×fW&–f–VB¶–ÆÂ–ç7FVBöbÆövv–æræBW†—F–ærà¢¶–ÆÅVç&W7öç6—fU'VææW'3¢G'VRÀ¢Ò“°¢–b‚7F÷VB’°¢•7V&vVçDÆöræW'&÷"€¢u’7V&vVçB'VææW'27W'f—fVB7F÷æB–FVçF—G’×fW&–f–VB¶–ÆÂöâV—B(	Br°¢w'VææW'2F†—26÷VÆBæ÷B6öæf—&Ò27F÷VB&R7F–ÆÂ'Vææ–ærv—F‚F†V—"r°¢v–æ†W&—FVB7&VFVçF–Ç2rÀ¢“°¢Ð¢Ð¢òòFVÆ–&W&FVÇ’æò&VÆV6R†W&S¢F†RfVæ6R7F—2WVçF–ÂF†R÷7BÖ7–æ0¢òòf–æÂ7vVW&VÆ÷rÂv†–6‚—2F†Rf—'7BÖöÖVçB6‡WFF÷vâÖÖ¶W&—2¶æ÷vâFð¢òò†fRf–æ—6†VBà¢ÒÀ¢v7–æ2rÀ¢“°¦öåV—B€¢w6‡WFF÷vâÖÖ¶W"rÀ¢7–æ2‚’Óâ°¢òòæ÷BG'’öf–æÆÇ“¢&V¦V7F–öâ†W&R6â&VFFRÖ¶W"ç6‡WFF÷væVçF—&VÇ¢òò‡6VRÖ¶W%6‡WFF÷vå6WGFÆVF’Â6ò—B×W7Bæ÷B&VB2'F†R&VçB—2F÷vâ"à¢6öç7B²•6W76–öäf–ÇW&W2ÒÒv—B6‡WFF÷väÖ¶W"‚“°¢òògVÆf–ÆÖVçBÆöæRv2æWfW"V—FRF†R&ööbF†—26Æ–×2Fò&S¢6‡WFF÷và¢òò6öÆÆV7G2W"×6W76–öâFWF6‚f–ÇW&W2–ç7FVBöbF‡&÷v–ærÂ6ò’6W76–öà¢òò6÷VÆB†fR&VVâÆVgBv—F‚Æ—fR&ö6W72âæ÷rF†B—B&W÷'G2F†VÒÂ¢òòf–ÇW&RÖVç2F†R&VçB—2¦æ÷B¢6öæf—&ÖVBF÷vâæBF†RfVæ6R7F—2Wà¢–b‡•6W76–öäf–ÇW&W2â’°¢•7V&vVçDÆöræW'&÷"€¢G·•6W76–öäf–ÇW&W7Ò’6W76–öâ‡2’f–ÆVBFòFWF6‚GW&–ærV—B(	B†öÆF–ærF†R°¢vÆVæ6‚fVæ6RÂ6–æ6R7W'f—f–ær&VçB6÷VÆB7F–ÆÂ7F'BGW&&ÆR'VææW"rÀ¢“°¢&WGW&ã°¢Ð¢Ö¶W%6‡WFF÷vå6WGFÆVBÒG'VS°¢ÒÀ¢v7–æ2rÀ¢“°¦öåV—B‚w&Wf–WrÖ'F–f7B×6æ6†÷G2rÂ6ÆVçW7F—fU&Wf–Wt'F–f7E6æ6†÷G2Âv7–æ2r“°¢òòÅ5KˆÞXÚyJ‚vVçBjÚ>[‹ŽKùÞZÙŽY(Î˜X{®y¨Ni{n™{Nz©~Xú>8 ¦öåV—B‚vÇ7×ööÂrÂ6‡WFF÷väÇ76W'fW%ööÂÂv7–æ2r“°¦öåV—B‚v÷&6Ö–FÆR×vF6†W"rÂ‚’Óâ7F÷÷&6–FÆUvF6†W"‚’Âw7–æ2r“°¦öåV—B‚v–ÒrÂ‚’Óâ7F÷–Ô6öææV7F–öâ‚wV—Br’Âv7–æ2r“°¢òò‹Úâ#rÔTD•TÒÓ3§’ÖVçbhÊ®X‹÷7BÖ7–æ2(	N(	Bˆº^Kˆâ6‡WFF÷vâÖÖ¶W"YÂ7–æ2[›nXùÀ¢òò'&–FvRXúþˆ;ÞYÊ‚6W76–öâ6Æ÷6Ry¨BF—7÷6U6W76–öå&Vv—7G&F–öç2‡Vç&Vv—7FW%6W76–öä7G‚ð¢òòFö¶VâžK˜¾X˜ÞX[>™zÒÂKª~yIþ8Ç’F—7÷6R6W76–öâ&Vv—7G&F–öâf–ÆVB†æöâÖfFÂž8Ð¢òòiz^[ù~Yš®Z;8'÷7BÖ7–æ2K‹.ŠÎYÊ‚6‡WFF÷vâÖÖ¶W"†7–æ2žK˜¾Yîhš~ŠÂÂK‰Nk:ŽXhÎš®[¨þYÊ€¢òò&VÖ÷FR×76‚×ööÂK˜¾X˜ÒŽKŠNˆ^YÂ÷7BÖ7–æ2ÂhÈžk:ŽXhÎ[¨þhš~ŠÂ(	N(	B'&–FvRXXŽK¨âööÂX[2ž8 ¢ò¢ ¢¢6öæ6ÇW6—fR6V6öæB72ÂgFW"F†R7–æ2†6Rà¢ ¢¢'VåV—DF—7÷6W'6öæÇ’VçFW'2÷7BÖ7–æ2öæ6RF†R7–æ2†6R6WGFÆVB†÷"†—@¢¢—G2'VFvWB’Â6ò'’†W&R6‡WFF÷vâÖÖ¶W&†2f–æ—6†VBæBÂv—F‚—BÂWfW'¢¢6W76–öâæFWF6†(	Bv†–6‚f÷"’—2†æFÆRæ6Æ÷6R‚–VæF–ær–âv—@¢¢&ö2æ6Æ÷6R‚–âæò’&ö6W72&VÖ–ç2F†B6÷VÆB7F'BGW&&ÆR'VâÂ6òF†—0¢¢72—26öæ6ÇW6—fR–âF†R÷&F–æ'’66RÂæB—B6öÆÆV7G2W†7FÇ’v†BF†P¢¢f—'7B7vVW6÷VÆBæ÷B6VS¢'Vâv†÷6RF—&V7F÷'’v2V&Æ—6†VBgFW"F†@¢¢7vVW†BÇ&VG’66ææVBà¢ ¢¢F†B6öæ6ÇW6—fVæW72&VÆöæw2FòöæR'&æ6‚öæÇ’ÂæBF†R&VÆV6R&VÆ÷r—0¢¢vFVBöâ—Bâ–bF†R7–æ2†6R§F–ÖVB÷WB¢–ç7FVBÂ6‡WFF÷vâÖÖ¶W&Ö¢¢7F–ÆÂ&R–âfÆ–v‡BæB’&ö6W72Ö’7F–ÆÂ&RÆ—fS²F†—27vVW7F–ÆÂ'Vç0¢¢†&W7BÖVff÷'B&V6Æ–Ò—2v÷'F‚†f–ær’'WB—B&÷fW2æ÷F†–ærÂ6òF†RfVæ6R—0¢¢¦æ÷B¢Æ÷vW&VBâ–âF†B'&æ6‚F†RwV&çFVR—2F†RfVæ6R—G6VÆb7FæF–ærVçF–À¢¢F†R&ö6W72W†—G2(	BÆVæ6†W"V—F†W"&VgW6W2Â÷"†BÇ&VG’V&Æ—6†VB—G0¢¢'VâF—&V7F÷'’&Vf÷&RF†RfVæ6RvVçBWÂ–âv†–6‚66RF†R66â&VÆ÷r6VW0¢¢—B(	Bv—F‚F†RæW‡B–ç7Fæ6Rw27FÆR7vVW&VÖ÷f–ærF†RÆVgF÷fW"f–ÆRà¢ ¢¢&Vv—7FW&VB†VBöb’ÖVçfæBf"†VBöb&VÖ÷FR×76‚×ööÆ¢—BæVVG2öæÇ¢¢F†RÆö6Âf–ÆW7—7FVÒæBÆö6Â6–væÇ2ÂæB÷7BÖ7–æ2—26W&–ÂÂ6òvö–æp¢¢f—'7B¶VW2—G2'VFvWB6ÆV"öbF—7÷6W"F†BF–ÖW2÷WBâF†RööÂFV&F÷và¢¢×W7B7F’Æ7BÂf÷"F†R&V6öâFö7VÖVçFVBB—G2÷vâ&Vv—7G&F–öâà¢ ¢¢'VFvWC¢2v—F–ærf÷"F†R7F÷Ö–Æ&÷‚ÇW2ãW26V–Æ–æröâF†RW66ÆF–öà¢¢(	Bã"ãW2v–ç7BF†—2†6Rw2g2W"ÖF—7÷6W"&6RâÖ÷7B'VææW'2&RÇ&VG¢¢vöæR'’æ÷s²v†B—2ÆVgB—2F†Ræ'&÷rv–æF÷rF†—272W†—7G2Fò6Æ÷6Rà¢¢ð¦öåV—B€¢w’×7V&vVçBÖf–æÂ×7vVWrÀ¢7–æ2‚’Óâ°¢6öç7BvVçD†öÖRÒF‚æ¦ö–â†ævWEF‚‚wW6W$FFr’Âw’ÖvVçBÖ†öÖRr“°¢G'’°¢òò&WG'’F†RfVæ6R&Vf÷&R66ææ–ærÂæ÷BgFW"âF†Rf—'7BGFV×B'Vç2–à¢òòF†R7–æ2†6Rv†W&RG&ç6–VçB’ôòf–ÇW&R—2Æ–¶VÇ’æBæ÷F†–ær—0¢òò&WG&–VC²&—6–ær—B†W&R&W7F÷&W2F†R÷&FW&–ærF†Rv†öÆR&wVÖVçB&W7G0¢òòöâ(	BfVæ6RÂF†Vâ66â(	BæB6öæf–æW2F†RfVæ6VÆW72v–æF÷rFòF†@¢òòV&Æ–W"†6R–ç7FVBöbF†R&W7BöbF†RV—Bà¢–b‚V—DÆVæ6„fVæ6U&—6VB’°¢G'’°¢&VÆV6UV—DÆVæ6„fVæ6RÒv—B7V—&U•7V&vVçDÆVæ6„fVæ6R†vVçD†öÖR“°¢V—DÆVæ6„fVæ6U&—6VBÒG'VS°¢Ò6F6‚†W'"’°¢•7V&vVçDÆörçv&â€¢v6÷VÆBæ÷B&—6RF†R7V&vVçBÆVæ6‚fVæ6R&Vf÷&RF†Rf–æÂV—B7vVWV—F†W#¢rÀ¢W'"À¢“°¢Ð¢Ð¢6öç7B7F÷VBÒv—B7F÷ÆÅ•7V&vVçE'Vç4f÷$W†—B†vVçD†öÖRÂóÂ°¢¶–ÆÄ'VFvWD×3¢óSÀ¢†÷7E–C¢&ö6W72ç–BÀ¢¶–ÆÅVç&W7öç6—fU'VææW'3¢G'VRÀ¢Ò“°¢–b‚7F÷VB’°¢•7V&vVçDÆöræW'&÷"€¢u’7V&vVçB'VææW'2V&VBgFW"F†Rf—'7BV—B7vVWæB6÷VÆBæ÷B&Rr°¢v6öæf—&ÖVB7F÷VB(	BF†W’&R7F–ÆÂ'Vææ–ærv—F‚F†V—"–æ†W&—FVB7&VFVçF–Ç2rÀ¢“°¢Ð¢òòæòfVæ6RæBæò&ööbF†R&VçB—2F÷vã¢F†—272—2æ÷B6öæ6ÇW6—fRÀ¢òòæBæ÷F†–ær'Vç2gFW"—Bâ¶VW&R×66ææ–ærv†–ÆRF†R&VçBÖ–v‡B7F–ÆÀ¢òò&RV&Æ—6†–ærÂ6òF†Rv–æF÷r7W'f—f÷"†2Fò6Æ—'VâF‡&÷Vv‚—2F†P¢òòv&WGvVVâGvò66ç2&F†W"F†â&WfW'—F†–ærgFW"F†RÆ7BöæR"à¢òò6‡WFF÷vâÖÖ¶W&Ö’6–×Ç’&R6Æ÷r(	BWfW'’&÷VæB—2æ÷F†W"6†æ6Rf÷ ¢òò—BFòf–æ—6‚ÂæBF†RÆö÷VæG2F†RÖöÖVçB—BFöW2à¢–b‚V—DÆVæ6„fVæ6U&—6VBbbÖ¶W%6‡WFF÷vå6WGFÆVB’°¢6öç7BFVFÆ–æRÒFFRææ÷r‚’²dTä4TÄU55õT•Eõ$U5tTUô%TDtUEôÕ3°¢v†–ÆR‚Ö¶W%6‡WFF÷vå6WGFÆVBbbFFRææ÷r‚’ÂFVFÆ–æR’°¢v—BæWr&öÖ—6SÇfö–Câ‚‡&W6öÇfR’Óâ°¢6WEF–ÖV÷WB‡&W6öÇfRÂdTä4TÄU55õT•Eõ$U5tTUô”åDU%dÅôÕ2’çVç&Vcòâ‚“°¢Ò“°¢–b†Ö¶W%6‡WFF÷vå6WGFÆVB’'&V³°¢òòF–v‡FW"W"×&÷VæB'VFvWG2F†âF†R72&÷fS¢F†—2—2&÷W@¢òò&WWF—F–öâÂæ÷B&÷WBv—F–ærç’6–ævÆR'VææW"÷WBà¢v—B7F÷ÆÅ•7V&vVçE'Vç4f÷$W†—B†vVçD†öÖRÂ3Â°¢¶–ÆÄ'VFvWD×3¢sÀ¢†÷7E–C¢&ö6W72ç–BÀ¢¶–ÆÅVç&W7öç6—fU'VææW'3¢G'VRÀ¢Ò’æ6F6‚‚‚’ÓâfÇ6R“°¢Ð¢Ð¢Ò6F6‚†W'"’°¢•7V&vVçDÆöræW'&÷"‚vf–æÂ’7V&vVçBV—B7vVWf–ÆVC¢rÂW'"“°¢Òf–æÆÇ’°¢òòÆ÷vW&–ærF†RfVæ6R—2öæÇ’6fRöæ6RF†R&VçB—2&÷f&Ç’F÷vââ&V@¢òò†W&R&F†W"F†âBF†RF÷öbF†—2F—7÷6W#¢F†R7–æ2†6RÖ’†fP¢òò&VVâ7WBöfb'’—G2'VFvWBv†–ÆR6‡WFF÷vâÖÖ¶W&¶WB'Vææ–ærÂæBF†P¢òò7vVW&÷fR§W7BvfR—BÖ÷&RF–ÖRFòf–æ—6‚à¢–b†Ö¶W%6‡WFF÷vå6WGFÆVB’°¢òòÆVf–ær—B7FæF–ærv÷VÆBöæÇ’ÖGFW"–bF†—2&ö6W726öÖV†÷p¢òò7W'f—fVBF†RV—BÂæBF†Vâ—Bv÷VÆB&VgW6RF†—2–ç7Fæ6Rw2÷và¢òòGW&&ÆRÆVæ6†W2f÷"F†R&W7Böb—G2Æ–fRâ†&BÖ¶–ÆÆVB&ö6W70¢òò6ææ÷B&V6‚F†—2Æ–æS²F†BÆVgF÷fW"—26öÆÆV7FVB'’F†RæW‡@¢òò–ç7Fæ6Rw27FÆR7vVWÂv†–6‚F†R&V6÷&FVB7F'B–FVçF—G’Ö¶W26fP¢òòWfVâv†VâF†R–B—2&V7–6ÆVBöçFò—Bà¢6öç7B&VÆV6RÒ&VÆV6UV—DÆVæ6„fVæ6S°¢&VÆV6UV—DÆVæ6„fVæ6RÒçVÆÃ°¢v—B&VÆV6Sòâ‚’æ6F6‚‚‚’ÓâVæFVf–æVB“°¢ÒVÇ6R–b‡V—DÆVæ6„fVæ6U&—6VB’°¢òòF†R7–æ2†6RF–ÖVB÷WBv—F‚6‡WFF÷vâÖÖ¶W&7F–ÆÂ–âfÆ–v‡BÂ÷ ¢òò—BF‡&Wr&Vf÷&RF†RÖ¶W"v26‡WBF÷vââV—F†W"v’‡Vær&VçB¢òòÖ’7F–ÆÂ&RÆ—fRÂæBæ÷F†–ær'Vç2gFW"F†—2Fò6öÆÆV7Bv†B—@¢òò6÷VÆB7F–ÆÂÆVæ6‚(	B6òF†RfVæ6R7F—2WVçF–ÂF†R&ö6W72W†—G2À¢òòæBF†RæW‡B–ç7Fæ6Rw27FÆR7vVW&VÖ÷fW2F†Rf–ÆRà¢•7V&vVçDÆöræW'&÷"€¢w&VçB6‡WFF÷vâv2æ÷B6öæf—&ÖVB6ö×ÆWFRöâV—B(	B†öÆF–ærF†R’7V&vVçBr°¢vÆVæ6‚fVæ6RVçF–ÂF†—2&ö6W72W†—G26ò7F–ÆÂÖÆ—fR&VçB6ææ÷B7F'Br°¢vGW&&ÆR'VææW"æ÷F†–ær—2ÆVgBFò&V6Æ–ÒrÀ¢“°¢ÒVÇ6R°¢òòæV—F†W"wV&çFVR—2f–Æ&ÆS¢F†RfVæ6R6÷VÆBæ÷B&R&—6VBöà¢òòV—F†W"GFV×BÂæBF†R&VçBv2æWfW"6öæf—&ÖVBF÷vââ6––ærvP¢òò&R&†öÆF–ærF†RfVæ6R"†W&R(	Bv†–6‚F†—2'&æ6‚W6VBFò(	BFW67&–&V@¢òòFö÷"F†Bv2æWfW"6‡WBâF†R&WVFVB66ç2&÷fR&RF†RöæÇ¢òòF†–æræ'&÷v–ærF†Rv–æF÷s²7FFRF†RW‡÷7W&R–ç7FVBöb–×Ç––ær—@¢òò—26Æ÷6VBà¢•7V&vVçDÆöræW'&÷"€¢wV—BVæFVBv—F‚æò’7V&vVçBÆVæ6‚fVæ6RæBæò&ööbF†R&VçB—2F÷vâ(	Br°¢v7W'f—f–ær&VçB6÷VÆB7F–ÆÂV&Æ—6‚GW&&ÆR'VææW"gFW"F†RÆ7B66âÂr°¢væB—Bv÷VÆB¶VW'Vææ–ærv—F‚F†R7&VFVçF–Ç2—B–æ†W&—FVBrÀ¢“°¢Ð¢Ð¢ÒÀ¢w÷7BÖ7–æ2rÀ¢“°¦öåV—B‚w’ÖVçbrÂ‚’Óâ6‡WFF÷vå”Vçf—&öæÖVçB‚’Âw÷7BÖ7–æ2r“°¢òòjÚ>[‹Ž˜X{®i{nKùÞyYžX‹vVçBY(Â6W76–öâiKn[îZèÎh‰ûÉ¶7–æ2‹h^i{nYîK¸ÞhÈž˜X{®š(Nzé~[ÞX©¾kˆ^yn8 ¦öåV—B‚v6öFW‚ÖVçbrÂ‚’Óâ6‡WFF÷vä6öFW„Vçf—&öæÖVçB‚’Âw÷7BÖ7–æ2r“°¦öåV—B‚v6öFW‚×&÷‡’rÂ‚’ÓâF—7÷6T6öFW…&÷‡’‚’Âw÷7BÖ7–æ2r“°¢òòVÖ&VFF–ærÖ†÷7C¢&÷'BŠúÞK˜’(	N(	Bz¸¾X‹¾ŠêžX{¢5Æ—FRXiž‹ùîhêRÂKˆÞzØž[Ù>X˜ÒF–6²Ž˜*>h›’¦ö"KùÞhÈ¢òòVæF–ærKˆ¾jÊ{ºÞ‹yÂXižK¨¾XªYÎjÚ^XéþZÙizKŠÞijÒž8 ¦öåV—B‚vVÖ&VFF–ærÖ†÷7BrÂ‚’Óâ7F÷VÖ&VFF–æt†÷7B‚’Âv7–æ2r“°¢òòçF‡&÷–2Ö6ö×BÆö÷&6²&÷‡“¢z¸¾XÛ2FW7G&÷’h˜iÈ’–âÖfÆ–v‡B6ö6¶WB²zØ’6W'fW"æ6Æ÷6P¢òòY¹î‹2‡ã×2{ª~XŠ²ž8.‹yò6‡WFF÷vâÖÖ¶W"YÎYÊ‚7–æ2™‹një^[›nXù‹y(	BiÈYØþh8^Xk^iŠò&÷‡’XXŽX[>8¢òò6ÆVFR4Ä’ZÙ‹ù¾zˆ¾iKnX‹T4ôäå$U4UBÂKØb6W76–öâiÊÎiÚ^[YÊ‚6Æ÷6R‹zþ[èNKˆ¢Â‹ùžzxÒW'&÷"y»NhêP¢òòŠ*¾Y	âÂ[ÛY8ÞXúþhê^Xù~8 ¦öåV—B‚vçF‡&÷–2Ö6ö×B×&÷‡’rÂ‚’ÓâF—7÷6TçF‡&÷–46ö×E&÷‡’‚’Âv7–æ2r“°¢òò'&÷w6W"×'VçF–ÖS¢7F÷F†RÖævVB6‡&öÖR6ò—BFöW6âwB÷WFÆ—fRF†R††VFV@¢òò'&÷w6W"²Æö6¶VBW6W"ÖFFÖF—"v÷VÆB÷F†W'v—6R7W'f—fRV—BæBf÷&6R7FÆP¢òò6–ævÆWFöäÆö6²&V6÷fW'’æW‡BÆVæ6‚’â7F÷—2–FV×÷FVçBòæòÖ÷–bæWfW"7F'FVBà¦öåV—B‚v'&÷w6W"×'VçF–ÖRrÂ‚’ÓâF—7÷6T'&÷w6W%'VçF–ÖR‚’Âv7–æ2r“°¢òò&VÖ÷FRf–ÆR×6W'f–6R6Æ–VçG3¢XXŽK¨âööÂX[>™zÒÂhÈ.ijÞ‹ùÎzºòFVÖöây¨BW†V26†ææVÎ8 ¦öåV—B‚w&VÖ÷FRÖf–ÆRÖ'&÷w6W"rÂ‚’ÓâF—7÷6U&VÖ÷FTf–ÆT'&÷w6W"‚’Âv7–æ2r“°¦öåV—B‚v‡FÖÂ×&Wf–Ww2rÂF—7÷6T‡FÖÅ&Wf–Ww2Âv7–æ2r“°¢òò&VÖ÷FR54‚ööÃ¢K‹¾XªŽijÞ[Èh˜iÈžkK¾XªŽ‹ùîhêRÂ™‹.jÚ"76ƒ"ZÙXú^iøN™‹¾ZâæöFR‹ù¾zˆ¾˜X{®8 ¢òò÷7BÖ7–æ2Ž™Ùâ7–æ2“§6‡WFF÷vâÖÖ¶W"YÊ‚7–æ2™‹një^X[26W76–öç2i{bÂ”vVçBæ6Æ÷6R‚¢òòKÉ®{¸ò’ÖÖævW"%2Xù¶–ÆÂiØ‹ùÎzºòFVÖöâ(	N(	BˆºRööÂYÊ‚7–æ2[›nXùXX€¢òòijÞ[È54‚Â¶–ÆÂZK‹JRÂFVÖöâ²VçbÖf–ÆRŽY
+¾XzÞŠøžjè¾yY’3Xˆn™)ò…#bZêŠêÒÓ‚ôÒÓž8 ¢òòhÊ®X‹÷7BÖ7–æ2K‹.ŠÂÂKùÞŠø6W76–öâ{ªr¶–ÆÂXXŽZèÎh‰ÂööÂiÈYîiKn[î8 ¦öåV—B‚w&VÖ÷FR×76‚×ööÂrÂ‚’ÓâF—7÷6U&VÖ÷FU76…ööÂ‚’Âw÷7BÖ7–æ2r“°¢òòtDFVÆWFU6W76–öâÖ’6öç7VÖRÆöævW"F†âF†R6†&VB7–æ2V—B'VFvWBâ¶–ÆÀ¢òòFWF6†VBtDõ6–FV6"&ö6W72w&÷W27–æ6‡&öæ÷W6Ç’&Vf÷&RF†B'VFvWB7F'G3°¢òòF†RÆ–v‡GvV–v‡B6VÒ—2æòÖ÷v†Vâ6–×VÆF÷"v2æWfW"–æ—F–Æ—¦VBà¦öåV—B‚v–÷2×6–×VÆF÷"ÖW†—BÖ&÷'BrÂ&÷'D”õ56–×VÆF÷$÷W&F–öç4f÷$W†—BÂw7–æ2r“°¢òò†öö²‹ùîhêS¢XÎhèžXZŽ˜:‚u2G&ç7÷'BŽY
+¾˜xÞ‹ùâF–ÖW"’Â™‹.Xú^iøN™‹¾Zî˜X{®8 ¦öåV—B‚v†öö²Ö6öçG&öÂrÂ‚’ÓâF—7÷6T†öö´6öçG&öÂ‚’Âw7–æ2r“°¢òò6W76–öâÖv—B×"Ö6öçFW‡C¢Xùnkh‚æv—B„TBy¨B&6VÂvF6†W"Šê.™ˆRÂ™‹.XéþyIþXú^iøN™‹¾Zî˜X{®8 ¦öåV—B‚vv—BÖ6öçFW‡BrÂ‚’ÓâF—7÷6Tv—D6öçFW‡B‚’Âv7–æ2r“°¦öåV—B‚v–÷2×6–×VÆF÷"Ö†÷7BrÂF—7÷6T”õ56–×VÆF÷$†÷7BÂv7–æ2r“°¦öåV—B‚v–÷2×6–×VÆF÷"Ö÷væW'6†—×&Vv—7G'’rÂfÇW6„”õ56–×VÆF÷$÷væW'6†—&Vv—7G'’Âv7–æ2r“° ¢òò÷7BÖ7–æ2™‹njëS¢K‹.ŠÎ‹yÂzîKùÞKéÞ‹Yb7–æ2™‹një^Kª~xšžy¨Nkˆ^yb…tÂ6†V6·ö–çB'’6Æ÷6Rž8 ¦öåV—B‚vF"Ö6Æ–VçBrÂ‚’ÓâÆ–fV7–6ÆTF$6Æ–VçDÖævW"æF—7÷6R‚wV—Br’Âw÷7BÖ7–æ2r“°¦öåV—B‚vÆö6ÂÖF"Ö6Æ÷6RrÂ‚’ÓâÆö6ÄF$6Æ÷6TF"‚’Âw÷7BÖ7–æ2r“° ¢òòF—7Æ’&W7F÷&RÖ’¦ö–ââ–âÖfÆ–v‡BæF—fRÖöFRw&—FRƒW2’Â&W7F÷&RF†P¢òò÷&–v–æÂÖöFRƒW2’ÂF†Vâv—BVÆV7G&öâvVöÖWG'’ƒW2’â¶VWÖ&v–â&Vf÷&P¢òòF†RW†—7F–ær#2†&BÖW†—BvF6†Fös²6ö×ÆWFVBF—7÷6W'2æWfW"v—BF†—2Æöærà¦–ç7FÆÅV—D†æFÆW"ƒc“° ¦æöâ‚wv–æF÷rÖÆÂÖ6Æ÷6VBrÂ‚’Óâ°¢–b‡&ö6W72çÆFf÷&ÒÓÒvF'v–âr’°¢çV—B‚“°¢Ð§Ò“° ¦æöâ‚v7F—fFRrÂ‚’Óâ°¢òòÖ4õ2Fö6²6Æ–6·26†÷VÆB&W7F÷&Rö7&VFRF†R&–Ö'’v–æF÷rÂæ÷B&V6öà¢òò&÷WBWfW'’'&÷w6W%v–æF÷r–âF†R&ö6W72âvÆö&Âfö–6R–çWB¶VW2†–FFVà¢òò66†VB÷fW&Æ’v–æF÷rÆ—fRgFW"f—'7BW6S²W6–ærvWDÆÅv–æF÷w2‚’æÆVæwF€¢òò†W&RÖFRFö6²7F—fF–öâæòÖ÷v†VâF†RÖ–âv–æF÷rv26Æ÷6VB'WBF†P¢òò÷fW&Æ’7F–ÆÂW†—7FVBà¢òð¢òòFòæ÷Bfö7W2F†RÖ–âv–æF÷rv†–ÆRF†RvÆö&Âfö–6R÷fW&Æ’—2f—6–&ÆRà¢òò6Æ–6¶–ær÷fW&Æ’6öçG&öÇ2Ç6ò7F—fFW2F†RVÆV7G&öâöâÖ4õ3²G&VF–æp¢òòF†B7F—fF–öâÆ–¶RFö6²6Æ–6²Ö¶W2F†RÖ–âv–æF÷r÷÷fW"F†P¢òòW6W"w2F&vWB&–v‡BgFW"F†W’6Æ–6²$6÷’"–âF†Rf–ÇW&RfÆÆ&6²à¢–b†—4vÆö&Åfö–6T–çWD÷fW&Æ•f—6–&ÆR‚’’&WGW&ã°¢òòfö7W4Ö–åv–æF÷r‚’YÊ‚†–FRÖöâÖ6Æ÷6RjŠ[ÈþKˆ¾ZJžxKnh¨®‰xþ‹[~iÚ^y¨Nz©~Xú26†÷rY¹îiÚRÀ¢òò&VæFW&W"KˆÞ˜xÞ‹ÛÓ¾‹ùNY¹âfÇ6RŠŽzK®K‹¾z©~Xú>yÉþk*K¨bŽ[È.[‹Žh‰nšinjÊY
+þXª‚’Îh˜Ò7&VFUv–æF÷~8 ¢òòzºþx+žkˆ^XÙ^™‹¾ijÞiÉþ™{NzhjÚ.[»®z©rŽYÂ6V6öæBÖ–ç7Fæ6RÎ™‹.{¹^‹ø~™‹¾ijÞ™z‚²&VÆöBy›Þ[òž8 ¢–b‡7F'GWv–æF÷t7&VF–öäÆÆ÷vVBbbfö7W4Ö–åv–æF÷r‚’’°¢7&VFUv–æF÷r‚“°¢Ð§Ò“° ¦gVæ7F–öâÖVÖ÷'•6WGF–æw5v—&R‚’°¢6öç7B7FFRÒ&VDÖVÖ÷'•6WGF–æw57FFR‚“°¢&WGW&â°¢ââç7FFRçfÇVRÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢7W7FöÖ—¦VD¶W—3¢7FFRæ7W7FöÖ—¦VD¶W—2À¢FVfVÇG3¢7FFRæFVfVÇG2À¢Ó°§Ð ¦gVæ7F–öâ–ÔFVfVÇE6WGF–æw5v—&R†6†ææVÃó¢–ÔFVfVÇE6WGF–æw46†ææVÂ’°¢6öç7B7FFRÒ&VD–ÔFVfVÇE6WGF–æw57FFR†6†ææVÂ“°¢&WGW&â°¢ââç7FFRçfÇVRÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢7W7FöÖ—¦VD¶W—3¢7FFRæ7W7FöÖ—¦VD¶W—2À¢FVfVÇG3¢7FFRæFVfVÇG2À¢Ó°§Ð ¦gVæ7F–öâ'6T–ÔFVfVÇE6WGF–æw46†ææVÂ‡&s¢Væ¶æ÷vâ“¢–ÔFVfVÇE6WGF–æw46†ææVÂÂVæFVf–æVB°¢–b‡&rÓÓÒVæFVf–æVBÇÂ&rÓÓÒçVÆÂ’&WGW&âVæFVf–æVC°¢–b‚—4–ÔFVfVÇE6WGF–æw46†ææVÂ‡&r’’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂv–ÒFVfVÇB6WGF–æw26†ææVÂ–çfÆ–Br“°¢Ð¢&WGW&â&s°§Ð ¦gVæ7F–öâ7V&vVçDÖöFVÅ6WGF–æw5v—&R‚’°¢6öç7B7FFRÒ&VE7V&vVçDÖöFVÅ6WGF–æw57FFR‚“°¢&WGW&â°¢ââç7FFRçfÇVRÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢7W7FöÖ—¦VD¶W—3¢7FFRæ7W7FöÖ—¦VD¶W—2À¢FVfVÇG3¢7FFRæFVfVÇG2À¢Ó°§Ð ¦gVæ7F–öâf—6–öä'&–FvU6WGF–æw5v—&R‚’°¢6öç7B7FFRÒ&VEf—6–öä'&–FvU6WGF–æw57FFR‚“°¢&WGW&â°¢ââç7FFRçfÇVRÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢7W7FöÖ—¦VD¶W—3¢7FFRæ7W7FöÖ—¦VD¶W—2À¢FVfVÇG3¢7FFRæFVfVÇG2À¢Ó°§Ð ¢ò¢¢Šz>iéŠxnŠxžj^Šëî{ÚâF6ŽûÈŽy›ÞYÞXÙ^™JîûÈÎ˜	ZÙ~jë^j
+š¨ÎûÉ¾™Ùîk9^h©²”ådÄ”Eõ$Õ>ûÈž8"¢ð¦gVæ7F–öâ'6Uf—6–öä'&–FvU6WGF–æw5F6‚‡&s¢Væ¶æ÷vâ“¢'F–ÃÅf—6–öä'&–FvU6WGF–æw3â°¢–b‚&rÇÂG—Vöb&rÓÒvö&¦V7BrÇÂ'&’æ—4'&’‡&r’’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂwf—6–öâ'&–FvR6WGF–æw2F6‚&WV—&VB†ö&¦V7B’r“°¢Ð¢6öç7B–çWBÒ&r2&V6÷&CÇ7G&–ærÂVæ¶æ÷vãã°¢6öç7BF6ƒ¢'F–ÃÅf—6–öä'&–FvU6WGF–æw3âÒ·Ó°¢–b‚vVæ&ÆVBr–â–çWB’°¢–b‡G—Vöb–çWBæVæ&ÆVBÓÒv&ööÆVâr’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂwf—6–öâ'&–FvRVæ&ÆVB×W7B&R&ööÆVâr“°¢Ð¢F6‚æVæ&ÆVBÒ–çWBæVæ&ÆVC°¢Ð¢–b‚wF&vWDÖöFVÇ2r–â–çWB’°¢–b‚'&’æ—4'&’†–çWBçF&vWDÖöFVÇ2’’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂwf—6–öâ'&–FvRF&vWDÖöFVÇ2×W7B&R7G&–ær'&’r“°¢Ð¢òòG&–ÒYîh¹.{¹Þz›®y›ÞXX>{JûÈÎ˜þXXÞˆHþXÎûÈ‚"FVW6VV²"ò".ûÈž‰Þy¹Ž8 ¢6öç7BG&–ÖÖVBÒ–çWBçF&vWDÖöFVÇ2æÖ‚†Ò’Óâ‡G—VöbÒÓÓÒw7G&–ærròÒçG&–Ò‚’¢rr’“°¢–b‡G&–ÖÖVBç6öÖR‚†Ò’ÓâÒæÆVæwF‚ÓÓÒ’’°¢F‡&÷t—4W'&÷"€¢t”ådÄ”Eõ$Õ2rÀ¢wf—6–öâ'&–FvRF&vWDÖöFVÇ2×W7B&RæöâÖ&Ææ²7G&–ær'&’rÀ¢“°¢Ð¢F6‚çF&vWDÖöFVÇ2ÒG&–ÖÖVC°¢Ð¢f÷"†6öç7B¶W’öb²w&–Ö'’rÂvfÆÆ&6²uÒ26öç7B’°¢–b‚†¶W’–â–çWB’’6öçF–çVS°¢6öç7BfÇVRÒ–çWE¶¶W•Ó°¢–b‡fÇVRÓÓÒçVÆÂ’°¢F6…¶¶W•ÒÒçVÆÃ°¢6öçF–çVS°¢Ð¢–b‚fÇVRÇÂG—VöbfÇVRÓÒvö&¦V7BrÇÂ'&’æ—4'&’‡fÇVR’’°¢F‡&÷t—4W'&÷"€¢t”ådÄ”Eõ$Õ2rÀ¢f—6–öâ'&–FvRG¶¶W—Ò×W7B&R²&÷f–FW$–BÂÖöFVÄ–BÒ÷"çVÆÆÀ¢“°¢Ð¢6öç7B&VbÒfÇVR2&V6÷&CÇ7G&–ærÂVæ¶æ÷vãã°¢–b‡G—Vöb&Vbç&÷f–FW$–BÓÒw7G&–ærrÇÂG—Vöb&VbæÖöFVÄ–BÓÒw7G&–ærr’°¢F‡&÷t—4W'&÷"€¢t”ådÄ”Eõ$Õ2rÀ¢f—6–öâ'&–FvRG¶¶W—Ò×W7B&R²&÷f–FW$–BÂÖöFVÄ–BÒ÷"çVÆÆÀ¢“°¢Ð¢òòG&–ÒYîh¹.{¹Þ{ªþz›®y›ÞûÈÎ˜þXXÞˆHþ˜XÞ{ÚîûÈŽz›®y›ÞK‹.ûÈž‰Þy¹Ž8 ¢6öç7B&÷f–FW$–BÒ&Vbç&÷f–FW$–BçG&–Ò‚“°¢6öç7BÖöFVÄ–BÒ&VbæÖöFVÄ–BçG&–Ò‚“°¢–b‡&÷f–FW$–BæÆVæwF‚ÓÓÒÇÂÖöFVÄ–BæÆVæwF‚ÓÓÒ’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂf—6–öâ'&–FvRG¶¶W—Ò&÷f–FW$–BöÖöFVÄ–B×W7Bæ÷B&R&Ææ¶“°¢Ð¢F6…¶¶W•ÒÒ²&÷f–FW$–BÂÖöFVÄ–BÓ°¢Ð¢&WGW&âF6ƒ°§Ð ¦gVæ7F–öâ'6U7V&vVçDÖöFVÅ6WGF–æw5F6‚‡&s¢Væ¶æ÷vâ“¢7V&vVçDÖöFVÅ6WGF–æw5F6‚°¢–b‚&rÇÂG—Vöb&rÓÒvö&¦V7BrÇÂ'&’æ—4'&’‡&r’’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂw7V&vVçBÖöFVÂ6WGF–æw2F6‚&WV—&VB†ö&¦V7B’r“°¢Ð¢6öç7B–çWBÒ&r2&V6÷&CÇ7G&–ærÂVæ¶æ÷vãã°¢6öç7BF6ƒ¢7V&vVçDÖöFVÅ6WGF–æw5F6‚Ò·Ó°¢òò&÷f–FW$–BKˆâÖöFVÂ–BYÎ{ªniÙòŽyúÞj~ŠønK‹"’ÎX[yJŽYÎKˆZY~j
+š¨Âþ[Ù.KˆXÉn8 ¢f÷"†6öç7B¶W’öb²v6ÆVFT6öFRrÂv6ÆVFT6öFU&÷f–FW$–BuÒ26öç7B’°¢–b‚†¶W’–â–çWB’’6öçF–çVS°¢6öç7BfÇVRÒ–çWE¶¶W•Ó°¢–b‚—5fÆ–E7V&vVçDÖöFVÄ–D–çWB‡fÇVR’’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂ7V&vVçBÖöFVÂG¶¶W—Ò×W7B&RfÆ–B7G&–ær÷"çVÆÆ“°¢Ð¢F6…¶¶W•ÒÒæ÷&ÖÆ—¦U7V&vVçDÖöFVÄ–B‡fÇVR“°¢Ð¢–b‚v6öFW…6Ö'E7V&vVçE&÷WF–ærr–â–çWB’°¢–b‡G—Vöb–çWBæ6öFW…6Ö'E7V&vVçE&÷WF–ærÓÒv&ööÆVâr’°¢F‡&÷t—4W'&÷"‚t”ådÄ”Eõ$Õ2rÂw7V&vVçB6öFW…6Ö'E7V&vVçE&÷WF–ær×W7B&R&ööÆVâr“°¢Ð¢F6‚æ6öFW…6Ö'E7V&vVçE&÷WF–ærÒ–çWBæ6öFW…6Ö'E7V&vVçE&÷WF–æs°¢Ð¢&WGW&âF6ƒ°§Ð ¦gVæ7F–öâ6–ÆVçDVæ7'—FVE&WG'•v—&R‚’°¢6öç7B7FFRÒ&VE6–ÆVçDVæ7'—FVE&WG'•6WGF–æw57FFR‚“°¢&WGW&â°¢Væ&ÆVC¢7FFRçfÇVRæVæ&ÆVBÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇDVæ&ÆVC¢7FFRæFVfVÇG2æVæ&ÆVBÀ¢Ó°§Ð ¦gVæ7F–öâ6W76–öå'VçF–ÖTfÆÆ&6µv—&R‚’°¢6öç7B7FFRÒ&VE6W76–öå'VçF–ÖTfÆÆ&6µ6WGF–æw57FFR‚“°¢&WGW&â°¢Væ&ÆVC¢7FFRçfÇVRæVæ&ÆVBÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇDVæ&ÆVC¢7FFRæFVfVÇG2æVæ&ÆVBÀ¢Ó°§Ð ¦gVæ7F–öâ6ö×7F–öåv—&R‚’°¢6öç7B7FFRÒ&VD6ö×7F–öå7FFR‚“°¢&WGW&â°¢7C¢7FFRçfÇVRæ6ÆVFT6öFTWFô6ö×7E7BÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇE7C¢7FFRæFVfVÇG2æ6ÆVFT6öFTWFô6ö×7E7BÀ¢Ó°§Ð ¦gVæ7F–öâ”6ö×7F–öåv—&R‚’°¢6öç7B7FFRÒ&VE”6ö×7F–öå7FFR‚“°¢&WGW&â°¢7C¢7FFRçfÇVRç”WFô6ö×7E7BÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇE7C¢7FFRæFVfVÇG2ç”WFô6ö×7E7BÀ¢Ó°§Ð ¦gVæ7F–öâ6†DVÖ&VFF–æuv—&R‚’°¢6öç7B7FFRÒ&VD6†DVÖ&VFF–æu6WGF–æw57FFR†6†DVÖ&VFF–ætFVfVÇD6öçFW‡B‚’“°¢6öç7Bf–Æ&ÆRÒ—46†DVÖ&VFF–ætf–Æ&ÆR‚“°¢&WGW&â°¢Væ&ÆVC¢f–Æ&ÆRbb7FFRçfÇVRæVæ&ÆVBÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇDVæ&ÆVC¢f–Æ&ÆRbb7FFRæFVfVÇG2æVæ&ÆVBÀ¢Ó°§Ð ¦gVæ7F–öâv—E6fWG•v—&R‚’°¢6öç7B7FFRÒ&VDv—E6fWG•6WGF–æw57FFR‚“°¢&WGW&â°¢WFõ6æ6†÷DVæ&ÆVC¢7FFRçfÇVRæWFõ6æ6†÷DVæ&ÆVBÀ¢—47W7FöÖ—¦VC¢7FFRæ—47W7FöÖ—¦VBÀ¢FVfVÇDWFõ6æ6†÷DVæ&ÆVC¢7FFRæFVfVÇG2æWFõ6æ6†÷DVæ&ÆVBÀ¢Ó°§Ð ¢ò¢ ¢¢&ö÷G7G&VÆV7G&öâÒW‡÷'FVBVçG'’ö–çBf÷"G–æÖ–2–×÷'Bg&öÒ–æFW‚çG2à¢¢F†RVÆV7G&öâ7F'GW6öFR&÷fR'Vç22ÖöGVÆRF÷ÖÆWfVÂ6–FRVffV7G2v†Và¢¢F†—2ÖöGVÆR—2G–æÖ–6ÆÇ’–×÷'FVBâF†—2gVæ7F–öâW†—7G2öæÇ’Fò6F—6g¢¢F†R–×÷'B6öçG&7C²7GVÂ&ö÷B6WVVæ6R—2–æ—F–FVB'’æöâ‚'&VG’"’à¢¢ð¦W‡÷'B7–æ2gVæ7F–öâ&ö÷G7G&VÆV7G&öâ‚“¢&öÖ—6SÇfö–Câ°¢òò6–FRVffV7G2Ç&VG’–âÖ÷F–öâg&öÒÖöGVÆRÖÆWfVÂ6öFR&÷fRà¢òò&WGW&â&öÖ—6RF†B&W6öÇfW2v†Vâ—2&VG’à¢&WGW&âæWr&öÖ—6SÇfö–Câ‚‡&W6öÇfR’Óâ°¢–b†æ—5&VG’‚’’°¢&W6öÇfR‚“°¢ÒVÇ6R°¢æöæ6R‚w&VG’rÂ‚’Óâ&W6öÇfR‚’“°¢Ð¢Ò“°§Ð ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òò4¥2{É>ZÙŽˆz®hH‚Ž[ø^š¾iŠþiÊÎih~K»niÈYîKˆiÚšn[.ŠúÞXúRž8 ¢òòKéÞ‹Yb6öæb†VÆV7G&öâ×7F÷&R[©^["žy¨NjŠYÙ~{ª~XšþKÙÎyJŽKÉ®hš~ŠÂFVÆWFR&WV—&Ræ66†Uµõöf–ÆVæÖUÐ¢òò(	N(	Nh™>XÈ^Yâõöf–ÆVæÖRhÈ~Y	i[NKŠ¢&ö÷G7G&6‡Væ²ÎzØžK¨îh¨®K‹¾‹ù¾zˆ²'VæFÆRK¸â4¥2{É>ZÙŽ˜xÎ‹Š.hèž8 ¢òòjÚNYîK»¾KÙ^‹ùŠÎi{nXªŽh–×÷'Bˆº^YÞKŠÒ'&WV—&RiÊÂ6‡Væ²y¨NXˆnXÈR"ŽZh"G&—§¦ÆRÖ÷&ÒŠ*¾h¸nX{®y¨@¢òòxºÎz¸²6‡Væ²’ÄæöFRKÉ®h¨¢„Ô"'VæFÆRK¸îZKN˜xÞikk.XÃ®Y
+þXªŽXšþKÙÎyJŽXZŽ˜xþ˜xÞ‹y(i"•2K¨ÎjÊk:ŽXhÀ¢òòh©¾™I’(i"k.XÎZK‹J^{É>ZÙŽK¸Þz›¢(i"jøþjÊ˜xÞŠù^˜;Þk8NkÈþi[N[ÊjŠYÙ~Y»âÎi[XØjÊYîK‹¾‹ù¾zˆ²c‚Znˆ	~[ÒôôÐ¢òòƒ##bÓrÓ"ZéîK¨¾iXS®hHþŠønŠê.™ˆ^™;î‹zþjøþKŠ®KÉ®ŠùÞK¨¾K»nŠznXùKˆjÊÎ{ªbBXˆn™)þKˆ‹ÚâôôÒ[ê®xêòž8 ¢òò6öæby¨Nk.XÎXXŽK¨îiÊÎih~K»nšn[.Kº>zŽZè>iŠþiÊÂ6‡Væ²KéÞ‹YbÅ&öÆÇWhÈžKéÞ‹Yn[¨þX˜Þ{Úâ’Îh˜Kº^YÊŽšn[ ¢òòiÊ¾[îh¨®ˆz®[{ZîY¹î{É>ZÙŽXÛ>Xúþˆz®hHŽ8.ièN[»®Kª~xšžiŠò4¥2Ç&WV—&RòÖöGVÆRòõöf–ÆVæÖRYØ~yÉþZéîZÙŽYÊƒ°¢òòG—VöbZèŽXÚ¾XYÎKØþkX¾Šù^zØž™Ùâ4¥2k.XÎxêþZ(>8 ¦–b€¢G—Vöb&WV—&RÓÓÒvgVæ7F–öârb`¢G—VöbÖöGVÆRÓÒwVæFVf–æVBrb`¢G—Vöbõöf–ÆVæÖRÓÓÒw7G&–ærrb`¢&WV—&Ræ66†RÒçVÆÂb`¢&WV—&Ræ66†Uµõöf–ÆVæÖUÒÓÒçVÆÀ¢’°¢&WV—&Ræ66†Uµõöf–ÆVæÖUÒÒÖöGVÆS°§Ð ¦ÆWBv÷&·G&VU'VçF–ÖT6Æ÷6U&VG’ÒfÇ6S°¦ÆWBÆ7Ev÷&·G&VTÖ–çFVææ6TF#¢&WGW&åG—SÇG—VöbG'”vWDF$6Æ–VçCâÒçVÆÃ° ¢ò¢¢v÷&·G&VRÖ–çFVææ6RæVVG2&÷F‚7F÷&vRæB'VçF–ÖRÖ6Æ÷6R6W'f–6W2â¢ð¦gVæ7F–öâ7F'E&VG•v÷&·G&VTÖ–çFVææ6R‚“¢fö–B°¢7F'Ev÷&·G&VU&V7–6ÆTÖ–çFVææ6R‡°¢—5&VG“¢‚’Óà¢v÷&·G&VU'VçF–ÖT6Æ÷6U&VG’bbvWDÖ¶W$–e&VG’‚’ÓÒçVÆÂbbG'”vWDF$6Æ–VçB‚’ÓÒçVÆÂÀ¢&V7–6ÆT7W'&VçE6W76–öã¢‡6W76–öä–BÂ7FGW2’Óà¢&V7–6ÆU6W76–öåv÷&·G&VTf÷%7FGW46†ævR‡6W76–öä–BÂ7FGW2’À¢öäGFV×D6ö×ÆWFS¢VF—E&Vv—7FW&VEv÷&·G&VW2À¢Ò“°¢6öç7BF"ÒG'”vWDF$6Æ–VçB‚“°¢–b‡v÷&·G&VU'VçF–ÖT6Æ÷6U&VG’bbvWDÖ¶W$–e&VG’‚’bbF"bbF"ÓÒÆ7Ev÷&·G&VTÖ–çFVææ6TF"’°¢Æ7Ev÷&·G&VTÖ–çFVææ6TF"ÒF#°¢fö–BVF—E&Vv—7FW&VEv÷&·G&VW2‚’æ6F6‚‚†W'&÷"’Óà¢F$6Æ–VçDÆörçv&â‚wv÷&·G&VRVF—B÷7GöæVBrÂW'&÷"’À¢“°¢fö–Bv÷&·G&VUööÂç&V6÷fW%ööÂ‚’æ6F6‚‚†W'&÷"’Óà¢F$6Æ–VçDÆörçv&â‚wv÷&·G&VRööÂ&V6÷fW'’÷7GöæVBrÂW'&÷"’À¢“°¢Ð§Ð ¦öåV—B‚w&VÖ÷FRÖFW6·F÷×f–WvW"rÂ‚’Óâ&VÖ÷FTFW6·F÷f–WvW%v–æF÷w2ç&W6WB‚’Âw7–æ2r“°
