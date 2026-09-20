@@ -37,8 +37,17 @@ import {
 import { BRAND_IDENTITY } from '@cindy/maker-shared/brand-identity';
 
 import { supportsBetaUpdateChannel } from '../shared/updateChannelCapability';
-import { fetchManifest, getBaseUrl, isDev, probeBetaManifest, clearCachedManifest } from './manifestService';
+import { clearCachedManifest, isDev, probeBetaManifest } from './manifestService';
 import type { Manifest } from './manifestService';
+import {
+  CUSTOM_UPDATE_FEED_ID,
+  compareCustomUpdateVersions,
+  fetchCustomUpdateManifest,
+  getCustomUpdateBaseUrl,
+  getCustomUpdatePlatformKey,
+  isCustomUpdatePlatformSupported,
+} from './customUpdateFeed';
+import { isForkBetaUpdateChannelAvailable } from './forkUpdatePolicy';
 import { download, DownloadError } from './downloader/index';
 import { ProgressNormalizer } from './updateProgressNormalizer';
 import { compareAppUpdateVersions } from './updateVersionPolicy';
@@ -110,6 +119,10 @@ interface PatchInfo {
   version: string;
   fileName: string;
   sha256: string;
+  /** Identifies the update feed that downloaded this patch. */
+  feedId: string;
+  /** Prevents a staged artifact from being replayed across OS/architecture. */
+  platformKey: string;
   /**
    * release-relogin-on-update: whether the manifest declared this version
    * requires Feishu re-authorization. Carried in patch-info.json so the relaunch
@@ -126,9 +139,9 @@ interface PatchInfo {
   /**
    * 下载这份补丁时的有效渠道。共库另一实例在本进程停机期间切过渠道后,
    * 冷启动读盘对账会丢掉这份旧包,避免 manifest 失败时把旧渠道 zip 当匹配补丁装上。
-   * 旧 patch-info 没有这个字段,保持原行为。
+   * 旧 patch-info 没有 feed/platform/channel 完整身份，统一 fail-closed 后重新下载。
    */
-  enableBeta?: boolean;
+  enableBeta: boolean;
 }
 
 /**
@@ -176,6 +189,8 @@ let readyFilePath: string | undefined;
 let readyZipSha256: string | undefined;
 /** 当前 staged 补丁对应的渠道代际。延迟清理用它区分「同路径上的新旧包」。 */
 let readyChannelEpoch: number | undefined;
+/** Linux newer-than-channel package held until an equal/newer manifest appears. */
+let deferredLinuxPatch: { version: string; path: string; epoch: number } | undefined;
 /**
  * 更新渠道代际计数:用户在下载进行中关掉 beta(clearStagedPatch)时 +1,
  * 让 in-flight 的 checkForUpdate 在写回 patch-info / 恢复旧 patch 前察觉
@@ -226,6 +241,9 @@ function broadcastStatus(payload: UpdateStatusPayload): void {
 }
 
 function channelSettingsWire() {
+  if (!isForkBetaUpdateChannelAvailable()) {
+    return { enableBeta: false, isCustomized: true };
+  }
   return {
     enableBeta: readObservedEnableBetaFromDisk(),
     isCustomized: isEnableBetaUserCustomized(),
@@ -521,6 +539,47 @@ function broadcastUpdateProgress(payload: {
 
 const PATCH_INFO_FILE = 'patch-info.json';
 const UPDATE_LOCK_FILE = '.updating';
+const SAFE_PATCH_FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function resolvePatchInfoFilePath(fileName: unknown): string | null {
+  if (typeof fileName !== 'string' || !SAFE_PATCH_FILE_NAME_RE.test(fileName)) return null;
+  // Keep this explicit even though the allowlist already excludes separators:
+  // tests run Windows branches on POSIX, where path.basename() alone would not
+  // recognize a backslash traversal payload.
+  if (fileName.includes('/') || fileName.includes('\\')) return null;
+  const updatesDir = path.resolve(getUpdatesDir());
+  const resolved = path.resolve(updatesDir, fileName);
+  return path.dirname(resolved) === updatesDir ? resolved : null;
+}
+
+function readPatchInfo(): { info: PatchInfo; filePath: string } | null {
+  try {
+    const raw = fs.readFileSync(path.join(getUpdatesDir(), PATCH_INFO_FILE), 'utf-8');
+    const info = JSON.parse(raw) as PatchInfo;
+    const filePath = resolvePatchInfoFilePath(info.fileName);
+    if (typeof info.version !== 'string' || !info.version || !filePath) return null;
+    return { info, filePath };
+  } catch {
+    return null;
+  }
+}
+
+function isRegularStagedPatchFile(filePath: string): boolean {
+  try {
+    return fs.lstatSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function removeStagedPatchFile(filePath: string): void {
+  try {
+    // Windows virus scanners can briefly retain a handle after the patch was
+    // inspected. Retry those transient removals so invalidated channel
+    // payloads do not survive after their patch-info marker is cleared.
+    fs.rmSync(filePath, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  } catch { /* next startup cleanup can retry */ }
+}
 
 /**
  * Snapshot of the current update lifecycle state. Prefer
@@ -562,6 +621,8 @@ export function isUpdateRelaunchImminent(): boolean {
   // A missing VC++ Runtime requires an explicit user install. Treating that
   // indefinite wait as imminent would keep startup side-effects disabled.
   if (lastErrorCode === WINDOWS_UPDATER_RUNTIME_MISSING_ERROR_CODE) return false;
+  // This fork currently ships an update feed only for Windows x64.
+  if (!isCustomUpdatePlatformSupported()) return false;
   // Linux 安装要 pkexec 密码，不会在空闲/启动时自己装。
   if (process.platform === 'linux') return false;
   // Respecting the user's switch: with auto-relaunch off the patch just sits
@@ -636,37 +697,43 @@ export function clearReloginFlag(): void {
  */
 function checkExistingPatch(): { action: 'relaunch' | 'check' | 'none'; version?: string } {
   if (isCindyPersonalRuntime()) return { action: 'none' };
-  const updatesDir = getUpdatesDir();
-  const infoPath = path.join(updatesDir, PATCH_INFO_FILE);
-
-  let patchInfo: PatchInfo;
-  try {
-    const raw = fs.readFileSync(infoPath, 'utf-8');
-    patchInfo = JSON.parse(raw) as PatchInfo;
-    if (
-      typeof patchInfo.version !== 'string' ||
-      !patchInfo.version ||
-      typeof patchInfo.fileName !== 'string' ||
-      !patchInfo.fileName
-    ) {
-      throw new Error('invalid patch-info');
-    }
-  } catch {
+  const parsed = readPatchInfo();
+  if (!parsed) {
+    removePatchInfo();
     return { action: 'check' };
   }
+  const { info: patchInfo, filePath: patchFilePath } = parsed;
 
-  const patchFilePath = path.join(updatesDir, patchInfo.fileName);
-  if (!fs.existsSync(patchFilePath)) {
+  if (!isRegularStagedPatchFile(patchFilePath)) {
+    removeStagedPatchFile(patchFilePath);
     removePatchInfo();
     return { action: 'check' };
   }
 
+  if (
+    patchInfo.feedId !== CUSTOM_UPDATE_FEED_ID ||
+    patchInfo.platformKey !== getCustomUpdatePlatformKey() ||
+    !isCustomUpdatePlatformSupported()
+  ) {
+    log.warn(
+      'Discarding staged patch v%s from an untrusted or unsupported update feed/platform',
+      patchInfo.version,
+    );
+    removeStagedPatchFile(patchFilePath);
+    removePatchInfo();
+    const flag = readReloginFlag();
+    if (flag?.version === patchInfo.version) {
+      clearReloginFlag();
+    }
+    return { action: 'check' };
+  }
+
   const currentEnableBeta = readObservedEnableBetaFromDisk();
-  if (typeof patchInfo.enableBeta === 'boolean' && patchInfo.enableBeta !== currentEnableBeta) {
+  if (typeof patchInfo.enableBeta !== 'boolean' || patchInfo.enableBeta !== currentEnableBeta) {
     log.info(
       'discarding staged patch v%s from another update channel (patch=%s current=%s)',
       patchInfo.version,
-      patchInfo.enableBeta ? 'beta' : 'release',
+      patchInfo.enableBeta === true ? 'beta' : 'release-or-missing',
       currentEnableBeta ? 'beta' : 'release',
     );
     discardExistingPatch(patchInfo, patchFilePath, true);
@@ -712,6 +779,56 @@ function checkExistingPatch(): { action: 'relaunch' | 'check' | 'none'; version?
   return { action: 'relaunch', version: patchInfo.version };
 }
 
+function persistedPatchMatchesCurrentFeed(version: string, stagedPath: string): boolean {
+  const parsed = readPatchInfo();
+  if (!parsed) return false;
+  const { info, filePath } = parsed;
+  return (
+    isCustomUpdatePlatformSupported() &&
+    info.feedId === CUSTOM_UPDATE_FEED_ID &&
+    info.platformKey === getCustomUpdatePlatformKey() &&
+    info.version === version &&
+    path.resolve(stagedPath) === filePath &&
+    info.enableBeta === readUpdateChannelSettings().enableBeta &&
+    isRegularStagedPatchFile(filePath)
+  );
+}
+
+/** Revalidate the persisted feed binding immediately before a native updater runs. */
+function readyPatchMatchesCurrentFeed(): boolean {
+  return Boolean(
+    readyVersion &&
+    readyFilePath &&
+    persistedPatchMatchesCurrentFeed(readyVersion, readyFilePath),
+  );
+}
+
+/**
+ * A Linux staged package can only be exposed as ready after a manifest for the
+ * exact same version has supplied the trusted installer digest and size. Keep
+ * the on-disk files so a later matching manifest can recover them, but clear
+ * every in-memory apply handle while the channel is behind.
+ */
+function deferLinuxPatchUntilMatchingManifest(version: string | undefined): void {
+  log.info(
+    'Linux: keeping staged patch v%s until a matching manifest supplies its trusted digest',
+    version ?? '<unknown>',
+  );
+  if (version && readyFilePath) {
+    deferredLinuxPatch = {
+      version,
+      path: readyFilePath,
+      epoch: readyChannelEpoch ?? updateChannelEpoch,
+    };
+  }
+  readyVersion = undefined;
+  readyFilePath = undefined;
+  readyChannelEpoch = undefined;
+  linuxStagedDebSha256 = null;
+  linuxStagedDebSize = null;
+  currentStatus = 'idle';
+}
+
 function writePatchInfo(info: PatchInfo): void {
   try {
     fs.writeFileSync(
@@ -732,7 +849,7 @@ function discardExistingPatch(
   patchFilePath: string,
   clearMatchingReloginFlag: boolean,
 ): void {
-  try { fs.unlinkSync(patchFilePath); } catch { /* ignore */ }
+  removeStagedPatchFile(patchFilePath);
   removePatchInfo();
   if (!clearMatchingReloginFlag) return;
   const flag = readReloginFlag();
@@ -853,14 +970,18 @@ function discardStagedPatchFiles(): void {
     log.info('deferring staged patch discard until auto-relaunch eligibility settles');
     return;
   }
-  const discardedVersion = readyVersion;
-  if (readyFilePath) {
-    try { fs.unlinkSync(readyFilePath); } catch { /* ignore */ }
+  const discardedVersion = readyVersion ?? deferredLinuxPatch?.version;
+  const discardedPaths = new Set(
+    [readyFilePath, deferredLinuxPatch?.path].filter((value): value is string => Boolean(value)),
+  );
+  for (const filePath of discardedPaths) {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
   readyVersion = undefined;
   readyFilePath = undefined;
   readyZipSha256 = undefined;
   readyChannelEpoch = undefined;
+  deferredLinuxPatch = undefined;
   linuxStagedDebSha256 = null;
   linuxStagedDebSize = null;
   removePatchInfo();
@@ -1090,6 +1211,11 @@ export function isVersionlessAppVersion(version: string): boolean {
 async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<CheckForUpdateResult> {
   if (isCindyPersonalRuntime()) return 'idle';
   log.info('checkForUpdate() called, currentStatus=%s', currentStatus);
+  if (!isCustomUpdatePlatformSupported()) {
+    log.info('Fork app update channel is unavailable on this platform');
+    currentStatus = 'idle';
+    return 'idle';
+  }
   // 先跟共享设置对一次有效渠道:共库另一实例改过开关时,本进程内存代际还停在旧值。
   if (syncObservedUpdateChannel()) {
     log.info('shared update channel changed — discarding staged patch before check');
@@ -1122,7 +1248,7 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
     setStatus('checking');
   }
 
-  const manifest = manifestOverride ?? await fetchManifest();
+  const manifest = manifestOverride ?? await fetchCustomUpdateManifest();
   if (!manifest) {
     log.info('Manifest fetch failed');
     if (!wasReady) currentStatus = 'idle';
@@ -1140,41 +1266,27 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
       currentVersion,
       latestVersion,
     );
-    if (wasReady) {
+    if (wasReady || deferredLinuxPatch) {
       discardStagedPatchFiles();
     } else {
       currentStatus = 'idle';
     }
     return 'manifest_failed';
   }
-  if (versionRelation === 'same') {
-    log.info('Versions match, no update needed');
-    if (wasReady) {
-      log.info('Discarding staged patch because the current manifest no longer advertises an upgrade');
-      discardStagedPatchFiles();
-    } else {
-      currentStatus = 'idle';
-    }
-    return 'idle';
-  }
-  if (versionRelation === 'older') {
-    log.warn(
-      'Skipping app downgrade from %s to %s',
-      currentVersion,
-      latestVersion,
-    );
-    if (wasReady) {
-      discardStagedPatchFiles();
-    } else {
-      currentStatus = 'idle';
-    }
-    return 'idle';
+
+  if (
+    process.platform === 'linux' &&
+    deferredLinuxPatch &&
+    !persistedPatchMatchesCurrentFeed(deferredLinuxPatch.version, deferredLinuxPatch.path)
+  ) {
+    log.info('Linux: deferred patch lost its fork feed binding; discarding it');
+    discardStagedPatchFiles();
   }
 
   const asset = resolveUpdateAsset(manifest);
-  if (!asset) {
+  if (versionRelation === 'newer' && !asset) {
     log.info(process.platform === 'linux' ? 'No installer in Linux manifest' : 'No hotfix in manifest');
-    if (wasReady) {
+    if (wasReady || deferredLinuxPatch) {
       discardStagedPatchFiles();
     } else {
       currentStatus = 'idle';
@@ -1182,11 +1294,91 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
     return 'idle';
   }
 
-  // wasReady 且 manifest 仍是已下好的同一个版本 → 无事发生,保持 ready。
-  // Windows 同文件名但 SHA-256 变了时不能把新摘要绑到旧字节上，必须重下。
+  if (versionRelation !== 'newer') {
+    log.info(
+      versionRelation === 'same'
+        ? 'Versions match, no update needed'
+        : 'Skipping app downgrade from %s to %s',
+      currentVersion,
+      latestVersion,
+    );
+    // A feed publication can briefly lag or roll back. Keep a previously
+    // verified, feed-bound upgrade instead of hiding it behind an older
+    // manifest. checkExistingPatch already rejected invalid/local downgrades.
+    if (wasReady) return 'ready';
+    currentStatus = 'idle';
+    return 'idle';
+  }
+
+  // The newer-manifest path above rejects a missing asset, so this narrowing
+  // is safe for all download and Linux digest handling below.
+  if (!asset) return 'idle';
+
+  if (process.platform === 'linux' && deferredLinuxPatch) {
+    const deferred = deferredLinuxPatch;
+    const channelOrder = compareCustomUpdateVersions(latestVersion, deferred.version);
+    if (channelOrder === null || channelOrder < 0) {
+      log.info(
+        'Linux: channel v%s is behind deferred patch v%s; keeping deferred package',
+        latestVersion,
+        deferred.version,
+      );
+      setStatus('idle');
+      return 'idle';
+    }
+
+    if (channelOrder === 0) {
+      const expectedPath = resolvePatchInfoFilePath(path.basename(asset.file));
+      const digest = normalizeLinuxDebSha256(asset.sha256 ?? '');
+      const size = typeof asset.size === 'number' && asset.size > 0 ? asset.size : null;
+      if (
+        expectedPath === path.resolve(deferred.path) &&
+        isRegularStagedPatchFile(deferred.path) &&
+        digest &&
+        size !== null
+      ) {
+        log.info('Linux: matching manifest arrived for deferred patch v%s', deferred.version);
+        readyVersion = deferred.version;
+        readyFilePath = deferred.path;
+        readyChannelEpoch = deferred.epoch;
+        deferredLinuxPatch = undefined;
+        linuxStagedDebSha256 = digest;
+        linuxStagedDebSize = size;
+        setStatus('ready', { version: readyVersion });
+        return 'ready';
+      }
+      log.info('Linux: matching manifest does not describe the deferred package; re-downloading');
+    } else {
+      log.info(
+        'Linux: channel v%s supersedes deferred patch v%s; downloading the newer package',
+        latestVersion,
+        deferred.version,
+      );
+    }
+    discardStagedPatchFiles();
+  }
+
+  // Keep a trusted ready patch when the channel temporarily lags. For an
+  // equal Windows version, however, the current filename and digest must still
+  // match; a republished archive is downloaded and verified again.
   let replacingReadyWindowsDigest = false;
-  if (wasReady && latestVersion === previousReadyVersion) {
-    if (process.platform === 'win32') {
+  if (wasReady) {
+    const readyOrder = previousReadyVersion === undefined
+      ? null
+      : compareCustomUpdateVersions(latestVersion, previousReadyVersion);
+    if (readyOrder === null || readyOrder < 0) {
+      log.info(
+        'Manifest v%s does not supersede ready patch v%s; keeping ready patch',
+        latestVersion,
+        previousReadyVersion ?? '<invalid>',
+      );
+      return 'ready';
+    }
+    if (readyOrder === 0) {
+      if (process.platform !== 'win32') {
+        log.info('Ready patch v%s still matches latest — no superseding needed', previousReadyVersion);
+        return 'ready';
+      }
       const sameFile = path.basename(asset.file) === path.basename(previousReadyFilePath ?? '');
       const trustedSha256 = normalizeWindowsZipSha256(asset.sha256);
       if (!trustedSha256) {
@@ -1205,18 +1397,31 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
         log.info('Ready patch v%s still matches latest — no superseding needed', previousReadyVersion);
         return 'ready';
       }
-    } else {
-      log.info('Ready patch v%s still matches latest — no superseding needed', previousReadyVersion);
-      return 'ready';
     }
   }
 
-  // Cold-started Windows patches stay off the relaunch path until a current
-  // manifest restores the trust anchor. Reuse that staged file only when its
-  // bytes still match the current digest.
+  // Cold-started Windows patches stay off the relaunch path until the current
+  // manifest restores the in-memory trust anchor. A staged version ahead of
+  // the channel remains on disk but is not applied or replaced.
   if (!wasReady && process.platform === 'win32') {
     const patchResult = checkExistingPatch();
-    if (patchResult.action === 'relaunch' && patchResult.version === latestVersion) {
+    const patchOrder = patchResult.version
+      ? compareCustomUpdateVersions(patchResult.version, latestVersion)
+      : null;
+    if (patchResult.action === 'relaunch' && patchOrder !== null && patchOrder > 0) {
+      log.info(
+        'Windows: channel v%s is behind staged patch v%s; keeping it pending',
+        latestVersion,
+        patchResult.version,
+      );
+      readyVersion = undefined;
+      readyFilePath = undefined;
+      readyZipSha256 = undefined;
+      readyChannelEpoch = undefined;
+      currentStatus = 'idle';
+      return 'idle';
+    }
+    if (patchResult.action === 'relaunch' && patchOrder === 0) {
       const sameFile = path.basename(asset.file) === path.basename(readyFilePath ?? '');
       const trustedSha256 = normalizeWindowsZipSha256(asset.sha256);
       if (!trustedSha256) {
@@ -1239,7 +1444,7 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
 
   log.info('Update available: %s → %s (wasReady=%s)', currentVersion, latestVersion, wasReady);
 
-  const downloadUrl = `${getBaseUrl()}/${asset.file}`;
+  const downloadUrl = `${getCustomUpdateBaseUrl()}/${asset.file}`;
   const fileName = path.basename(asset.file);
   const destPath = path.join(getUpdatesDir(), fileName);
   const keepPreviousReady = wasReady && !replacingReadyWindowsDigest;
@@ -1365,6 +1570,8 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
       version: latestVersion,
       fileName,
       sha256: asset.sha256.toLowerCase(),
+      feedId: CUSTOM_UPDATE_FEED_ID,
+      platformKey: getCustomUpdatePlatformKey(),
       requireRelogin,
       enableBeta: channelEnableBetaAtStart,
     });
@@ -1382,6 +1589,7 @@ async function doCheckForUpdate(manifestOverride?: Manifest | null): Promise<Che
       ? normalizeWindowsZipSha256(asset.sha256)
       : undefined;
     readyChannelEpoch = updateChannelEpoch;
+    deferredLinuxPatch = undefined;
     // 信任锚:manifest 里的 installer 摘要与大小,进本进程内存,不落用户可写盘。
     linuxStagedDebSha256 = normalizeLinuxDebSha256(asset.sha256 ?? '');
     linuxStagedDebSize = typeof asset.size === 'number' && asset.size > 0 ? asset.size : null;
@@ -2009,6 +2217,15 @@ async function executeRelaunchUnguarded(theme: 'light' | 'dark', checkForBinaryU
   }
   isRelaunching = true;
 
+  if (!isCustomUpdatePlatformSupported()) {
+    log.error('Custom updates are unsupported on this platform — refusing to apply staged patch');
+    isRelaunching = false;
+    autoRelaunchInProgress = false;
+    discardStagedPatchFiles();
+    setStatus('error', { errorCode: 'unsupported_custom_update_platform' });
+    return;
+  }
+
   // translocated bundle 的临时路径不能写入 updater marker，也不能从该只读位置
   // 执行普通热更。
   if (isMacAppTranslocated()) {
@@ -2037,6 +2254,15 @@ async function executeRelaunchUnguarded(theme: 'light' | 'dark', checkForBinaryU
     }
     // 标志先放下,否则 clearStagedPatch 会当成 apply 已提交而跳过。
     clearStagedPatch();
+    return;
+  }
+
+  if (!readyPatchMatchesCurrentFeed()) {
+    log.error('Staged patch no longer matches the current fork feed — refusing to apply');
+    isRelaunching = false;
+    autoRelaunchInProgress = false;
+    discardStagedPatchFiles();
+    setStatus('error', { errorCode: 'untrusted_staged_patch' });
     return;
   }
 
@@ -2106,6 +2332,16 @@ async function executeRelaunchUnguarded(theme: 'light' | 'dark', checkForBinaryU
     return;
   }
 
+  // Re-check after the asynchronous reclaim: patch-info may have changed while
+  // we were waiting for runners to stop.
+  if (!readyPatchMatchesCurrentFeed()) {
+    log.error('Staged patch feed binding changed during relaunch preparation');
+    isRelaunching = false;
+    autoRelaunchInProgress = false;
+    discardStagedPatchFiles();
+    setStatus('error', { errorCode: 'untrusted_staged_patch' });
+    return;
+  }
   log.info(
     'Executing relaunch with file: %s (%s bytes)',
     maskPath(readyFilePath), fs.statSync(readyFilePath).size,
@@ -2241,6 +2477,9 @@ export function initUpdateService(): void {
     if (typeof next !== 'boolean') {
       throwIpcError('INVALID_PARAMS', 'enableBeta required (boolean)');
     }
+    if (next && !isForkBetaUpdateChannelAvailable()) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'fork beta update channel is unavailable');
+    }
     const wasBeta = readUpdateChannelSettings().enableBeta;
     // 先拦住 apply 再等落盘:writeEnableBeta 可能卡住跨进程锁。
     // 真正写成之后再删 zip;写入失败则放开 hold,旧补丁还能用。
@@ -2292,6 +2531,7 @@ export function initUpdateService(): void {
   // 打开 beta 前的预检:探测 manifest-{platform}-beta.json 是否可达。
   ipcMain.handle('update-channel-probe-beta', async (event) => {
     assertTrustedAppRendererEvent(event);
+    if (!isForkBetaUpdateChannelAvailable()) return { available: false };
     const available = await probeBetaManifest();
     return { available };
   });
@@ -2302,6 +2542,9 @@ export function initUpdateService(): void {
   // app.relaunch() 只是标记「退出后重启」,真正触发重启的是 app.quit() 的退出流程。
   ipcMain.handle('update-channel-relaunch', (event) => {
     assertTrustedAppRendererEvent(event);
+    if (!isForkBetaUpdateChannelAvailable()) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'fork beta update channel is unavailable');
+    }
     log.info('relaunch requested for update channel change');
     discardUnappliedStagedPatchForChannelRelaunch();
     // Explicit JS argv has had import credentials removed; Electron's default
@@ -2364,10 +2607,19 @@ export function initUpdateService(): void {
         return { hasUpdate: false, action: 'none' as const };
       }
 
+      if (!isCustomUpdatePlatformSupported()) {
+        // Do not let an official/foreign package left in the shared updates
+        // directory cross the fork boundary on a platform this channel does
+        // not publish. checkExistingPatch performs safe, identity-aware cleanup.
+        checkExistingPatch();
+        currentStatus = 'idle';
+        return { hasUpdate: false, action: 'none' as const };
+      }
+
       // Step 1: prefer manifest (so we don't relaunch into a stale intermediate version).
       // 启动态用短超时，避免 external CDN 慢时阻塞启动关键路径（#26）。
       // 后台 30-min 轮询仍走默认 30s 超时。
-      const manifest = await fetchManifest(STARTUP_MANIFEST_TIMEOUT_MS);
+      const manifest = await fetchCustomUpdateManifest(STARTUP_MANIFEST_TIMEOUT_MS);
 
       if (!manifest) {
         // Network unavailable — fall back to local patch.
@@ -2402,28 +2654,53 @@ export function initUpdateService(): void {
       const currentVersion = app.getVersion();
       log.info('Startup: current=%s, latest=%s', currentVersion, latestVersion);
 
+      // Step 2: inspect the staged patch independently from the channel. The
+      // fork channel can briefly lag or roll back while publishing; a patch
+      // already verified as newer than the running app must never be replaced
+      // with, or hidden by, an older channel version.
+      const patchResult = checkExistingPatch();
       const startupVersionRelation = compareAppUpdateVersions(latestVersion, currentVersion);
-      if (startupVersionRelation !== 'newer') {
-        // The online manifest is authoritative. A local patch that is no longer
-        // advertised must not survive into a later offline startup.
-        const patchResult = checkExistingPatch();
+      if (startupVersionRelation === 'invalid') {
         if (patchResult.action === 'relaunch') {
           log.info(
-            'Discarding unadvertised local patch v%s (manifest relation=%s)',
+            'Discarding local patch v%s because the manifest version is invalid',
             patchResult.version,
-            startupVersionRelation,
           );
           discardStagedPatchFiles();
         }
-        if (startupVersionRelation === 'invalid') {
-          log.info('[diag] update-check-startup returning error=manifest_failed');
-          return { hasUpdate: false, action: 'none' as const, error: 'manifest_failed' as const };
+        log.info('[diag] update-check-startup returning error=manifest_failed');
+        return { hasUpdate: false, action: 'none' as const, error: 'manifest_failed' as const };
+      }
+
+      if (startupVersionRelation !== 'newer') {
+        // Invalid/equal/older manifests cannot trigger a download. Any local
+        // patch that is itself not an upgrade was removed by the check above;
+        // a newer local patch remains eligible for relaunch.
+        if (patchResult.action === 'relaunch') {
+          log.info(
+            'Keeping local patch v%s while channel serves non-upgrade v%s',
+            patchResult.version,
+            latestVersion,
+          );
+          if (process.platform === 'linux') {
+            deferLinuxPatchUntilMatchingManifest(patchResult.version);
+            return { hasUpdate: false, action: 'none' as const };
+          }
+          if (process.platform === 'win32') {
+            readyVersion = undefined;
+            readyFilePath = undefined;
+            readyZipSha256 = undefined;
+            readyChannelEpoch = undefined;
+            currentStatus = 'idle';
+            return { hasUpdate: false, action: 'none' as const };
+          }
+          currentStatus = 'ready';
+          return await buildStartupReadyReply(patchResult.version);
         }
         return { hasUpdate: false, action: 'none' as const };
       }
 
       if (!resolveUpdateAsset(manifest)) {
-        const patchResult = checkExistingPatch();
         if (patchResult.action === 'relaunch') {
           log.info('Discarding local patch v%s because the manifest has no update asset', patchResult.version);
           discardStagedPatchFiles();
@@ -2431,59 +2708,74 @@ export function initUpdateService(): void {
         return { hasUpdate: false, action: 'none' as const };
       }
 
-      // Step 2: local patch may already match latest → skip download.
-      const patchResult = checkExistingPatch();
-      if (patchResult.action === 'relaunch' && patchResult.version === latestVersion) {
-        log.info('Local patch v%s matches latest, requesting relaunch', patchResult.version);
-        let reuseStagedPatch = true;
-        if (process.platform === 'win32') {
-          const hotfix = manifest.app.hotfix;
-          const sameFile = Boolean(
-            hotfix && path.basename(hotfix.file) === path.basename(readyFilePath ?? ''),
+      if (patchResult.action === 'relaunch' && patchResult.version) {
+        const patchOrder = compareCustomUpdateVersions(patchResult.version, latestVersion);
+        if (patchOrder !== null && patchOrder >= 0) {
+          if (process.platform === 'linux' && patchOrder > 0) {
+            deferLinuxPatchUntilMatchingManifest(patchResult.version);
+            return { hasUpdate: false, action: 'none' as const };
+          }
+          if (process.platform === 'win32' && patchOrder > 0) {
+            log.info(
+              'Windows: channel v%s is behind staged patch v%s; keeping it pending',
+              latestVersion,
+              patchResult.version,
+            );
+            readyVersion = undefined;
+            readyFilePath = undefined;
+            readyZipSha256 = undefined;
+            readyChannelEpoch = undefined;
+            currentStatus = 'idle';
+            return { hasUpdate: false, action: 'none' as const };
+          }
+          log.info(
+            'Local patch v%s is at least channel v%s, requesting relaunch',
+            patchResult.version,
+            latestVersion,
           );
-          const trustedSha256 = hotfix ? normalizeWindowsZipSha256(hotfix.sha256) : undefined;
-          if (!trustedSha256) {
-            log.info('Windows: manifest has no trusted hotfix digest — discarding local patch');
-            discardStagedPatchFiles();
-            return { hasUpdate: false, action: 'none' as const };
+          let reuseStagedPatch = true;
+          if (process.platform === 'win32') {
+            const hotfix = manifest.app.hotfix;
+            const sameFile = Boolean(
+              hotfix && path.basename(hotfix.file) === path.basename(readyFilePath ?? ''),
+            );
+            const trustedSha256 = hotfix ? normalizeWindowsZipSha256(hotfix.sha256) : undefined;
+            if (!trustedSha256) {
+              log.info('Windows: manifest has no trusted hotfix digest — discarding local patch');
+              discardStagedPatchFiles();
+              return { hasUpdate: false, action: 'none' as const };
+            }
+            if (!sameFile || !(await windowsZipFileMatchesDigest(readyFilePath, trustedSha256))) {
+              log.info('Windows: local patch does not match current manifest — will re-download');
+              readyVersion = undefined;
+              readyFilePath = undefined;
+              readyZipSha256 = undefined;
+              readyChannelEpoch = undefined;
+              reuseStagedPatch = false;
+            } else {
+              readyZipSha256 = trustedSha256;
+            }
           }
-          if (!sameFile) {
-            log.info('Windows: local patch filename changed — will download newly advertised artifact');
-            readyVersion = undefined;
-            readyFilePath = undefined;
-            readyZipSha256 = undefined;
-            readyChannelEpoch = undefined;
-            reuseStagedPatch = false;
-          } else if (!(await windowsZipFileMatchesDigest(readyFilePath, trustedSha256))) {
-            log.info('Windows: local patch bytes do not match current digest — will re-download');
-            readyVersion = undefined;
-            readyFilePath = undefined;
-            readyZipSha256 = undefined;
-            readyChannelEpoch = undefined;
-            reuseStagedPatch = false;
-          } else {
-            readyZipSha256 = trustedSha256;
+          if (reuseStagedPatch && process.platform === 'linux') {
+            // 冷启动匹配旧补丁:把这份 CDN manifest 的 installer 摘要与大小
+            // 重新锚进进程内存,让后续 apply 有可信锚可用。
+            const installer = manifest.app.installer;
+            linuxStagedDebSha256 = installer?.sha256
+              ? normalizeLinuxDebSha256(installer.sha256)
+              : null;
+            linuxStagedDebSize = typeof installer?.size === 'number' && installer.size > 0
+              ? installer.size
+              : null;
+            if (!linuxStagedDebSha256 || linuxStagedDebSize === null) {
+              log.info('Linux: manifest has no installer digest/size — discarding local patch');
+              discardStagedPatchFiles();
+              return { hasUpdate: false, action: 'none' as const };
+            }
           }
-        }
-        if (reuseStagedPatch && process.platform === 'linux') {
-          // 冷启动匹配旧补丁:把这份 CDN manifest 的 installer 摘要与大小
-          // 重新锚进进程内存,让后续 apply 有可信锚可用。
-          const installer = manifest.app.installer;
-          linuxStagedDebSha256 = installer?.sha256
-            ? normalizeLinuxDebSha256(installer.sha256)
-            : null;
-          linuxStagedDebSize = typeof installer?.size === 'number' && installer.size > 0
-            ? installer.size
-            : null;
-          if (!linuxStagedDebSha256 || linuxStagedDebSize === null) {
-            log.info('Linux: manifest has no installer digest/size — discarding local patch');
-            discardStagedPatchFiles();
-            return { hasUpdate: false, action: 'none' as const };
+          if (reuseStagedPatch) {
+            currentStatus = 'ready';
+            return await buildStartupReadyReply(patchResult.version);
           }
-        }
-        if (reuseStagedPatch) {
-          currentStatus = 'ready';
-          return await buildStartupReadyReply(patchResult.version);
         }
       }
 
@@ -2576,8 +2868,11 @@ export function initUpdateService(): void {
 export async function enableUncustomizedBetaChannel(
   shouldWrite: () => boolean = () => true,
 ): Promise<boolean> {
-  // Linux 目前仅 x64 发布 beta .deb；arm64 等不支持构建不得写入组织默认。
-  if (!supportsBetaUpdateChannel(process.platform, process.arch)) return false;
+  // 先满足官方构建能力，再应用 fork 自己的渠道策略。
+  if (
+    !supportsBetaUpdateChannel(process.platform, process.arch) ||
+    !isForkBetaUpdateChannelAvailable()
+  ) return false;
   const wasBeta = readUpdateChannelSettings().enableBeta;
   // 先拦住 apply 再等落盘。身份守卫拒绝或写入失败时,旧补丁还得能用。
   if (!wasBeta) {
