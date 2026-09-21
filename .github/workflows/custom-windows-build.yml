@@ -61,14 +61,28 @@ jobs:
           $requested = $env:REQUESTED_REF.Trim()
 
           if ($requested -eq 'stable') {
+            # The hotfix manifest can advance while an upstream beta is being
+            # published. GitHub's latest Release is the authoritative stable ref.
+            $releaseHeaders = @{
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+            $latestRelease = Invoke-RestMethod -Headers $releaseHeaders -Uri 'https://api.github.com/repos/makecindy/cindy/releases/latest'
+            $officialRef = [string]$latestRelease.tag_name
+            if (
+              $officialRef -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
+              $latestRelease.draft -eq $true -or
+              $latestRelease.prerelease -eq $true
+            ) {
+              throw "GitHub returned an invalid official stable Release: '$officialRef'"
+            }
+            $version = $officialRef.Substring(1)
             $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             $manifest = Invoke-RestMethod -Uri "https://hotfix.cindy.app/cindy/manifest-win32-x64.json?t=$cacheBust"
-            $version = [string]$manifest.app.version
-            if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
-              throw "Official stable manifest returned an invalid version: '$version'"
-            }
-            $officialRef = "v$version"
-            $requireRelogin = $manifest.app.requireRelogin -eq $true
+            $requireRelogin = (
+              [string]$manifest.app.version -eq $version -and
+              $manifest.app.requireRelogin -eq $true
+            )
           } elseif ($requested -match '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
             $officialRef = $requested
             $version = $requested.Substring(1)
