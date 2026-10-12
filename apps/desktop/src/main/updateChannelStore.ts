@@ -28,6 +28,7 @@ import {
   createOverrideSettingsFile,
   type OverrideSettingsState,
 } from './maker-host/override-settings-file.js';
+import { isForkBetaUpdateChannelAvailable } from './forkUpdatePolicy.js';
 
 const log = desktopMakerLogger.child('update-channel-settings');
 
@@ -64,6 +65,7 @@ function normalize(raw: unknown): UpdateChannelSettings {
 export function resolveEffectiveEnableBeta(
   state: OverrideSettingsState<UpdateChannelSettings>,
 ): boolean {
+  if (!isForkBetaUpdateChannelAvailable()) return false;
   return state.customizedKeys.includes('enableBeta')
     ? state.value.enableBeta
     : state.value.orgDefaultEnableBeta;
@@ -96,6 +98,9 @@ export function readUpdateChannelSettingsState(): OverrideSettingsState<UpdateCh
 }
 
 export async function writeEnableBeta(enableBeta: boolean): Promise<void> {
+  if (enableBeta && !isForkBetaUpdateChannelAvailable()) {
+    throw new Error('fork beta update channel is unavailable');
+  }
   // 关 beta 的值等于系统默认 false。若不 preserveDefaults,override 会被删掉,
   // 用户键消失后会被当成未自定义,xd 组织下次登录又会默认打开。
   // 设置页每次拨动都写 enableBeta,与组织默认标记分开。
@@ -106,6 +111,9 @@ export async function writeEnableBeta(enableBeta: boolean): Promise<void> {
 
 /** 用户是否显式拨过 beta 开关。组织默认写入不算。 */
 export function isEnableBetaUserCustomized(): boolean {
+  // Treat the fork policy as an explicit stable choice so the organization
+  // default path never probes or writes the unsupported official Beta channel.
+  if (!isForkBetaUpdateChannelAvailable()) return true;
   return store.readState().customizedKeys.includes('enableBeta');
 }
 
@@ -122,6 +130,7 @@ export function isEnableBetaUserCustomized(): boolean {
 export async function tryEnableUncustomizedBetaAtomic(
   shouldWrite: () => boolean = () => true,
 ): Promise<boolean> {
+  if (!isForkBetaUpdateChannelAvailable()) return false;
   let wrote = false;
   await store.updateAtomic((current) => {
     if (

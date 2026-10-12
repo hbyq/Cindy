@@ -27,6 +27,12 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const LOG_UPLOAD_TARGET_ENV = 'XDT_LOG_UPLOAD_TARGET';
 
 /**
+ * 开源 fork 的版本化包没有官方私有 SLS 配置。只有构建方显式写入精确值 `1` 时，
+ * 才把日志上报强制关闭；官方/普通发行构建默认行为仍是缺配置即失败。
+ */
+export const FORK_DISABLE_LOG_UPLOAD_ENV = 'XDT_FORK_DISABLE_LOG_UPLOAD';
+
+/**
  * 允许缺省的区域。dev 是内部开发构建身份，不面向用户发行，缺省即该渠道功能整体关闭。
  * 其余区域（当前 cn / global，以及将来新增的任何发行区域）**自动成为必填**——这样新增
  * 区域时不需要有人记得来改这份名单。
@@ -185,11 +191,24 @@ function assertRegionsIsolated(targets, file) {
  *
  * `allowMissing`（版本无关 / 开源打包传 true）：配置文件缺失时注入空串而不是抛错，让功能整体
  * 关闭。发行(有版本)打包传 false（默认），缺失即硬失败。
+ *
+ * 开源 fork 的版本化流水线可显式设置 `XDT_FORK_DISABLE_LOG_UPLOAD=1`。该开关不是
+ * “允许漏配”，而是强制产出空目标：即使 runner 上意外存在配置，也不会把任何官方或陌生
+ * logstore 烘焙进 fork 包。其它值不生效，继续走默认 fail-closed 路径。
  */
-export function desktopLogUploadBuildEnv({ authRegion, repoRoot, configPath, allowMissing = false } = {}) {
+export function desktopLogUploadBuildEnv({
+  authRegion,
+  repoRoot,
+  configPath,
+  allowMissing = false,
+  env = process.env,
+} = {}) {
   const region = resolveClientBuildRegion(
-    authRegion || process.env.CINDY_AUTH_REGION?.trim(),
+    authRegion || env.CINDY_AUTH_REGION?.trim(),
   );
+  if (env[FORK_DISABLE_LOG_UPLOAD_ENV] === '1') {
+    return { [LOG_UPLOAD_TARGET_ENV]: '' };
+  }
   const targets = loadLogUploadTargets({ repoRoot, configPath, allowMissing });
   // targets === null 只在 allowMissing 且文件缺失时发生 ⇒ 无目标,功能整体关闭。
   const target = targets?.[region] ?? null;
